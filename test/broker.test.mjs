@@ -8,10 +8,10 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { SqliteLeaseBroker, fixtureContract, fixtureRegistry } from "../src/broker.mjs";
 
-function withBroker(callback, registry = fixtureRegistry()) {
+function withBroker(callback, registry = fixtureRegistry(), options = {}) {
   const directory = mkdtempSync(join(tmpdir(), "delegation-broker-mvp-"));
   const path = join(directory, "broker.sqlite");
-  const broker = new SqliteLeaseBroker({ path, registry });
+  const broker = new SqliteLeaseBroker({ path, registry, ...options });
   try { return callback(broker, path, directory); } finally { broker.close(); rmSync(directory, { recursive: true, force: true }); }
 }
 
@@ -67,6 +67,15 @@ test("separate Node processes cannot oversubscribe the same SQLite capacity grou
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("backward wall-clock steps fail closed instead of extending an old capability", () => withBroker((broker) => {
+  const lease = leased(broker, fixtureContract({ taskId: "clock-regression" }), 1_000);
+  const issued = broker.issueLeaseCapability(lease.leaseId, lease.fencingToken, 1_001);
+  assert.equal(issued.status, "issued");
+  assert.throws(() => broker.leaseForCapability(issued.capability, 900), /clock_regression_detected/);
+  assert.throws(() => broker.heartbeat(lease.leaseId, lease.fencingToken, 900, 30_000), /clock_regression_detected/);
+  assert.equal(broker.leases()[0].expiresAt, lease.expiresAt);
+}));
 
 test("expiry plus monotonic fencing prevents stale workers from authorizing an effect", () => withBroker((broker) => {
   const first = leased(broker, fixtureContract({ leaseTtlMs: 5 }));
@@ -277,6 +286,38 @@ test("aging admits old work under a sustained stream of newer control tasks", ()
   }
 });
 
+test("dispatch window keeps fresh control visible behind more than one hundred aged work tasks", () => {
+  const directory = mkdtempSync(join(tmpdir(), "delegation-broker-dispatch-window-"));
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  registry.capacityGroups["G-shared"].maxConcurrent = 2;
+  const broker = new SqliteLeaseBroker({ path: join(directory, "broker.sqlite"), registry, agingStepMs: 30_000 });
+  try {
+    const floor = leased(broker, fixtureContract({ taskId: "window-floor", leaseTtlMs: 1_000_000 }), 1_000);
+    const releasable = leased(broker, fixtureContract({ taskId: "window-release", leaseTtlMs: 1_000_000 }), 1_000);
+    for (let index = 0; index < 200; index += 1) {
+      assert.equal(broker.submit(fixtureContract({
+        taskId: `window-work-${index}`,
+        admissionClass: "work",
+        recovery: { owner: "window-controller", deadlineAt: 2_000_000 },
+      }), 1_001).status, "queued");
+    }
+    assert.equal(broker.submit(fixtureContract({
+      taskId: "window-fresh-control",
+      recovery: { owner: "window-controller", deadlineAt: 2_000_000 },
+    }), 99_999).status, "queued");
+    broker.release(releasable.leaseId, releasable.fencingToken, "capacity returns", 100_000);
+    broker.release(floor.leaseId, floor.fencingToken, "control floor returns", 100_000);
+    const ready = broker.dispatchPending(100_000, 100);
+    assert.equal(ready.some((item) => item.taskId === "window-fresh-control"), true);
+    assert.equal(ready.filter((item) => item.lease.admissionClass === "control").length, 1);
+  } finally {
+    broker.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("work fan-out cannot consume control and verifier admission reserves", () => {
   const registry = fixtureRegistry();
   registry.capacityGroups["G-shared"] = {
@@ -364,12 +405,26 @@ test("contract admission requires child-facing done criteria, prompt binding, an
   assert.equal(broker.leases().length, 0);
 }));
 
+test("effect-capable contracts fail closed until the launch path asserts a blocking behavioral monitor", () => {
+  withBroker((broker) => {
+    const denied = broker.reserve(fixtureContract({ taskId: "unwired-proposal", operationClass: "propose_patch" }), 1_000);
+    assert.equal(denied.status, "denied_policy");
+    assert.equal(denied.reasonCode, "behavioral_enforcement_unavailable");
+    assert.equal(broker.leases().length, 0);
+  });
+  withBroker((broker) => {
+    const admitted = broker.reserve(fixtureContract({ taskId: "wired-proposal", operationClass: "propose_patch" }), 1_000);
+    assert.equal(admitted.status, "leased");
+    assert.equal(admitted.lease.behavioralEnforcement, "blocking_monitor");
+  }, fixtureRegistry(), { behavioralEnforcement: "blocking_monitor" });
+});
+
 test("high-risk work is denied before lease when a requested budget dimension is not hard", () => withBroker((broker) => {
   const result = broker.reserve(fixtureContract({ operationClass: "external_write" }), 1_000);
   assert.equal(result.status, "denied_policy");
   assert.match(result.reasons[0], /hard budget enforcement/);
   assert.equal(broker.leases().length, 0);
-}));
+}, fixtureRegistry(), { behavioralEnforcement: "blocking_monitor" }));
 
 test("high-risk work cannot omit a hard budget dimension", () => withBroker((broker) => {
   const result = broker.reserve(fixtureContract({
@@ -379,7 +434,7 @@ test("high-risk work cannot omit a hard budget dimension", () => withBroker((bro
   assert.equal(result.status, "denied_policy");
   assert.match(result.reasons[0], /input, output, and cost/);
   assert.equal(broker.leases().length, 0);
-}));
+}, fixtureRegistry(), { behavioralEnforcement: "blocking_monitor" }));
 
 test("typed effect receipts are approval-bound and idempotent", () => {
   const registry = fixtureRegistry();
@@ -406,7 +461,7 @@ test("typed effect receipts are approval-bound and idempotent", () => {
     assert.equal(first.status, "recorded");
     assert.equal(replay.status, "replayed");
     assert.deepEqual(replay.receipt, first.receipt);
-  }, registry);
+  }, registry, { behavioralEnforcement: "blocking_monitor" });
 });
 
 test("durable queued contracts redact secret-shaped text before SQLite persistence", () => {

@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -42,6 +45,96 @@ function artifactBytes(value, artifactIsRedacted) {
   throw new Error("controller evidence artifact must be bytes or a string");
 }
 
+function normalizeOutput(value, policy = {}) {
+  if (typeof value !== "string") throw new Error("semantic command/url output must be a string");
+  let text = redactText(value)
+    .replaceAll("\r\n", "\n")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .split("\n").map((line) => line.trimEnd()).join("\n").trim();
+  if (policy.stripTimestamps !== false) text = text.replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g, "<timestamp>");
+  if (policy.stripPids !== false) text = text.replace(/\b(pid|process)\s*[:=#]?\s*\d+\b/gi, "$1=<pid>");
+  for (const root of policy.rootPaths ?? []) {
+    if (typeof root !== "string" || !isAbsolute(root)) throw new Error("semantic normalization rootPaths must be absolute paths");
+    text = text.replaceAll(root, "<root>");
+  }
+  if (policy.unorderedLines === true) text = text.split("\n").sort().join("\n");
+  return text;
+}
+
+function semanticProjection(kind, observation, baselinePolicy) {
+  if (!observation || typeof observation !== "object") throw new Error("semantic evidence observation must be an object");
+  if (kind === "command") {
+    if (!Number.isSafeInteger(observation.exitCode)) throw new Error("semantic command evidence requires integer exitCode");
+    const normalization = baselinePolicy ?? Object.freeze({
+      stripTimestamps: observation.normalization?.stripTimestamps !== false,
+      stripPids: observation.normalization?.stripPids !== false,
+      unorderedLines: observation.normalization?.unorderedLines === true,
+      rootPaths: Object.freeze([...(observation.normalization?.rootPaths ?? [])]),
+    });
+    return {
+      schema: "command/v1",
+      exitCode: observation.exitCode,
+      stdout: normalizeOutput(observation.stdout ?? "", normalization),
+      stderr: normalizeOutput(observation.stderr ?? "", normalization),
+      normalization,
+    };
+  }
+  if (kind === "file") {
+    if (typeof observation.content !== "string" || !Number.isSafeInteger(observation.lineStart) || observation.lineStart < 1
+      || !Number.isSafeInteger(observation.lineEnd) || observation.lineEnd < observation.lineStart
+      || typeof observation.revision !== "string" || !observation.revision) {
+      throw new Error("semantic file evidence requires content, revision, and a valid line range");
+    }
+    return {
+      schema: "file/v1",
+      revision: observation.revision,
+      lineStart: observation.lineStart,
+      lineEnd: observation.lineEnd,
+      contentHash: createHash("sha256").update(redactText(observation.content)).digest("hex"),
+    };
+  }
+  if (kind === "test") {
+    if (!new Set(["pass", "fail", "skip"]).has(observation.outcome)
+      || !["passed", "failed", "skipped"].every((key) => Number.isSafeInteger(observation[key] ?? 0) && (observation[key] ?? 0) >= 0)) {
+      throw new Error("semantic test evidence requires outcome and non-negative counts");
+    }
+    return {
+      schema: "test/v1",
+      suite: boundedString(observation.suite, "semantic test suite"),
+      outcome: observation.outcome,
+      passed: observation.passed ?? 0,
+      failed: observation.failed ?? 0,
+      skipped: observation.skipped ?? 0,
+    };
+  }
+  if (kind === "url") {
+    if (!Number.isSafeInteger(observation.status) || observation.status < 100 || observation.status > 599
+      || !Number.isSafeInteger(observation.retrievedAt) || observation.retrievedAt < 0) {
+      throw new Error("semantic URL evidence requires HTTP status and retrievedAt");
+    }
+    const normalization = baselinePolicy ?? Object.freeze({
+      stripTimestamps: observation.normalization?.stripTimestamps !== false,
+      stripPids: false,
+      unorderedLines: observation.normalization?.unorderedLines === true,
+      rootPaths: Object.freeze([]),
+    });
+    return {
+      schema: "url/v1",
+      status: observation.status,
+      retrievedAt: observation.retrievedAt,
+      body: normalizeOutput(observation.body ?? "", normalization),
+      normalization,
+    };
+  }
+  throw new Error(`semantic comparison is not defined for evidence kind ${kind}`);
+}
+
+function semanticComparable(projection) {
+  if (projection.schema !== "url/v1") return projection;
+  const { retrievedAt: _retrievedAt, ...comparable } = projection;
+  return comparable;
+}
+
 function descriptorMatches(left, right) {
   return left?.source === "controller"
     && left.kind === right.kind
@@ -50,7 +143,18 @@ function descriptorMatches(left, right) {
     && left.contentHash === right.contentHash
     && left.capturedAt === right.capturedAt
     && left.size === right.size
-    && left.retentionUntil === right.retentionUntil;
+    && left.retentionUntil === right.retentionUntil
+    && left.semanticSchema === right.semanticSchema;
+}
+
+function writeDurableExclusive(path, bytes) {
+  const descriptor = openSync(path, "wx", 0o600);
+  try {
+    writeFileSync(descriptor, bytes);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 function requireOwnerOnlyDirectory(path) {
@@ -70,7 +174,8 @@ function validateStoredEntry(entry) {
     || typeof entry.claim !== "string" || !HASH.test(entry.contentHash)
     || !Number.isSafeInteger(entry.capturedAt) || entry.capturedAt < 0
     || !Number.isSafeInteger(entry.retentionUntil) || entry.retentionUntil <= entry.capturedAt
-    || !Number.isSafeInteger(entry.size) || entry.size < 0) {
+    || !Number.isSafeInteger(entry.size) || entry.size < 0
+    || (entry.semanticSchema !== undefined && !new Set(["command/v1", "file/v1", "test/v1", "url/v1"]).has(entry.semanticSchema))) {
     throw new Error("controller evidence metadata is malformed");
   }
   return match[1];
@@ -105,7 +210,38 @@ export class ControllerEvidenceStore {
     this.#load();
   }
 
-  capture({ kind, claim, artifact, artifactIsRedacted = false, capturedAt = Date.now() }) {
+  capture(input) {
+    return this.#capture(input);
+  }
+
+  captureObservation({ kind, claim, observation, capturedAt = Date.now() }) {
+    const projection = semanticProjection(kind, observation);
+    return this.#capture({
+      kind,
+      claim,
+      artifact: JSON.stringify(projection),
+      capturedAt,
+      semanticSchema: projection.schema,
+    });
+  }
+
+  compareSemantic(descriptor, observation) {
+    if (!this.verify(descriptor)) return Object.freeze({ status: "invalid_evidence", differences: Object.freeze(["retained evidence is missing or corrupt"]) });
+    if (typeof descriptor.semanticSchema !== "string") return Object.freeze({ status: "unsupported", differences: Object.freeze(["evidence has no semantic schema"]) });
+    const retained = JSON.parse(this.artifact(descriptor).toString("utf8"));
+    if (retained.schema !== descriptor.semanticSchema) return Object.freeze({ status: "invalid_evidence", differences: Object.freeze(["semantic schema does not match retained content"]) });
+    const candidate = semanticProjection(descriptor.kind, observation, retained.normalization);
+    const expectedComparable = semanticComparable(retained);
+    const candidateComparable = semanticComparable(candidate);
+    const match = JSON.stringify(expectedComparable) === JSON.stringify(candidateComparable);
+    return Object.freeze({
+      status: match ? "match" : "mismatch",
+      differences: Object.freeze(match ? [] : ["semantic projection differs"]),
+      ...(descriptor.kind === "url" ? { baselineRetrievedAt: retained.retrievedAt, candidateRetrievedAt: candidate.retrievedAt } : {}),
+    });
+  }
+
+  #capture({ kind, claim, artifact, artifactIsRedacted = false, capturedAt = Date.now(), semanticSchema }) {
     if (!EVIDENCE_KINDS.has(kind)) throw new Error("unsupported controller evidence kind");
     boundedString(claim, "controller evidence claim");
     const safeClaim = redactText(claim);
@@ -116,7 +252,7 @@ export class ControllerEvidenceStore {
     const contentHash = createHash("sha256").update(bytes).digest("hex");
     const objectPath = join(this.#objects, contentHash);
     if (!existsSync(objectPath)) {
-      try { writeFileSync(objectPath, bytes, { flag: "wx", mode: 0o600 }); }
+      try { writeDurableExclusive(objectPath, bytes); }
       catch (error) { if (error?.code !== "EEXIST") throw error; }
     }
     const id = randomUUID();
@@ -129,9 +265,10 @@ export class ControllerEvidenceStore {
       capturedAt,
       size: bytes.length,
       retentionUntil: capturedAt + this.#retentionMs,
+      ...(semanticSchema === undefined ? {} : { semanticSchema }),
     });
     if (!this.#verifyCandidate(entry)) throw new Error("controller evidence object path is unsafe or corrupt");
-    writeFileSync(join(this.#metadata, `${id}.json`), `${JSON.stringify(entry)}\n`, { flag: "wx", mode: 0o600 });
+    writeDurableExclusive(join(this.#metadata, `${id}.json`), `${JSON.stringify(entry)}\n`);
     this.#entries.set(entry.ref, entry);
     return entry;
   }
@@ -178,6 +315,11 @@ export class ControllerEvidenceStore {
       if (!this.#verifyCandidate(frozen)) throw new Error(`controller evidence artifact is missing or corrupt: ${entry.ref}`);
       this.#entries.set(frozen.ref, frozen);
     }
+    const referenced = new Set([...this.#entries.values()].map((entry) => entry.contentHash));
+    for (const name of readdirSync(this.#objects)) {
+      if (!HASH.test(name)) throw new Error("controller evidence object directory contains an unexpected file");
+      if (!referenced.has(name)) rmSync(join(this.#objects, name), { force: true });
+    }
   }
 
   #verifyCandidate(entry) {
@@ -194,10 +336,13 @@ export class ControllerEvidenceStore {
  * Validate only evidence provenance and acceptance binding. Self-reported
  * evidence remains available as context but can never satisfy acceptance.
  */
-export function validateResultEvidence(result, { acceptance = [], evidenceStore } = {}) {
+export function validateResultEvidence(result, { acceptance = [], evidenceStore, semanticRecaptures = {} } = {}) {
   if (!evidenceStore || typeof evidenceStore.verify !== "function") throw new Error("validation requires a controller evidence store");
   if (!Array.isArray(acceptance) || acceptance.some((check) => typeof check !== "string" || !check)) {
     throw new Error("acceptance must be an array of non-empty strings");
+  }
+  if (!semanticRecaptures || typeof semanticRecaptures !== "object" || Array.isArray(semanticRecaptures)) {
+    throw new Error("semanticRecaptures must be an object keyed by evidence ref");
   }
   if (!result || !Array.isArray(result.evidence) || !Array.isArray(result.validationPerformed)) {
     return Object.freeze({ status: "rejected", reasons: Object.freeze(["result evidence shape is invalid"]), satisfied: Object.freeze([]) });
@@ -225,6 +370,17 @@ export function validateResultEvidence(result, { acceptance = [], evidenceStore 
     if (!validation || !evidence || evidence.source !== "controller" || evidence.claim !== check) {
       reasons.push(`acceptance lacks controller evidence: ${check}`);
       continue;
+    }
+    if (Object.hasOwn(semanticRecaptures, evidence.ref)) {
+      if (typeof evidenceStore.compareSemantic !== "function") {
+        reasons.push(`semantic comparison is unavailable: ${check}`);
+        continue;
+      }
+      const comparison = evidenceStore.compareSemantic(evidence, semanticRecaptures[evidence.ref]);
+      if (comparison.status !== "match") {
+        reasons.push(`semantic recapture mismatch: ${check}`);
+        continue;
+      }
     }
     satisfied.push(check);
   }

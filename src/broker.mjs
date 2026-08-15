@@ -5,6 +5,8 @@ const ENFORCEMENT = Object.freeze({ hard: 2, metered_best_effort: 1, unavailable
 const ADMISSION_CLASSES = new Set(["control", "verify", "work"]);
 const INVENTORY_CONFIDENCE = new Set(["measured", "observed", "assumed"]);
 const PENDING_STATES = new Set(["waiting", "ready", "claimed", "awaiting_result", "escalated", "completed", "failed"]);
+const EFFECT_CAPABLE_OPERATIONS = new Set(["propose_patch", "apply", "external_write"]);
+const BEHAVIORAL_ENFORCEMENT = new Set(["unavailable", "blocking_monitor"]);
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const SECRET_PATTERNS = [
@@ -44,6 +46,7 @@ function asLease(row) {
     expiresAt: row.expires_at,
     enforcement: parseJson(row.enforcement),
     admissionClass: row.admission_class,
+    behavioralEnforcement: row.behavioral_enforcement,
     probe: row.is_probe === 1,
     ...(row.max_input_tokens === null || row.max_input_tokens === undefined ? {} : { maxInputTokens: row.max_input_tokens }),
     ...(row.max_output_tokens === null || row.max_output_tokens === undefined ? {} : { maxOutputTokens: row.max_output_tokens }),
@@ -62,8 +65,9 @@ export class SqliteLeaseBroker {
   #db;
   #maxPendingTasks;
   #agingStepMs;
+  #behavioralEnforcement;
 
-  constructor({ path, registry, maxPendingTasks = 1_000, agingStepMs = 30_000 }) {
+  constructor({ path, registry, maxPendingTasks = 1_000, agingStepMs = 30_000, behavioralEnforcement = "unavailable" }) {
     if (!path) throw new Error("SQLite broker needs a database path");
     if (!Number.isSafeInteger(maxPendingTasks) || maxPendingTasks < 1 || maxPendingTasks > 100_000) {
       throw new Error("maxPendingTasks must be an integer between 1 and 100000");
@@ -71,8 +75,10 @@ export class SqliteLeaseBroker {
     if (!Number.isSafeInteger(agingStepMs) || agingStepMs < 1 || agingStepMs > 86_400_000) {
       throw new Error("agingStepMs must be an integer between 1 and 86400000");
     }
+    if (!BEHAVIORAL_ENFORCEMENT.has(behavioralEnforcement)) throw new Error("behavioralEnforcement must be unavailable or blocking_monitor");
     this.#maxPendingTasks = maxPendingTasks;
     this.#agingStepMs = agingStepMs;
+    this.#behavioralEnforcement = behavioralEnforcement;
     this.#db = new DatabaseSync(path);
     try {
       // Configure the connection wait before contending for the database-wide
@@ -168,15 +174,34 @@ export class SqliteLeaseBroker {
         reason: task.state === "awaiting_result" ? "result_reconciliation_deadline" : "capacity_wait_deadline",
       });
 
-      const queued = this.#db.prepare(`
+      const eligible = this.#db.prepare(`
         SELECT * FROM pending_tasks
         WHERE state = 'waiting' AND eligible_at IS NOT NULL AND eligible_at <= ? AND deadline_at > ?
-        ORDER BY (
-          CASE admission_class WHEN 'control' THEN 0 WHEN 'verify' THEN 1 ELSE 2 END
-          - CAST((? - created_at) / ? AS INTEGER)
-        ), created_at, task_id
-        LIMIT ?
-      `).all(now, now, now, this.#agingStepMs, limit);
+      `).all(now, now);
+      const classRank = (admissionClass) => admissionClass === "control" ? 0 : admissionClass === "verify" ? 1 : 2;
+      const effectiveRank = (pending) => Math.max(0, classRank(pending.admission_class) - Math.floor((now - pending.created_at) / this.#agingStepMs));
+      const comparePending = (left, right) => effectiveRank(left) - effectiveRank(right)
+        || left.created_at - right.created_at
+        || left.task_id.localeCompare(right.task_id);
+      const selected = eligible.sort(comparePending).slice(0, limit);
+      // The SQL/JS dispatch window is bounded, but a representative from each
+      // protected class must remain visible even behind a large aged work
+      // backlog. Replace the lowest-priority tail candidate rather than growing
+      // the caller's limit.
+      const protectedIncluded = new Set(selected.filter((pending) => pending.admission_class !== "work").map((pending) => pending.admission_class));
+      for (const protectedClass of ["control", "verify"].slice(0, Math.min(limit, 2))) {
+        if (protectedIncluded.has(protectedClass)) continue;
+        const representative = eligible.filter((pending) => pending.admission_class === protectedClass).sort(comparePending)[0];
+        if (!representative) continue;
+        if (selected.length < limit) selected.push(representative);
+        else {
+          const replaceAt = selected.findLastIndex((pending) => !protectedIncluded.has(pending.admission_class));
+          if (replaceAt < 0) continue;
+          selected[replaceAt] = representative;
+        }
+        protectedIncluded.add(protectedClass);
+      }
+      const queued = [...new Map(selected.map((pending) => [pending.task_id, pending])).values()].sort(comparePending);
       const ready = [];
       for (const pending of queued) {
         const reservation = this.#reserveCore(parseJson(pending.contract), now);
@@ -300,6 +325,7 @@ export class SqliteLeaseBroker {
   }
 
   queueWaitMetrics(now) {
+    this.#assertNondecreasingTime(now);
     if (!Number.isSafeInteger(now) || now < 0) throw new Error("queue wait metrics require a non-negative safe-integer time");
     const rows = this.#db.prepare(`
       SELECT admission_class, created_at FROM pending_tasks
@@ -370,6 +396,7 @@ export class SqliteLeaseBroker {
 
   /** Validate a child-scoped IPC capability without exposing controller authority. */
   leaseForCapability(capability, now) {
+    this.#assertNondecreasingTime(now);
     if (typeof capability !== "string" || !capability) return { status: "denied_capability" };
     const row = this.#db.prepare(`
       SELECT l.*
@@ -482,6 +509,7 @@ export class SqliteLeaseBroker {
   }
 
   authorizeEffect(intent, now) {
+    this.#assertNondecreasingTime(now);
     const lease = this.#db.prepare("SELECT * FROM leases WHERE lease_id = ?").get(intent.leaseId);
     if (!lease || lease.fencing_token !== intent.fencingToken || lease.expires_at <= now || lease.task_id !== intent.taskId) {
       return { status: "denied_lease" };
@@ -563,6 +591,7 @@ export class SqliteLeaseBroker {
         max_output_tokens INTEGER,
         max_cost_micros INTEGER,
         admission_class TEXT NOT NULL DEFAULT 'control' CHECK (admission_class IN ('control', 'verify', 'work')),
+        behavioral_enforcement TEXT NOT NULL DEFAULT 'unavailable' CHECK (behavioral_enforcement IN ('unavailable', 'blocking_monitor')),
         is_probe INTEGER NOT NULL DEFAULT 0 CHECK (is_probe IN (0, 1))
       );
       CREATE INDEX IF NOT EXISTS leases_by_group_expiry ON leases(capacity_group, expires_at);
@@ -604,6 +633,7 @@ export class SqliteLeaseBroker {
     if (!leaseColumns.includes("max_output_tokens")) this.#db.exec("ALTER TABLE leases ADD COLUMN max_output_tokens INTEGER");
     if (!leaseColumns.includes("max_cost_micros")) this.#db.exec("ALTER TABLE leases ADD COLUMN max_cost_micros INTEGER");
     if (!leaseColumns.includes("admission_class")) this.#db.exec("ALTER TABLE leases ADD COLUMN admission_class TEXT NOT NULL DEFAULT 'control'");
+    if (!leaseColumns.includes("behavioral_enforcement")) this.#db.exec("ALTER TABLE leases ADD COLUMN behavioral_enforcement TEXT NOT NULL DEFAULT 'unavailable'");
     if (!leaseColumns.includes("is_probe")) this.#db.exec("ALTER TABLE leases ADD COLUMN is_probe INTEGER NOT NULL DEFAULT 0");
     const groupColumns = this.#db.prepare("PRAGMA table_info(capacity_groups)").all().map((column) => column.name);
     const groupMigrations = [
@@ -721,6 +751,7 @@ export class SqliteLeaseBroker {
   }
 
   #expire(now) {
+    this.#assertNondecreasingTime(now);
     const rows = this.#db.prepare("SELECT * FROM leases WHERE expires_at <= ?").all(now);
     if (rows.length) {
       this.#db.prepare("DELETE FROM leases WHERE expires_at <= ?").run(now);
@@ -748,6 +779,12 @@ export class SqliteLeaseBroker {
     return rows.map((row) => row.lease_id);
   }
 
+  #assertNondecreasingTime(now) {
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error("broker time must be a non-negative safe integer");
+    const floor = this.#db.prepare("SELECT at FROM events ORDER BY sequence DESC LIMIT 1").get()?.at;
+    if (floor !== undefined && now < floor) throw new Error("clock_regression_detected");
+  }
+
   #afterLeaseRemoved(lease, now) {
     this.#db.prepare(`
       UPDATE pending_tasks SET eligible_at = MIN(eligible_at, ?), updated_at = ?
@@ -766,6 +803,15 @@ export class SqliteLeaseBroker {
   }
 
   #reserveCore(contract, now) {
+    if (EFFECT_CAPABLE_OPERATIONS.has(contract?.operationClass) && this.#behavioralEnforcement !== "blocking_monitor") {
+      const result = {
+        status: "denied_policy",
+        reasonCode: "behavioral_enforcement_unavailable",
+        reasons: ["effect-capable contract requires a wired blocking behavioral monitor"],
+      };
+      this.#record(now, "ReservationDenied", { taskId: contract?.taskId, ...result });
+      return result;
+    }
     const policyError = this.#validateContract(contract);
     if (policyError) {
       this.#record(now, "ReservationDenied", { taskId: contract?.taskId, status: "denied_policy", reason: policyError });
@@ -838,6 +884,7 @@ export class SqliteLeaseBroker {
         expiresAt: now + (contract.leaseTtlMs ?? 30_000),
         enforcement: parseJson(resource.enforcement),
         admissionClass: contract.admissionClass,
+        behavioralEnforcement: this.#behavioralEnforcement,
         probe,
         ...(Number.isInteger(contract.budget?.maxInputTokens) ? { maxInputTokens: contract.budget.maxInputTokens } : {}),
         ...(Number.isInteger(contract.budget?.maxOutputTokens) ? { maxOutputTokens: contract.budget.maxOutputTokens } : {}),
@@ -846,13 +893,13 @@ export class SqliteLeaseBroker {
       this.#db.prepare(`
         INSERT INTO leases (
           lease_id, task_id, resource_id, capacity_group, profile, fencing_token,
-          issued_at, expires_at, enforcement, max_input_tokens, max_output_tokens, max_cost_micros, admission_class, is_probe
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          issued_at, expires_at, enforcement, max_input_tokens, max_output_tokens, max_cost_micros, admission_class, behavioral_enforcement, is_probe
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         lease.leaseId, lease.taskId, lease.resourceId, lease.capacityGroup, lease.profile,
         lease.fencingToken, lease.issuedAt, lease.expiresAt, JSON.stringify(lease.enforcement),
         lease.maxInputTokens ?? null, lease.maxOutputTokens ?? null, lease.maxCostMicros ?? null,
-        lease.admissionClass, lease.probe ? 1 : 0,
+        lease.admissionClass, lease.behavioralEnforcement, lease.probe ? 1 : 0,
       );
       if (probe) this.#db.prepare("UPDATE capacity_groups SET probe_lease_id = ? WHERE id = ?").run(lease.leaseId, lease.capacityGroup);
       this.#record(now, "LeaseIssued", lease);
@@ -931,6 +978,7 @@ export class SqliteLeaseBroker {
   }
 
   #record(at, type, payload) {
+    this.#assertNondecreasingTime(at);
     this.#db.prepare("INSERT INTO events (at, type, payload) VALUES (?, ?, ?)").run(at, type, JSON.stringify(redact(payload)));
   }
 }

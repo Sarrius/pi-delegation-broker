@@ -20,11 +20,11 @@ Validated locally on Node 26 with deterministic fake transport only. The fake tr
 
 - SQLite (`BEGIN IMMEDIATE` + WAL) lease reservation, TTL, fencing and shared capacity groups.
 - Durable bounded task waiting with named recovery owner/deadline and supervisor wake-up after capacity changes.
-- `control | verify | work` admission classes with reserved control capacity plus queue aging so old work is not starved.
+- `control | verify | work` admission classes with clamped queue aging and protected dispatch-window representatives, preventing either old work or fresh control from disappearing behind backlog.
 - Contract admission requires child-facing `doneWhen`, exact prompt-digest binding and a positive latency budget.
-- A deterministic behavioral monitor for typed action reconciliation, no-progress detection and evidence-bound completion claims.
+- A deterministic behavioral monitor for typed action reconciliation, no-progress detection and evidence-bound completion claims. Effect-capable contracts fail closed until a trusted launch path asserts the still-unwired blocking monitor.
 - Registry-defined inventory confidence, pessimistic cooldown policy and one half-open probe per group.
-- Persistent content-addressed, redacted controller evidence with explicit retention/pruning; self-reported evidence cannot satisfy acceptance.
+- Persistent content-addressed, redacted controller evidence with command/file/test/URL semantic recapture comparators and explicit retention/pruning; self-reported evidence cannot satisfy acceptance.
 - SHA-256-hashed lease capabilities for owner-only Unix-socket IPC.
 - Signed Ed25519 capability-registry verification before supervisor startup.
 - Owner-only state directory, lock, socket, bounded shutdown and periodic TTL sweep.
@@ -70,7 +70,7 @@ import {
 } from "@sars267/pi-delegation-broker";
 ```
 
-`ControllerEvidenceStore` requires an absolute owner-only `root`; text artifacts are redacted before hashing/retention, while binary artifacts require `artifactIsRedacted: true`. `BehavioralRunMonitor` is deterministic reference state: a Pi integration must call action authorization from a blocking pre-tool hook and result observation only after tool completion.
+`ControllerEvidenceStore` requires an absolute owner-only `root`; text artifacts are redacted before hashing/retention, while binary artifacts require `artifactIsRedacted: true`. `captureObservation`/`compareSemantic` support command, file-range, test-outcome and URL-body recapture, and `validateResultEvidence` applies any supplied `semanticRecaptures`. `BehavioralRunMonitor` is deterministic reference state: a Pi integration must call action authorization from a blocking pre-tool hook and result observation only after tool completion. The shipped supervisor does not assert that integration, so `propose_patch`, `apply`, and `external_write` admission returns `behavioral_enforcement_unavailable`.
 
 A supervisor requires signed registry schema v2 by default. Registry capacity groups must declare admission reserves, inventory confidence, default cooldown and probe interval; resources must declare their own inventory confidence. These fields are fail-closed because inferred capacity must not masquerade as measured capacity. If a durable database contains different policy values or removed/extra registry IDs, startup refuses an implicit transition and requires an audited migration/new state directory. Passing an unsigned fixture requires the explicit `allowUnsignedFixture: true` escape hatch, which exists only for deterministic tests.
 
