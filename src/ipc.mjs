@@ -1,9 +1,11 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { dirname } from "node:path";
-const MAX_REQUEST_BYTES = 64 * 1024;
-const CHILD_METHODS = new Set(["heartbeat", "release", "providerAttempt"]);
+import { captureLosslessJson } from "./lossless-json.mjs";
+import { AttemptSettlement, ProviderStreamAssembler, createAttemptRouteSnapshot } from "./provider-protocol.mjs";
+const MAX_REQUEST_BYTES = 1024 * 1024;
+const CHILD_METHODS = new Set(["heartbeat", "release", "providerAttempt", "providerStream"]);
 const CONTROLLER_METHODS = new Set([
   "reserve", "submit", "dispatchPending", "pendingTasks", "queueWaitMetrics", "readyTasks", "claimReadyTask", "abandonClaimedTask", "finalizeClaimedTask", "reschedulePending", "finishPending",
   "issueLeaseCapability", "markRateLimited", "markUnknown", "markHealthy", "release", "configureFakeProvider",
@@ -43,6 +45,7 @@ export class BrokerIpcServer {
   #fakeProvider;
   #server;
   #connections = new Set();
+  #controllerEpoch = randomUUID();
 
   constructor({ broker, socketPath, controllerToken = randomBytes(32).toString("base64url"), fakeProvider }) {
     if (!broker || !socketPath) throw new Error("Broker IPC server needs broker and socketPath");
@@ -129,8 +132,9 @@ export class BrokerIpcServer {
         responded = true;
         return this.#respond(socket, { id: null, ok: false, error: "invalid_json" });
       }
-      void Promise.resolve(this.#dispatch(request, Date.now(), abortController.signal)).then(
+      void Promise.resolve(this.#dispatch(request, Date.now(), abortController.signal, socket)).then(
         (result) => {
+          if (result === undefined) return; // streaming already wrote and ended
           if (abortController.signal.aborted) return;
           responded = true;
           this.#respond(socket, { id: request?.id ?? null, ok: true, result });
@@ -150,7 +154,11 @@ export class BrokerIpcServer {
     if (!socket.destroyed && !socket.writableEnded) socket.end(`${JSON.stringify(response)}\n`);
   }
 
-  async #dispatch(request, now, signal) {
+  #writeLine(socket, response) {
+    if (!socket.destroyed && !socket.writableEnded) socket.write(`${JSON.stringify(response)}\n`);
+  }
+
+  async #dispatch(request, now, signal, socket) {
     if (!request || typeof request.method !== "string") throw new Error("invalid_request");
     const { method, params = {}, authorization } = request;
     if (sameSecret(authorization, this.#controllerToken)) {
@@ -181,7 +189,128 @@ export class BrokerIpcServer {
     if (capability.status !== "authorized") throw new Error("unauthorized");
     if (method === "heartbeat") return this.#broker.heartbeat(capability.lease.leaseId, capability.lease.fencingToken, now, validateTtl(params.ttlMs));
     if (method === "release") return this.#broker.release(capability.lease.leaseId, capability.lease.fencingToken, "child release", now);
+    if (method === "providerStream") return this.#providerStream(capability.lease, params, signal, socket, request.id);
     return this.#providerAttempt(capability.lease, params.inputDigest, signal);
+  }
+
+  async #providerStream(lease, params, signal, socket, requestId) {
+    if (!this.#fakeProvider || typeof this.#fakeProvider.routeForLease !== "function") throw new Error("provider_transport_unavailable");
+    const context = params?.context;
+    if (!context || typeof context !== "object") throw new Error("stream requires typed context");
+
+    // Phase 1: bounded lossless context ingress (synchronous, before any writes)
+    const captured = captureLosslessJson(context, { maxBytes: 512 * 1024, maxNodes: 100_000, maxDepth: 32 });
+    const inputDigest = createHash("sha256").update(captured.canonical).digest("hex");
+    if (typeof captured.value.systemPrompt !== "string") throw new Error("context requires string systemPrompt");
+    if (!Array.isArray(captured.value.messages)) throw new Error("context requires array messages");
+    if (!Array.isArray(captured.value.tools)) throw new Error("context requires array tools");
+
+    // Phase 2: immutable route snapshot
+    const route = this.#fakeProvider.routeForLease(lease);
+    const attemptId = randomUUID();
+    const streamId = randomUUID();
+    const snapshot = createAttemptRouteSnapshot({
+      schemaVersion: 1,
+      controllerEpoch: this.#controllerEpoch,
+      attemptId,
+      streamId,
+      taskId: lease.taskId,
+      leaseId: lease.leaseId,
+      fencingToken: lease.fencingToken,
+      registryFingerprint: route.registryFingerprint,
+      registryVersion: route.registryVersion,
+      resourceId: lease.resourceId,
+      capacityGroup: lease.capacityGroup,
+      accountAlias: route.accountAlias,
+      provider: route.provider,
+      model: route.model,
+      reasoningEffort: route.reasoningEffort ?? null,
+      apiDialect: route.apiDialect,
+      endpointId: route.endpointId,
+      adapterId: route.adapterId,
+      credentialRefFingerprint: route.credentialRefFingerprint,
+      retryOwner: "broker",
+      sdkMaxRetries: 0,
+      deadlineAt: lease.expiresAt,
+      maxInputBytes: 1_000_000,
+      maxOutputBytes: 1_000_000,
+      maxOutputTokens: lease.maxOutputTokens ?? 8_000,
+      maxCostMicros: lease.maxCostMicros ?? 500_000,
+    });
+
+    const identity = Object.freeze({
+      controllerEpoch: snapshot.controllerEpoch,
+      attemptId: snapshot.attemptId,
+      streamId: snapshot.streamId,
+      leaseId: snapshot.leaseId,
+      fencingToken: snapshot.fencingToken,
+    });
+    const assembler = new ProviderStreamAssembler(identity, {
+      maxBlocks: 64,
+      maxBlockBytes: 256 * 1024,
+      maxTotalOutputBytes: 1_000_000,
+    });
+    const settlement = new AttemptSettlement(snapshot);
+
+    // Phase 3: run fake provider (async, before any frame writes)
+    const event = await this.#fakeProvider.attempt(lease, inputDigest, signal);
+    if (signal?.aborted) throw new Error("provider_attempt_aborted");
+    const observedAt = Date.now();
+    const telemetry = this.#broker.recordProviderEvent(lease.leaseId, lease.fencingToken, inputDigest, event, observedAt);
+    if (telemetry.status !== "recorded") throw new Error("lease no longer active");
+
+    // Phase 4: generate + validate + write frames
+    let seq = 0;
+    const emit = (type, payload = {}) => {
+      const frame = { protocolVersion: 1, ...identity, seq: seq++, type, payload };
+      const validated = assembler.accept(frame);
+      this.#writeLine(socket, { id: requestId, ok: true, frame });
+      return validated;
+    };
+
+    settlement.transition("admitted");
+    emit("attempt_accepted");
+    settlement.transition("provider_send_started");
+    emit("provider_send_started");
+
+    if (event.type === "succeeded") {
+      settlement.transition("headers_seen");
+      settlement.transition("streaming_tentative");
+      const text = event.resultRef;
+      emit("block_start", { index: 0, blockType: "text" });
+      emit("text_delta", { index: 0, delta: text });
+      emit("block_end", { index: 0, value: text });
+      emit("usage", { input: event.usage.input, output: event.usage.output, costMicros: event.usage.costMicros });
+      if (lease.enforcement.output === "hard" && lease.maxOutputTokens !== undefined && event.usage.output > lease.maxOutputTokens) {
+        this.#broker.release(lease.leaseId, lease.fencingToken, "hard output budget exceeded", observedAt);
+        emit("terminal", { outcome: "budget_exceeded", usage: event.usage });
+        settlement.settleTerminal("budget_exceeded", { facts: { usage: event.usage }, observedAt });
+      } else {
+        const success = this.#broker.markProviderSucceeded(lease.leaseId, lease.fencingToken, observedAt);
+        if (success.status !== "observed") throw new Error("lease no longer active");
+        emit("terminal", { outcome: "succeeded_terminal", usage: event.usage });
+        settlement.settleTerminal("succeeded_terminal", { facts: { usage: event.usage }, observedAt });
+      }
+    } else if (event.type === "rate_limited") {
+      settlement.transition("headers_seen");
+      const cooldown = this.#broker.markRateLimited(lease.resourceId, event.retryAfterMs, observedAt);
+      this.#broker.release(lease.leaseId, lease.fencingToken, "provider rate limited", observedAt);
+      emit("terminal", { outcome: "rate_limited", retryAfterMs: event.retryAfterMs });
+      settlement.settleTerminal("rate_limited", { facts: { retryAfterMs: event.retryAfterMs, capacityGroup: cooldown.capacityGroup }, observedAt });
+    } else if (event.type === "auth_fatal") {
+      settlement.transition("headers_seen");
+      this.#broker.markUnknown(lease.resourceId, observedAt, "provider auth fatal");
+      this.#broker.release(lease.leaseId, lease.fencingToken, "provider auth fatal", observedAt);
+      emit("terminal", { outcome: "auth_fatal" });
+      settlement.settleTerminal("auth_fatal", { observedAt });
+    } else {
+      this.#broker.release(lease.leaseId, lease.fencingToken, "provider failed before effect", observedAt);
+      emit("terminal", { outcome: "transport_before_headers", finishReason: event.reasonCode });
+      settlement.settleTerminal("transport_before_headers", { facts: { reasonCode: event.reasonCode }, observedAt });
+    }
+
+    socket.end();
+    return undefined; // streaming handled: #writeLine + end already done
   }
 
   async #providerAttempt(lease, inputDigest, signal) {
@@ -258,6 +387,47 @@ export function requestBrokerIpc({ socketPath, authorization, method, params = {
         const response = JSON.parse(buffered.trim());
         if (!response.ok) throw new Error(response.error);
         succeed(response.result);
+      } catch (error) { fail(error); }
+    });
+  });
+}
+
+/** Streaming client for framed provider responses. Reads NDJSON frames until
+ * the controller ends the socket. Returns { frames, terminal } where terminal
+ * is the frame whose type is "terminal". An error before streaming throws. */
+export function streamProviderIpc({ socketPath, authorization, context, signal }) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error("aborted"));
+    const socket = createConnection(socketPath);
+    socket.setEncoding("utf8");
+    let buffered = "";
+    let settled = false;
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    const fail = (error) => { if (settled) return; settled = true; cleanup(); socket.destroy(); reject(error); };
+    const succeed = (result) => { if (settled) return; settled = true; cleanup(); resolve(result); };
+    const onAbort = () => { socket.destroy(); fail(new Error("aborted")); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    socket.once("connect", () => {
+      if (!settled) socket.write(`${JSON.stringify({ id: randomBytes(8).toString("hex"), authorization, method: "providerStream", params: { context } })}\n`);
+    });
+    socket.on("data", (chunk) => { buffered += chunk; });
+    socket.once("error", fail);
+    socket.once("end", () => {
+      try {
+        const lines = buffered.trim().split("\n");
+        const frames = [];
+        let terminal = null;
+        for (const line of lines) {
+          if (!line) continue;
+          const response = JSON.parse(line);
+          if (!response.ok) throw new Error(response.error);
+          if (response.frame) {
+            frames.push(response.frame);
+            if (response.frame.type === "terminal") terminal = response.frame;
+          }
+        }
+        if (!terminal) throw new Error("stream ended without a terminal frame");
+        succeed({ frames, terminal });
       } catch (error) { fail(error); }
     });
   });

@@ -23,6 +23,7 @@ test("public API excludes test fixtures and exposes fake transport only through 
     "provisionBrokeredAgentDir",
     "requestBrokerIpc",
     "signedRegistryMessage",
+    "streamProviderIpc",
     "validateResultEvidence",
     "verifySignedRegistry",
   ]);

@@ -1,6 +1,6 @@
 # Controller-owned provider proxy protocol (design gate)
 
-Status: partially implemented. `src/provider-protocol.mjs` implements envelope validation, stream grammar, terminal CAS, phase machine, and outcome taxonomy as deterministic protocol primitives. Transport, credential resolution, framed IPC wiring, and a real provider adapter remain unimplemented; live use remains prohibited.
+Status: partially implemented. `src/provider-protocol.mjs` implements envelope validation, stream grammar, terminal CAS, phase machine, and outcome taxonomy as deterministic protocol primitives. `src/ipc.mjs` wires framed streaming through the `providerStream` IPC method: children send bounded typed context, the controller validates it through `captureLosslessJson`, creates an immutable `AttemptRouteSnapshot`, streams frames through `ProviderStreamAssembler`-validated grammar, and settles through `AttemptSettlement`. A real provider adapter, credential resolution, and live use remain unimplemented and prohibited.
 
 ## Authority boundary
 

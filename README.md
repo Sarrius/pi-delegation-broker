@@ -27,7 +27,7 @@ Validated locally on Node 26 with deterministic fake transport only. The fake tr
 - Persistent content-addressed, redacted controller evidence with command/file/test/URL semantic recapture comparators and explicit retention/pruning; self-reported evidence cannot satisfy acceptance.
 - SHA-256-hashed lease capabilities for owner-only Unix-socket IPC.
 - Signed Ed25519 capability-registry verification before supervisor startup.
-- Deterministic provider proxy protocol primitives: immutable `AttemptRouteSnapshot`, versioned framed envelope, strict stream grammar, exactly-once terminal CAS, attempt phase machine with crash-repair classification, and closed terminal/outcome vocabulary. No transport or credential wiring is included.
+- Framed streaming IPC: children send bounded typed context via `providerStream`; the controller validates it through `captureLosslessJson`, creates an immutable `AttemptRouteSnapshot`, streams `ProviderStreamAssembler`-validated frames, and settles through `AttemptSettlement`. A `streamProviderIpc` client reads NDJSON frames until the validated terminal. The legacy digest-only `providerAttempt` remains for backward compatibility. No real transport or credential is included.
 - Owner-only state directory, lock, socket, bounded shutdown and periodic TTL sweep.
 - A controller-only resolver that checks the exact approved model before creating a child policy.
 - Pre-handoff and post-session cleanup hooks for a compatible patched child launcher.

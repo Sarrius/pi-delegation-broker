@@ -1,5 +1,7 @@
 const INPUT_DIGEST = /^[a-f0-9]{64}$/;
 const EVENT_TYPES = new Set(["succeeded", "rate_limited", "auth_fatal", "failed_before_effect"]);
+const FAKE_REGISTRY_FP = "f1".repeat(32);
+const FAKE_CRED_FP = "e2".repeat(32);
 
 function nonNegativeInteger(value, name) {
   if (!Number.isInteger(value) || value < 0) throw new Error(`${name} must be a non-negative integer`);
@@ -77,5 +79,21 @@ export class ScriptedFakeProvider {
     plan.shift();
     const { delayMs: _delayMs, ...event } = planned;
     return structuredClone(event);
+  }
+
+  /** Test-only route info for the fake streaming path. A real adapter replaces this. */
+  routeForLease(lease) {
+    return {
+      provider: "fake",
+      model: lease.profile,
+      reasoningEffort: null,
+      apiDialect: "fake-stream",
+      endpointId: `fake-${lease.resourceId}`,
+      adapterId: "fake-adapter@0",
+      credentialRefFingerprint: FAKE_CRED_FP,
+      accountAlias: "fake-account",
+      registryFingerprint: FAKE_REGISTRY_FP,
+      registryVersion: 1,
+    };
   }
 }
