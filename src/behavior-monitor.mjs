@@ -1,28 +1,24 @@
 import { createHash } from "node:crypto";
+import { captureLosslessJson } from "./lossless-json.mjs";
 
 const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const STEP_ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$/;
 
-function canonicalize(value) {
-  if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error("behavior event contains a non-finite number");
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
-  if (!value || typeof value !== "object") throw new Error("behavior event must contain JSON-compatible values");
-  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalize(value[key])}`).join(",")}}`;
-}
-
-function digest(value) {
-  return createHash("sha256").update(canonicalize(value)).digest("hex");
+function digestCanonical(canonical) {
+  return createHash("sha256").update(canonical).digest("hex");
 }
 
 function requireAction(input) {
   if (!input || !STEP_ID.test(input.stepId ?? "") || !TOOL_NAME.test(input.toolName ?? "") || !Object.hasOwn(input, "args")) {
     throw new Error("behavior action requires bounded stepId, toolName, and args");
   }
-  return { stepId: input.stepId, toolName: input.toolName, args: input.args };
+  const captured = captureLosslessJson({ toolName: input.toolName, args: input.args });
+  return Object.freeze({
+    stepId: input.stepId,
+    toolName: captured.value.toolName,
+    args: captured.value.args,
+    actionHash: digestCanonical(captured.canonical),
+  });
 }
 
 function setEquals(left, right) {
@@ -69,10 +65,9 @@ export class BehavioralRunMonitor {
 
   declareAction(input) {
     if (this.#terminal) return this.#terminal;
-    const action = requireAction(input);
-    const declaration = Object.freeze({ ...action, actionHash: digest({ toolName: action.toolName, args: action.args }) });
-    this.#plans.set(action.stepId, declaration);
-    return Object.freeze({ status: "declared", stepId: action.stepId, actionHash: declaration.actionHash });
+    const declaration = requireAction(input);
+    this.#plans.set(declaration.stepId, declaration);
+    return Object.freeze({ status: "declared", stepId: declaration.stepId, actionHash: declaration.actionHash });
   }
 
   /** Must run before tool execution; a mismatch is blocked, not merely logged. */
@@ -80,7 +75,7 @@ export class BehavioralRunMonitor {
     if (this.#terminal) return this.#terminal;
     const action = requireAction(input);
     const declared = this.#plans.get(action.stepId);
-    const actualHash = digest({ toolName: action.toolName, args: action.args });
+    const actualHash = action.actionHash;
     if (!declared || declared.actionHash !== actualHash) {
       this.#metrics.planMismatches += 1;
       const terminal = this.#metrics.planMismatches >= this.#mismatchLimit;
@@ -110,7 +105,8 @@ export class BehavioralRunMonitor {
     if (!TOOL_NAME.test(toolName ?? "") || typeof isError !== "boolean" || typeof stateDigest !== "string" || !/^[a-f0-9]{64}$/.test(stateDigest)) {
       throw new Error("behavior result requires toolName, boolean isError, and controller stateDigest");
     }
-    const observation = digest({ toolName, args, result, isError, stateDigest });
+    const captured = captureLosslessJson({ toolName, args, result, isError, stateDigest });
+    const observation = digestCanonical(captured.canonical);
     if (observation === this.#lastObservation) {
       this.#repeatCount += 1;
       this.#metrics.repeatedNoProgress += 1;

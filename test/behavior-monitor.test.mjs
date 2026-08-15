@@ -79,3 +79,66 @@ test("worker completion is only an evidence-bound claim", () => {
   });
   assert.equal(monitor.metrics().completionClaims, 2);
 });
+
+test("behavior hashes one detached snapshot rather than caller-owned mutable arguments", () => {
+  const monitor = new BehavioralRunMonitor({ doneWhen: ["inspect"] });
+  const args = { options: { path: "/repo/a", force: false } };
+  monitor.declareAction({ stepId: "mutable", toolName: "read", args });
+  args.options.path = "/repo/b";
+
+  const changed = monitor.authorizeAction({ stepId: "mutable", toolName: "read", args });
+  assert.equal(changed.status, "reasoning_action_mismatch");
+  assert.equal(changed.block, true);
+});
+
+test("lossless behavior ingress rejects values JSON would erase or normalize", () => {
+  const rejected = [
+    -0,
+    Number.NaN,
+    new Date(0),
+    new Map([["command", "npm test"]]),
+    Object.assign(["npm test"], { extra: true }),
+    new Array(1),
+  ];
+  for (const [index, args] of rejected.entries()) {
+    const monitor = new BehavioralRunMonitor({ doneWhen: ["inspect"] });
+    assert.throws(
+      () => monitor.declareAction({ stepId: `invalid-${index}`, toolName: "bash", args }),
+      /lossless JSON/,
+    );
+  }
+
+  const cyclic = {};
+  cyclic.self = cyclic;
+  const monitor = new BehavioralRunMonitor({ doneWhen: ["inspect"] });
+  assert.throws(() => monitor.declareAction({ stepId: "cycle", toolName: "bash", args: cyclic }), /cycles/);
+});
+
+test("lossless behavior ingress never invokes accessors", () => {
+  let reads = 0;
+  const args = Object.defineProperty({}, "command", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return "npm test";
+    },
+  });
+  const monitor = new BehavioralRunMonitor({ doneWhen: ["inspect"] });
+  assert.throws(() => monitor.declareAction({ stepId: "getter", toolName: "bash", args }), /accessors/);
+  assert.equal(reads, 0);
+});
+
+test("canonical behavior hashing is independent of object key insertion order", () => {
+  const monitor = new BehavioralRunMonitor({ doneWhen: ["inspect"] });
+  monitor.declareAction({
+    stepId: "ordered",
+    toolName: "bash",
+    args: { command: "npm test", options: { quiet: true, color: false } },
+  });
+  const verdict = monitor.authorizeAction({
+    stepId: "ordered",
+    toolName: "bash",
+    args: { options: { color: false, quiet: true }, command: "npm test" },
+  });
+  assert.equal(verdict.status, "allowed");
+});

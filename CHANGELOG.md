@@ -4,6 +4,7 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## Unreleased
 
+- Behavioral action/result hashing now uses one bounded detached lossless-JSON snapshot; lossy numbers, sparse/decorated arrays, cycles, accessors and exotic containers fail closed instead of colliding or changing after declaration.
 - Added exact ready-task claim, pre-handoff requeue, `awaiting_result` crash reconciliation and terminal parent-result finalization.
 - Added clamped queue aging, protected control/verifier dispatch-window representatives and per-class p95/max wait metrics so neither strict priority nor an aged backlog hides a class.
 - Effect-capable contracts now fail closed with `behavioral_enforcement_unavailable` until a trusted launch path asserts a wired blocking monitor; the enforcement capability is carried on admitted leases.
