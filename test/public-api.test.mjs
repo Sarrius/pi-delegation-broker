@@ -18,7 +18,9 @@ test("public API excludes test fixtures and exposes fake transport only through 
     "SingleHostBrokerSupervisor",
     "SqliteLeaseBroker",
     "TERMINAL_OUTCOMES",
+    "compileEffectiveChildCapability",
     "createAttemptRouteSnapshot",
+    "createEffectiveChildCapability",
     "isTerminalOutcome",
     "outcomeProperties",
     "provisionBrokeredAgentDir",
@@ -26,7 +28,7 @@ test("public API excludes test fixtures and exposes fake transport only through 
     "signedRegistryMessage",
     "streamProviderIpc",
     "validateResultEvidence",
-    "verifySignedRegistry",
+    "verifySignedRegistry"
   ]);
   assert.equal("ScriptedFakeProvider" in api, false);
   assert.equal(typeof testing.ScriptedFakeProvider, "function");

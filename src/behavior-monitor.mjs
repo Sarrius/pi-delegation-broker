@@ -47,7 +47,9 @@ export class BehavioralRunMonitor {
     completionRejected: 0,
   };
 
-  constructor({ doneWhen, repeatedNoProgressLimit = 3, planMismatchLimit = 1 } = {}) {
+  #authorizationPolicy = null;
+
+  constructor({ doneWhen, repeatedNoProgressLimit = 3, planMismatchLimit = 1, authorizationPolicy = null } = {}) {
     if (!Array.isArray(doneWhen) || doneWhen.length < 1 || doneWhen.length > 20
       || doneWhen.some((item) => typeof item !== "string" || item.length < 1 || item.length > 500 || /[\0\r\n]/.test(item))) {
       throw new Error("behavior monitor requires 1-20 bounded doneWhen criteria");
@@ -61,6 +63,12 @@ export class BehavioralRunMonitor {
     this.#doneWhen = Object.freeze([...doneWhen]);
     this.#repeatLimit = repeatedNoProgressLimit;
     this.#mismatchLimit = planMismatchLimit;
+    if (authorizationPolicy) {
+      if (!authorizationPolicy.allowedTools || !(authorizationPolicy.allowedTools instanceof Set)) {
+        throw new Error("authorizationPolicy requires an allowedTools Set");
+      }
+      this.#authorizationPolicy = authorizationPolicy;
+    }
   }
 
   declareAction(input) {
@@ -74,6 +82,28 @@ export class BehavioralRunMonitor {
   authorizeAction(input) {
     if (this.#terminal) return this.#terminal;
     const action = requireAction(input);
+    if (this.#authorizationPolicy && !this.#authorizationPolicy.allowedTools.has(action.toolName)) {
+      this.#terminal = Object.freeze({
+        status: "tool_not_allowed",
+        block: true,
+        terminate: true,
+        cause: `tool ${action.toolName} is outside the capability allowedTools`,
+        retryable: false,
+        nextAction: "use only the tools declared in the effective child capability",
+      });
+      return this.#terminal;
+    }
+    if (this.#authorizationPolicy?.effectCapable && !this.#authorizationPolicy.requiresBehavioralMonitor) {
+      this.#terminal = Object.freeze({
+        status: "behavioral_enforcement_unavailable",
+        block: true,
+        terminate: true,
+        cause: "effect-capable operation without a wired blocking behavioral monitor",
+        retryable: false,
+        nextAction: "wire a blocking monitor before attempting effects",
+      });
+      return this.#terminal;
+    }
     const declared = this.#plans.get(action.stepId);
     const actualHash = action.actionHash;
     if (!declared || declared.actionHash !== actualHash) {
