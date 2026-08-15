@@ -530,3 +530,77 @@ test("SQLite ledger is durable and redacts canary secrets", () => {
   assert.equal(existsSync(path), true);
   rmSync(directory, { recursive: true, force: true });
 });
+
+
+test("transactional registry reload replaces registry when no active leases or tasks", () => {
+  const dir = mkdtempSync(join(tmpdir(), "broker-reload-"));
+  try {
+    const broker = new SqliteLeaseBroker({ path: join(dir, "b.sqlite"), registry: fixtureRegistry() });
+    const newRegistry = fixtureRegistry();
+    newRegistry.resources = {
+      ...fixtureRegistry().resources,
+      R4: { capacityGroup: "G-cheap", profile: "audit-low/v1", confidence: "measured", enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" } },
+    };
+    const result = broker.reloadRegistry(newRegistry, Date.now());
+    assert.equal(result.status, "reloaded");
+    // The old resources (R1, R2) are gone; only the new set remains
+    const reservation = broker.reserve(fixtureContract({ taskId: "reload-test" }), Date.now());
+    assert.equal(reservation.status, "leased");
+    // R4 exists in the new registry and is available for the audit-low profile
+    const auditReservation = broker.reserve(fixtureContract({
+      taskId: "reload-audit",
+      capability: { minimumProfile: "audit-low/v1", required: ["read_only_audit"], downgradePolicy: "forbid" },
+    }), Date.now());
+    assert.equal(auditReservation.status, "leased");
+    assert.equal(auditReservation.lease.resourceId, "R4");
+    broker.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("registry reload is denied while active leases exist", () => {
+  const dir = mkdtempSync(join(tmpdir(), "broker-reload-busy-"));
+  try {
+    const broker = new SqliteLeaseBroker({ path: join(dir, "b.sqlite"), registry: fixtureRegistry() });
+    const reservation = broker.reserve(fixtureContract({ taskId: "busy-task" }), Date.now());
+    assert.equal(reservation.status, "leased");
+    const result = broker.reloadRegistry(fixtureRegistry(), Date.now());
+    assert.equal(result.status, "denied");
+    assert.equal(result.reason, "active_leases_exist");
+    broker.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("registry reload is denied while active pending tasks exist", () => {
+  const dir = mkdtempSync(join(tmpdir(), "broker-reload-queue-"));
+  try {
+    const broker = new SqliteLeaseBroker({ path: join(dir, "b.sqlite"), registry: fixtureRegistry() });
+    // Consume both reasoning-high resources so submit queues
+    const r1 = broker.reserve(fixtureContract({ taskId: "holder-1" }), Date.now());
+    const r2 = broker.reserve(fixtureContract({ taskId: "holder-2" }), Date.now());
+    const submitted = broker.submit(fixtureContract({ taskId: "queued-task", recovery: { owner: "controller", deadlineAt: Date.now() + 60_000 } }), Date.now());
+    assert.equal(submitted.status, "queued");
+    // Release both holders so no active leases remain, but the waiting task persists
+    broker.release(r1.lease.leaseId, r1.lease.fencingToken, "test", Date.now());
+    broker.release(r2.lease.leaseId, r2.lease.fencingToken, "test", Date.now());
+    const result = broker.reloadRegistry(fixtureRegistry(), Date.now());
+    assert.equal(result.status, "denied");
+    assert.equal(result.reason, "active_tasks_exist");
+    broker.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("registry reload with invalid candidate rolls back to previous registry", () => {
+  const dir = mkdtempSync(join(tmpdir(), "broker-reload-invalid-"));
+  try {
+    const broker = new SqliteLeaseBroker({ path: join(dir, "b.sqlite"), registry: fixtureRegistry() });
+    const badRegistry = fixtureRegistry();
+    badRegistry.resources = {
+      R4: { capacityGroup: "G-nonexistent", profile: "audit-low/v1", confidence: "measured", enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" } },
+    };
+    assert.throws(() => broker.reloadRegistry(badRegistry, Date.now()), /Invalid resource policy/);
+    // The old registry should still work
+    const reservation = broker.reserve(fixtureContract({ taskId: "after-rollback" }), Date.now());
+    assert.equal(reservation.status, "leased");
+    broker.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

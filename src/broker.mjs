@@ -651,7 +651,7 @@ export class SqliteLeaseBroker {
     if (!resourceColumns.includes("inventory_confidence")) this.#db.exec("ALTER TABLE resources ADD COLUMN inventory_confidence TEXT NOT NULL DEFAULT 'assumed'");
   }
 
-  #seed(registry) {
+  #validateRegistry(registry) {
     if (!registry?.profiles || !registry?.capacityGroups || !registry?.resources) throw new Error("Broker registry needs profiles, capacityGroups, and resources");
     for (const [id, group] of Object.entries(registry.capacityGroups)) {
       if (!Number.isSafeInteger(group?.maxConcurrent) || group.maxConcurrent < 1
@@ -670,7 +670,9 @@ export class SqliteLeaseBroker {
         throw new Error(`Invalid resource policy: ${id}`);
       }
     }
-    this.#transaction(() => {
+  }
+
+  #insertRegistry(registry) {
       for (const [id, profile] of Object.entries(registry.profiles)) {
         const capabilities = JSON.stringify(profile.supports);
         this.#db.prepare("INSERT OR IGNORE INTO profiles (id, status, capabilities) VALUES (?, ?, ?)")
@@ -735,6 +737,36 @@ export class SqliteLeaseBroker {
           throw new Error(`Persisted ${table} membership differs from the supplied registry; audited migration is required`);
         }
       }
+  }
+
+  #seed(registry) {
+    this.#validateRegistry(registry);
+    this.#transaction(() => this.#insertRegistry(registry));
+  }
+
+  /**
+   * Transactional registry reload: validate the candidate, drain active leases
+   * and tasks, atomically delete the old registry and insert the new one. If
+   * the transaction fails, SQLite rollback preserves the previous registry.
+   */
+  reloadRegistry(newRegistry, now) {
+    this.#assertNondecreasingTime(now);
+    this.#validateRegistry(newRegistry);
+    return this.#transaction(() => {
+      const activeLeases = this.#db.prepare("SELECT count(*) AS count FROM leases WHERE expires_at > ?").get(now);
+      if (activeLeases.count > 0) return { status: "denied", reason: "active_leases_exist", count: activeLeases.count };
+      const activeTasks = this.#db.prepare("SELECT count(*) AS count FROM pending_tasks WHERE state IN ('waiting','ready','claimed','awaiting_result')").get();
+      if (activeTasks.count > 0) return { status: "denied", reason: "active_tasks_exist", count: activeTasks.count };
+      this.#db.prepare("DELETE FROM resources").run();
+      this.#db.prepare("DELETE FROM capacity_groups").run();
+      this.#db.prepare("DELETE FROM profiles").run();
+      this.#insertRegistry(newRegistry);
+      this.#record(now, "RegistryReloaded", {
+        profiles: Object.keys(newRegistry.profiles).length,
+        capacityGroups: Object.keys(newRegistry.capacityGroups).length,
+        resources: Object.keys(newRegistry.resources).length,
+      });
+      return { status: "reloaded" };
     });
   }
 
