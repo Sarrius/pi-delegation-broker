@@ -4,7 +4,7 @@
 
 **Local Git commit:** see `git log -1 --oneline` (recorded after final local release preparation)
 
-**Publication state:** prepared locally; no GitHub remote, npm publication, npm package-name query or real provider request was made.
+**Publication state:** public GitHub repository created and `main` pushed; no npm package has been uploaded and no real provider request was made.
 
 ## Passed local evidence
 
@@ -17,11 +17,12 @@
 - `git diff --check`, staged diff check and Git object integrity check passed.
 - The launcher seam patch applies with `git apply --check` to `pi-subagent-workflow` commit `0c28ce87bc45f4c3d66e0100b58ae13cf345978c`. Patch SHA-256: `0dffa9bd90f8abee2c870e6479044e68ce6b01118ddea900d04fa00084eddc8a`.
 - Non-live upstream integration scenarios (success, 429, expiry, stale capability and cancellation) passed using only `ScriptedFakeProvider`.
+- GitHub Actions CI passed on Ubuntu and macOS for the pushed `main` commit. `main` requires both CI checks, linear history and resolved conversations; force-push and branch deletion are disabled.
+- Private vulnerability reporting, Dependabot configuration and a reviewer-protected `npm-publish` GitHub Environment are enabled.
 
 ## Required human/remote actions before first public release
 
-1. Confirm ownership/availability of `@sars267/pi-delegation-broker` and that the GitHub owner/repository URL in `package.json` is correct.
-2. Create/push the public GitHub repository and enable branch protection plus private vulnerability reporting.
-3. Configure npm trusted publishing for exactly `.github/workflows/publish.yml`; protect the `npm-publish` environment with a reviewer.
-4. Re-run the checklist in [`RELEASE.md`](RELEASE.md), create `v0.1.0-alpha.0`, and use the manually dispatched workflow with the `next` tag.
-5. Do not claim production readiness or connect real accounts/credentials until the provider-proxy, signing-key lifecycle, controller reconciliation and read-only capacity-inventory gates are complete.
+1. Configure npm trusted publishing for `@sars267/pi-delegation-broker` and exactly `.github/workflows/publish.yml`. Do not add an npm token to GitHub secrets.
+2. Re-run the checklist in [`RELEASE.md`](RELEASE.md), create `v0.1.0-alpha.0`, and use the manually dispatched workflow with the `next` tag.
+3. Verify the npm provenance attestation and the published tarball manifest before creating GitHub release notes.
+4. Do not claim production readiness or connect real accounts/credentials until the provider-proxy, signing-key lifecycle, controller reconciliation and read-only capacity-inventory gates are complete.

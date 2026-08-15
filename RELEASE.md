@@ -5,10 +5,10 @@ This document prepares a public prerelease. It does **not** authorize a live pro
 ## One-time maintainer setup
 
 1. Confirm the npm package name is available. If it is not, update `name`, repository URLs, README install command and this file together.
-2. Create the GitHub repository `Sarrius/pi-delegation-broker` as **public**. Enable private vulnerability reporting and branch protection for `main`.
-3. Push this repository; do not push the parent research directory.
+2. Ensure the GitHub repository `Sarrius/pi-delegation-broker` is **public**, has private vulnerability reporting, and protects `main`.
+3. Push only this repository; do not push the parent research directory.
 4. In npm, configure trusted publishing for this exact GitHub repository and the `.github/workflows/publish.yml` workflow. Do not place an npm automation token in GitHub secrets.
-5. Create a protected GitHub Environment named `npm-publish` with required reviewer(s).
+5. Ensure the protected GitHub Environment named `npm-publish` has required reviewer(s).
 6. Create the npm `next` dist-tag through the first prerelease. Promote to `latest` only after production readiness is separately reviewed.
 
 ## Before every release
