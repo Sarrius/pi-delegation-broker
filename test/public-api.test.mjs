@@ -5,6 +5,7 @@ import * as testing from "../src/testing.mjs";
 
 test("public API excludes test fixtures and exposes fake transport only through the testing subpath", () => {
   assert.deepEqual(Object.keys(api).sort(), [
+    "ArtifactPipeline",
     "AttemptSettlement",
     "BehavioralRunMonitor",
     "BrokerIpcServer",

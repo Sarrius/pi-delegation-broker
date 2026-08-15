@@ -3,6 +3,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync } from "n
 import { createConnection, createServer } from "node:net";
 import { dirname } from "node:path";
 import { captureLosslessJson } from "./lossless-json.mjs";
+import { ArtifactPipeline } from "./artifact-pipeline.mjs";
 import { AttemptSettlement, ProviderStreamAssembler, createAttemptRouteSnapshot } from "./provider-protocol.mjs";
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const CHILD_METHODS = new Set(["heartbeat", "release", "providerAttempt", "providerStream"]);
@@ -251,6 +252,7 @@ export class BrokerIpcServer {
       maxTotalOutputBytes: 1_000_000,
     });
     const settlement = new AttemptSettlement(snapshot);
+    const pipeline = new ArtifactPipeline({ maxPending: 256, maxTotalBytes: 64 * 1024 * 1024 });
 
     // Phase 3: run fake provider (async, before any frame writes)
     const event = await this.#fakeProvider.attempt(lease, inputDigest, signal);
@@ -309,6 +311,17 @@ export class BrokerIpcServer {
       settlement.settleTerminal("transport_before_headers", { facts: { reasonCode: event.reasonCode }, observedAt });
     }
 
+    // Terminal durability barrier: drain all pending evidence/projection work
+    // before marking the terminal as persisted. If the barrier fails, the
+    // settlement stays at terminal_validated (crash-repair: terminal_unpersisted).
+    try {
+      pipeline.barrier();
+      settlement.markPersisted();
+    } catch {
+      // The terminal frame was already sent; persistence is ambiguous. The
+      // controller crash-repair class remains terminal_unpersisted so recovery
+      // can retry persistence or escalate instead of treating this as settled.
+    }
     socket.end();
     return undefined; // streaming handled: #writeLine + end already done
   }

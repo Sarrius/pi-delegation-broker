@@ -19,6 +19,7 @@ export {
   isTerminalOutcome,
   outcomeProperties,
 } from "./provider-protocol.mjs";
+export { ArtifactPipeline } from "./artifact-pipeline.mjs";
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";
 export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
 export { BrokeredLaunchResolver } from "./trusted-launch-resolver.mjs";
