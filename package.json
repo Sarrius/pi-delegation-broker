@@ -1,6 +1,6 @@
 {
   "name": "@sars267/pi-delegation-broker",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0-alpha.1",
   "description": "Non-production, single-host reference broker for capability-scoped Pi child delegation.",
   "type": "module",
   "main": "./src/index.mjs",
