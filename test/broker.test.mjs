@@ -4,6 +4,7 @@ import test from "node:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { SqliteLeaseBroker, fixtureContract, fixtureRegistry } from "../src/broker.mjs";
 
@@ -99,10 +100,175 @@ test("429 moves only to an approved equivalent profile and otherwise pauses capa
   assert.equal(stopped.earliestCompatibleAt, 6_001);
 }));
 
+test("queued capacity work wakes after lease release and becomes ready without a child process waiting", () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  withBroker((broker) => {
+    const first = leased(broker, fixtureContract({ taskId: "occupant" }), 1_000);
+    const queued = broker.submit(fixtureContract({
+      taskId: "queued-control",
+      recovery: { owner: "root-controller", deadlineAt: 60_000 },
+    }), 1_001);
+    assert.equal(queued.status, "queued");
+    assert.equal(queued.eligibleAt, first.expiresAt);
+    assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["waiting"]);
+
+    broker.release(first.leaseId, first.fencingToken, "completed", 1_002);
+    const ready = broker.dispatchPending(1_002);
+    assert.equal(ready.length, 1);
+    assert.equal(ready[0].taskId, "queued-control");
+    assert.equal(ready[0].lease.admissionClass, "control");
+    assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["ready"]);
+  }, registry);
+});
+
+test("queued work without a named recovery owner and deadline is rejected instead of waiting forever", () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  withBroker((broker) => {
+    leased(broker, fixtureContract({ taskId: "occupant" }), 1_000);
+    const result = broker.submit(fixtureContract({ taskId: "ownerless", recovery: undefined }), 1_001);
+    assert.equal(result.status, "denied_policy");
+    assert.match(result.reasons[0], /recovery owner/);
+    assert.deepEqual(broker.pendingTasks(), []);
+  }, registry);
+});
+
+test("durable queue has a hard entry bound and over-capacity work is explicitly escalated", () => {
+  const directory = mkdtempSync(join(tmpdir(), "delegation-broker-mvp-queue-bound-"));
+  const path = join(directory, "broker.sqlite");
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  const broker = new SqliteLeaseBroker({ path, registry, maxPendingTasks: 1 });
+  try {
+    leased(broker, fixtureContract({ taskId: "occupant" }), 1_000);
+    assert.equal(broker.submit(fixtureContract({ taskId: "queued-one" }), 1_001).status, "queued");
+    const overflow = broker.submit(fixtureContract({ taskId: "queued-two", recovery: { owner: "root-owner", deadlineAt: 60_000 } }), 1_002);
+    assert.equal(overflow.status, "denied_capacity");
+    assert.equal(overflow.reasonCode, "queue_full");
+    assert.equal(overflow.recoveryOwner, "root-owner");
+    assert.equal(broker.pendingTasks().length, 1);
+  } finally {
+    broker.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("capacity wait reaches explicit owner escalation at its deadline", () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  withBroker((broker) => {
+    leased(broker, fixtureContract({ taskId: "occupant" }), 1_000);
+    assert.equal(broker.submit(fixtureContract({
+      taskId: "deadline-waiter",
+      recovery: { owner: "human-owner", deadlineAt: 2_000 },
+    }), 1_001).status, "queued");
+    assert.deepEqual(broker.dispatchPending(2_000), []);
+    assert.deepEqual(broker.pendingTasks().map((task) => ({ state: task.state, owner: task.recoveryOwner })), [
+      { state: "escalated", owner: "human-owner" },
+    ]);
+    assert.equal(broker.events().some((event) => event.type === "TaskEscalated" && event.payload.taskId === "deadline-waiter"), true);
+  }, registry);
+});
+
+test("work fan-out cannot consume control and verifier admission reserves", () => {
+  const registry = fixtureRegistry();
+  registry.capacityGroups["G-shared"] = {
+    ...registry.capacityGroups["G-shared"],
+    maxConcurrent: 3,
+    admission: { controlReserve: 1, verifyReserve: 1 },
+  };
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  withBroker((broker) => {
+    assert.equal(broker.reserve(fixtureContract({ taskId: "work-1", admissionClass: "work" }), 1_000).status, "leased");
+    assert.equal(broker.reserve(fixtureContract({ taskId: "work-2", admissionClass: "work" }), 1_000).status, "denied_capacity");
+    assert.equal(broker.reserve(fixtureContract({ taskId: "verifier", admissionClass: "verify" }), 1_000).status, "leased");
+    assert.equal(broker.reserve(fixtureContract({ taskId: "merger", admissionClass: "control" }), 1_000).status, "leased");
+    assert.deepEqual(broker.leases().map((lease) => lease.admissionClass).sort(), ["control", "verify", "work"]);
+  }, registry);
+});
+
+test("assumed inventory cannot back a route that claims hard budget enforcement", () => {
+  const registry = fixtureRegistry();
+  for (const group of Object.values(registry.capacityGroups)) group.confidence = "assumed";
+  withBroker((broker) => {
+    const result = broker.reserve(fixtureContract(), 1_000);
+    assert.equal(result.status, "denied_policy");
+    assert.match(result.reasons[0], /assumed inventory/);
+    assert.equal(broker.leases().length, 0);
+  }, registry);
+});
+
+test("cooldown default comes from registry and only one half-open probe is admitted", () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  registry.capacityGroups["G-shared"].cooldown = { defaultMs: 10_000, probeIntervalMs: 2_000 };
+  withBroker((broker) => {
+    const initial = leased(broker, fixtureContract({ taskId: "initial" }), 1_000);
+    const cooldown = broker.markRateLimited(initial.resourceId, undefined, 1_001);
+    assert.equal(cooldown.until, 11_001);
+    broker.release(initial.leaseId, initial.fencingToken, "429", 1_001);
+    assert.equal(broker.reserve(fixtureContract({ taskId: "too-early" }), 11_000).earliestCompatibleAt, 11_001);
+
+    const probe = broker.reserve(fixtureContract({ taskId: "probe" }), 11_001);
+    assert.equal(probe.status, "leased");
+    assert.equal(probe.lease.probe, true);
+    const follower = broker.reserve(fixtureContract({ taskId: "follower" }), 11_001);
+    assert.equal(follower.status, "denied_capacity");
+    assert.equal(follower.earliestCompatibleAt, probe.lease.expiresAt);
+
+    assert.equal(broker.markProviderSucceeded(probe.lease.leaseId, probe.lease.fencingToken, 11_002).breakerClosed, true);
+    broker.release(probe.lease.leaseId, probe.lease.fencingToken, "probe success", 11_002);
+    const normal = broker.reserve(fixtureContract({ taskId: "normal" }), 11_002);
+    assert.equal(normal.status, "leased");
+    assert.equal(normal.lease.probe, false);
+  }, registry);
+});
+
+test("a pre-cooldown in-flight success cannot close a breaker opened by another lease", () => {
+  const registry = fixtureRegistry();
+  registry.capacityGroups["G-shared"] = {
+    ...registry.capacityGroups["G-shared"],
+    maxConcurrent: 2,
+    admission: { controlReserve: 1, verifyReserve: 0 },
+    cooldown: { defaultMs: 10_000, probeIntervalMs: 2_000 },
+  };
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  withBroker((broker) => {
+    const limited = leased(broker, fixtureContract({ taskId: "limited" }), 1_000);
+    const olderSuccess = leased(broker, fixtureContract({ taskId: "older-success" }), 1_000);
+    const cooldown = broker.markRateLimited(limited.resourceId, undefined, 1_001);
+    broker.release(limited.leaseId, limited.fencingToken, "429", 1_001);
+    const observed = broker.markProviderSucceeded(olderSuccess.leaseId, olderSuccess.fencingToken, 1_002);
+    assert.equal(observed.breakerClosed, false);
+    broker.release(olderSuccess.leaseId, olderSuccess.fencingToken, "completed", 1_002);
+    const blocked = broker.reserve(fixtureContract({ taskId: "must-stay-cooling" }), 1_003);
+    assert.equal(blocked.status, "denied_capacity");
+    assert.equal(blocked.earliestCompatibleAt, cooldown.until);
+  }, registry);
+});
+
 test("high-risk work is denied before lease when a requested budget dimension is not hard", () => withBroker((broker) => {
   const result = broker.reserve(fixtureContract({ operationClass: "external_write" }), 1_000);
   assert.equal(result.status, "denied_policy");
   assert.match(result.reasons[0], /hard budget enforcement/);
+  assert.equal(broker.leases().length, 0);
+}));
+
+test("high-risk work cannot omit a hard budget dimension", () => withBroker((broker) => {
+  const result = broker.reserve(fixtureContract({
+    operationClass: "external_write",
+    budget: { maxInputTokens: 100, maxOutputTokens: 10, enforcement: { input: "hard", output: "hard" } },
+  }), 1_000);
+  assert.equal(result.status, "denied_policy");
+  assert.match(result.reasons[0], /input, output, and cost/);
   assert.equal(broker.leases().length, 0);
 }));
 
@@ -112,8 +278,11 @@ test("typed effect receipts are approval-bound and idempotent", () => {
   withBroker((broker) => {
     const lease = leased(broker, fixtureContract({
       operationClass: "apply",
-      budget: { maxOutputTokens: 10, enforcement: { input: "hard", output: "hard", cost: "hard" } },
+      budget: { maxInputTokens: 100, maxOutputTokens: 10, maxCostMicros: 1_000, enforcement: { input: "hard", output: "hard", cost: "hard" } },
     }));
+    assert.equal(lease.maxInputTokens, 100);
+    assert.equal(lease.maxOutputTokens, 10);
+    assert.equal(lease.maxCostMicros, 1_000);
     const intent = {
       taskId: lease.taskId,
       leaseId: lease.leaseId,
@@ -129,6 +298,51 @@ test("typed effect receipts are approval-bound and idempotent", () => {
     assert.equal(replay.status, "replayed");
     assert.deepEqual(replay.receipt, first.receipt);
   }, registry);
+});
+
+test("durable queued contracts redact secret-shaped text before SQLite persistence", () => {
+  const directory = mkdtempSync(join(tmpdir(), "delegation-broker-mvp-queue-redaction-"));
+  const path = join(directory, "broker.sqlite");
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  const broker = new SqliteLeaseBroker({ path, registry });
+  try {
+    leased(broker, fixtureContract({ taskId: "occupant" }), 1_000);
+    assert.equal(broker.submit(fixtureContract({
+      taskId: "secret-queue",
+      intent: "CANARY_SECRET_queue_must_not_persist",
+      recovery: { owner: "root-controller", deadlineAt: 60_000 },
+    }), 1_001).status, "queued");
+  } finally {
+    broker.close();
+  }
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const serialized = database.prepare("SELECT contract FROM pending_tasks WHERE task_id = 'secret-queue'").get().contract;
+    assert.equal(serialized.includes("CANARY_SECRET_queue_must_not_persist"), false);
+    assert.match(serialized, /\[REDACTED\]/);
+  } finally {
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a changed registry cannot silently leave stale persisted admission policy active", () => {
+  const directory = mkdtempSync(join(tmpdir(), "delegation-broker-mvp-registry-transition-"));
+  const path = join(directory, "broker.sqlite");
+  const first = new SqliteLeaseBroker({ path, registry: fixtureRegistry() });
+  first.close();
+  const changed = fixtureRegistry();
+  changed.capacityGroups["G-cheap"].admission.verifyReserve = 2;
+  try {
+    assert.throws(
+      () => new SqliteLeaseBroker({ path, registry: changed }),
+      /audited migration is required/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("SQLite ledger is durable and redacts canary secrets", () => {

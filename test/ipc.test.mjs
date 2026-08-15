@@ -23,6 +23,7 @@ async function reserveCapability(server, taskId, maxOutputTokens = 100, contract
       contract: fixtureContract({
         taskId,
         budget: {
+          maxInputTokens: 1_000,
           maxOutputTokens,
           enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" },
         },

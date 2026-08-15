@@ -19,6 +19,10 @@ Validated locally on Node 26 with deterministic fake transport only. The fake tr
 ## What it provides
 
 - SQLite (`BEGIN IMMEDIATE` + WAL) lease reservation, TTL, fencing and shared capacity groups.
+- Durable bounded task waiting with named recovery owner/deadline and supervisor wake-up after capacity changes.
+- `control | verify | work` admission classes with capacity reserved for merger/verifier control paths.
+- Registry-defined inventory confidence, pessimistic cooldown policy and one half-open probe per group.
+- Controller-rooted evidence capture/validation; self-reported evidence cannot satisfy acceptance.
 - SHA-256-hashed lease capabilities for owner-only Unix-socket IPC.
 - Signed Ed25519 capability-registry verification before supervisor startup.
 - Owner-only state directory, lock, socket, bounded shutdown and periodic TTL sweep.
@@ -30,6 +34,7 @@ Validated locally on Node 26 with deterministic fake transport only. The fake tr
 
 - A real provider proxy, streaming upstream API calls, credential vault or account discovery.
 - Multi-host coordination, automatic stale-lock recovery, production daemon/service management or dashboard.
+- A complete controller scheduler that turns every ready queued lease into a child launch. The reference exposes durable readiness; integration remains controller-owned.
 - Signing-key storage, rotation, revocation or registry distribution.
 - A stable upstream Pi launcher API. The [integration patch](https://github.com/Sarrius/pi-delegation-broker/tree/main/patches) is source-repository-only and is **not** installed by this package.
 - A sandbox. Worktrees and a minimal environment are not operating-system isolation.
@@ -56,11 +61,13 @@ Do not install from npm until the repository release checklist is complete and t
 import {
   SingleHostBrokerSupervisor,
   BrokeredLaunchResolver,
+  ControllerEvidenceStore,
+  validateResultEvidence,
   verifySignedRegistry,
 } from "@sars267/pi-delegation-broker";
 ```
 
-A supervisor requires a signed registry by default. Passing an unsigned fixture requires the explicit `allowUnsignedFixture: true` escape hatch, which exists only for deterministic tests.
+A supervisor requires signed registry schema v2 by default. Registry capacity groups must declare admission reserves, inventory confidence, default cooldown and probe interval; resources must declare their own inventory confidence. These fields are fail-closed because inferred capacity must not masquerade as measured capacity. If a durable database contains different policy values or removed/extra registry IDs, startup refuses an implicit transition and requires an audited migration/new state directory. Passing an unsigned fixture requires the explicit `allowUnsignedFixture: true` escape hatch, which exists only for deterministic tests.
 
 The controller owns all of these values:
 

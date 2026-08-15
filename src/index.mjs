@@ -4,6 +4,7 @@
  * provider failover implementation.
  */
 export { SqliteLeaseBroker } from "./broker.mjs";
+export { ControllerEvidenceStore, validateResultEvidence } from "./evidence.mjs";
 export { BrokerIpcServer, requestBrokerIpc } from "./ipc.mjs";
 export { provisionBrokeredAgentDir } from "./isolated-child-config.mjs";
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";

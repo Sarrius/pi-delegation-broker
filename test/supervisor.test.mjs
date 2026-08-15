@@ -75,6 +75,52 @@ test("single-host supervisor owns an owner-only state dir, socket, lock and peri
   }
 });
 
+test("supervisor scheduler wakes queued controller work after capacity is released", async () => {
+  const stateDir = stateDirectory("broker-supervisor-queue-");
+  const supervisor = new SingleHostBrokerSupervisor({
+    stateDir,
+    registry: oneCapacityRegistry(),
+    allowUnsignedFixture: true,
+    controllerToken: CONTROLLER_TOKEN,
+    sweepIntervalMs: 100,
+  });
+  try {
+    await supervisor.start();
+    const occupant = await reserve(supervisor, "queue-occupant", { leaseTtlMs: 60_000 });
+    const queued = await requestBrokerIpc({
+      socketPath: supervisor.socketPath,
+      authorization: supervisor.controllerToken,
+      method: "submit",
+      params: { contract: fixtureContract({
+        taskId: "queue-waiter",
+        recovery: { owner: "root-controller", deadlineAt: Date.now() + 60_000 },
+      }) },
+    });
+    assert.equal(queued.status, "queued");
+    await requestBrokerIpc({
+      socketPath: supervisor.socketPath,
+      authorization: supervisor.controllerToken,
+      method: "release",
+      params: { leaseId: occupant.lease.leaseId, fencingToken: occupant.lease.fencingToken },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    const snapshot = supervisor.auditSnapshot();
+    assert.deepEqual(snapshot.pendingTasks.map((task) => task.state), ["ready"]);
+    assert.equal(snapshot.leases.some((lease) => lease.taskId === "queue-waiter"), true);
+    const ready = await requestBrokerIpc({
+      socketPath: supervisor.socketPath,
+      authorization: supervisor.controllerToken,
+      method: "readyTasks",
+    });
+    assert.equal(ready.length, 1);
+    assert.equal(ready[0].taskId, "queue-waiter");
+    assert.equal(ready[0].lease.taskId, "queue-waiter");
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("supervisor fails closed on a stale/foreign lock without deleting it", async () => {
   const stateDir = stateDirectory("broker-supervisor-lock-");
   const lockPath = join(stateDir, "broker.lock");

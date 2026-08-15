@@ -4,7 +4,10 @@ import { createConnection, createServer } from "node:net";
 import { dirname } from "node:path";
 const MAX_REQUEST_BYTES = 64 * 1024;
 const CHILD_METHODS = new Set(["heartbeat", "release", "providerAttempt"]);
-const CONTROLLER_METHODS = new Set(["reserve", "issueLeaseCapability", "markRateLimited", "markUnknown", "markHealthy", "release", "configureFakeProvider"]);
+const CONTROLLER_METHODS = new Set([
+  "reserve", "submit", "dispatchPending", "pendingTasks", "readyTasks", "reschedulePending", "finishPending",
+  "issueLeaseCapability", "markRateLimited", "markUnknown", "markHealthy", "release", "configureFakeProvider",
+]);
 
 function sameSecret(left, right) {
   if (typeof left !== "string" || typeof right !== "string") return false;
@@ -153,6 +156,12 @@ export class BrokerIpcServer {
     if (sameSecret(authorization, this.#controllerToken)) {
       if (!CONTROLLER_METHODS.has(method)) throw new Error("controller_method_not_allowed");
       if (method === "reserve") return this.#broker.reserve(params.contract, now);
+      if (method === "submit") return this.#broker.submit(params.contract, now);
+      if (method === "dispatchPending") return this.#broker.dispatchPending(now, params.limit);
+      if (method === "pendingTasks") return this.#broker.pendingTasks();
+      if (method === "readyTasks") return this.#broker.readyTasks();
+      if (method === "reschedulePending") return this.#broker.reschedulePending(params.taskId, params.recoveryOwner, params.eligibleAt, now);
+      if (method === "finishPending") return this.#broker.finishPending(params.taskId, params.state, now);
       if (method === "issueLeaseCapability") return this.#broker.issueLeaseCapability(params.leaseId, params.fencingToken, now);
       if (method === "markRateLimited") return this.#broker.markRateLimited(params.resourceId, params.retryAfterMs, now);
       if (method === "markUnknown") return this.#broker.markUnknown(params.resourceId, now, params.reason);
@@ -184,6 +193,8 @@ export class BrokerIpcServer {
     const telemetry = this.#broker.recordProviderEvent(lease.leaseId, lease.fencingToken, inputDigest, event, observedAt);
     if (telemetry.status !== "recorded") throw new Error("lease no longer active");
     if (event.type === "succeeded") {
+      const success = this.#broker.markProviderSucceeded(lease.leaseId, lease.fencingToken, observedAt);
+      if (success.status !== "observed") throw new Error("lease no longer active");
       if (lease.enforcement.output === "hard" && lease.maxOutputTokens !== undefined && event.usage.output > lease.maxOutputTokens) {
         this.#broker.release(lease.leaseId, lease.fencingToken, "hard output budget exceeded", observedAt);
         return { status: "budget_exceeded", maxOutputTokens: lease.maxOutputTokens };

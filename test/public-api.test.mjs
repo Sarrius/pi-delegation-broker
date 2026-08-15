@@ -7,11 +7,13 @@ test("public API excludes test fixtures and exposes fake transport only through 
   assert.deepEqual(Object.keys(api).sort(), [
     "BrokerIpcServer",
     "BrokeredLaunchResolver",
+    "ControllerEvidenceStore",
     "SingleHostBrokerSupervisor",
     "SqliteLeaseBroker",
     "provisionBrokeredAgentDir",
     "requestBrokerIpc",
     "signedRegistryMessage",
+    "validateResultEvidence",
     "verifySignedRegistry",
   ]);
   assert.equal("ScriptedFakeProvider" in api, false);

@@ -144,7 +144,7 @@ export class SingleHostBrokerSupervisor {
   /** Controller-local redacted read-only state; never exposed through child IPC. */
   auditSnapshot() {
     if (!this.#broker) throw new Error("Broker supervisor is not running");
-    return deepFreeze(structuredClone({ leases: this.#broker.leases(), events: this.#broker.events() }));
+    return deepFreeze(structuredClone({ leases: this.#broker.leases(), pendingTasks: this.#broker.pendingTasks(), events: this.#broker.events() }));
   }
 
   status() {
@@ -258,7 +258,9 @@ export class SingleHostBrokerSupervisor {
 
   #runSweep() {
     try {
-      this.#broker?.expire(Date.now());
+      const now = Date.now();
+      this.#broker?.expire(now);
+      this.#broker?.dispatchPending(now);
       this.#lastSweepAt = Date.now();
       this.#lastSweepError = undefined;
     } catch {

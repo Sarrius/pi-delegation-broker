@@ -10,6 +10,8 @@ A compatible launcher must enforce all of the following before a brokered child 
 4. Start the child with minimal inherited environment, isolated `PI_CODING_AGENT_DIR`, explicit extensions and model scope.
 5. Pass only `PI_BROKER_SOCKET`, lease metadata and `PI_BROKER_CAPABILITY` to the child.
 6. Invoke parent-only hooks after child-session handoff, before-handoff failure and session-process closure.
+7. Poll/observe controller-only pending readiness and launch only the exact task/lease returned by `dispatchPending`; a queued contract is not itself authority to spawn.
+8. Capture acceptance evidence through controller-owned tools and validate it against `ControllerEvidenceStore`; child-supplied `source: controller` text is not trusted without a matching ledger entry.
 
 The [source-repository-only reference patch](https://github.com/Sarrius/pi-delegation-broker/blob/main/patches/pi-subagent-workflow-trusted-launcher-seam.patch) demonstrates such a seam against `pi-subagent-workflow` commit `0c28ce87bc45f4c3d66e0100b58ae13cf345978c`. It is an unaccepted local patch and is not part of the npm tarball. Applying it, accepting it upstream, or replacing it with an equivalent stable API remains a human release decision.
 
@@ -19,5 +21,7 @@ The [source-repository-only reference patch](https://github.com/Sarrius/pi-deleg
 
 - Before handoff: controller release cleans up the lease/agent directory. If controller IPC fails, the resolver retains an explicitly pending record for later reconciliation.
 - After handoff: child provider shutdown releases its lease; parent completion cleanup is idempotent.
+- Capacity unavailable: `submit` queues only when the contract names a recovery owner and future deadline. Release/expiry/cooldown transitions make timed work eligible; the supervisor scheduler moves admitted entries to `ready`, while the controller remains responsible for child launch.
+- Wait deadline reached: the task becomes `escalated`; it never remains an ownerless, unbounded `paused_capacity` row.
 - Provider transport missing: `BrokerIpcServer` returns `provider_transport_unavailable`; it never falls back to fake success.
 - A real provider proxy must classify and reconcile any ambiguous external effect. The fake transport only proves pre-effect cancellation.

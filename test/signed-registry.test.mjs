@@ -23,7 +23,7 @@ function registryPayload(overrides = {}) {
 function signedEnvelope(registry = registryPayload(), keyId = "release-2026", privateKey) {
   const { privateKey: generated } = generateKeyPairSync("ed25519");
   const signingKey = privateKey ?? generated;
-  const unsigned = { schemaVersion: 1, keyId, registry };
+  const unsigned = { schemaVersion: 2, keyId, registry };
   return {
     ...unsigned,
     signature: sign(null, signedRegistryMessage(unsigned), signingKey).toString("base64url"),
@@ -33,7 +33,7 @@ function signedEnvelope(registry = registryPayload(), keyId = "release-2026", pr
 
 function signedEnvelopeWithKey(registry = registryPayload(), keyId = "release-2026") {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
-  const unsigned = { schemaVersion: 1, keyId, registry };
+  const unsigned = { schemaVersion: 2, keyId, registry };
   return {
     envelope: {
       ...unsigned,
@@ -63,12 +63,22 @@ test("signature, trust key and validity interval are fail-closed", () => {
 });
 
 test("invalid registry semantics cannot be signed into an accepted envelope", () => {
+  assert.throws(
+    () => signedRegistryMessage({ schemaVersion: 1, keyId: "legacy", registry: registryPayload() }),
+    /schemaVersion must equal 2/,
+  );
   const bad = registryPayload();
   bad.resources.R1.capacityGroup = "missing-group";
   const { privateKey } = generateKeyPairSync("ed25519");
   assert.throws(
     () => signedEnvelope(bad, "release-2026", privateKey),
     /references unknown capacity group/,
+  );
+  const noControlReserve = registryPayload();
+  noControlReserve.capacityGroups["G-shared"].admission.controlReserve = 0;
+  assert.throws(
+    () => signedEnvelope(noControlReserve, "release-2026", privateKey),
+    /invalid admission reserves/,
   );
 });
 

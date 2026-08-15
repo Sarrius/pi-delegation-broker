@@ -17,7 +17,7 @@ function signedSupervisor(root, registry = fixtureRegistry()) {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const now = Date.now();
   const payload = { registryVersion: "resolver-v1", issuedAt: now - 1_000, expiresAt: now + 60_000, ...registry };
-  const unsigned = { schemaVersion: 1, keyId: "resolver-key", registry: payload };
+  const unsigned = { schemaVersion: 2, keyId: "resolver-key", registry: payload };
   return new SingleHostBrokerSupervisor({
     stateDir: root,
     signedRegistry: { ...unsigned, signature: sign(null, signedRegistryMessage(unsigned), privateKey).toString("base64url") },

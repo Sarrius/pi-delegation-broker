@@ -3,6 +3,7 @@ import { createHash, createPublicKey, verify } from "node:crypto";
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const ENFORCEMENT = new Set(["hard", "metered_best_effort", "unavailable"]);
 const PROFILE_STATUS = new Set(["approved", "disabled"]);
+const INVENTORY_CONFIDENCE = new Set(["measured", "observed", "assumed"]);
 
 function isPlainObject(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -71,22 +72,41 @@ function normalizedBrokerRegistry(registry) {
   const capacityGroups = {};
   for (const [id, group] of Object.entries(registry.capacityGroups)) {
     requireIdentifier(id, `capacity group ${id}`);
-    ownKeysExactly(group, ["maxConcurrent"], `capacity group ${id}`);
+    ownKeysExactly(group, ["maxConcurrent", "admission", "cooldown", "confidence"], `capacity group ${id}`);
     if (!Number.isSafeInteger(group.maxConcurrent) || group.maxConcurrent < 1 || group.maxConcurrent > 10_000) {
       throw new Error(`capacity group ${id} has invalid maxConcurrent`);
     }
-    capacityGroups[id] = { maxConcurrent: group.maxConcurrent };
+    if (!INVENTORY_CONFIDENCE.has(group.confidence)) throw new Error(`capacity group ${id} has invalid confidence`);
+    ownKeysExactly(group.admission, ["controlReserve", "verifyReserve"], `capacity group ${id} admission`);
+    const { controlReserve, verifyReserve } = group.admission;
+    if (!Number.isSafeInteger(controlReserve) || controlReserve < 1
+      || !Number.isSafeInteger(verifyReserve) || verifyReserve < 0
+      || controlReserve + verifyReserve > group.maxConcurrent) {
+      throw new Error(`capacity group ${id} has invalid admission reserves`);
+    }
+    ownKeysExactly(group.cooldown, ["defaultMs", "probeIntervalMs"], `capacity group ${id} cooldown`);
+    if (!Number.isSafeInteger(group.cooldown.defaultMs) || group.cooldown.defaultMs < 1 || group.cooldown.defaultMs > 2_592_000_000
+      || !Number.isSafeInteger(group.cooldown.probeIntervalMs) || group.cooldown.probeIntervalMs < 1 || group.cooldown.probeIntervalMs > 86_400_000) {
+      throw new Error(`capacity group ${id} has invalid cooldown policy`);
+    }
+    capacityGroups[id] = {
+      maxConcurrent: group.maxConcurrent,
+      admission: { controlReserve, verifyReserve },
+      cooldown: { defaultMs: group.cooldown.defaultMs, probeIntervalMs: group.cooldown.probeIntervalMs },
+      confidence: group.confidence,
+    };
   }
   if (Object.keys(capacityGroups).length === 0) throw new Error("Signed registry must contain a capacity group");
 
   const resources = {};
   for (const [id, resource] of Object.entries(registry.resources)) {
     requireIdentifier(id, `resource ${id}`);
-    ownKeysExactly(resource, ["capacityGroup", "profile", "enforcement"], `resource ${id}`);
+    ownKeysExactly(resource, ["capacityGroup", "profile", "confidence", "enforcement"], `resource ${id}`);
     requireIdentifier(resource.capacityGroup, `resource ${id} capacityGroup`);
     requireIdentifier(resource.profile, `resource ${id} profile`);
     if (!capacityGroups[resource.capacityGroup]) throw new Error(`resource ${id} references unknown capacity group`);
     if (!profiles[resource.profile]) throw new Error(`resource ${id} references unknown profile`);
+    if (!INVENTORY_CONFIDENCE.has(resource.confidence)) throw new Error(`resource ${id} has invalid confidence`);
     ownKeysExactly(resource.enforcement, ["input", "output", "cost"], `resource ${id} enforcement`);
     const enforcement = {};
     for (const dimension of ["input", "output", "cost"]) {
@@ -94,7 +114,7 @@ function normalizedBrokerRegistry(registry) {
       if (typeof value !== "string" || !ENFORCEMENT.has(value)) throw new Error(`resource ${id} has invalid ${dimension} enforcement`);
       enforcement[dimension] = value;
     }
-    resources[id] = { capacityGroup: resource.capacityGroup, profile: resource.profile, enforcement };
+    resources[id] = { capacityGroup: resource.capacityGroup, profile: resource.profile, confidence: resource.confidence, enforcement };
   }
   if (Object.keys(resources).length === 0) throw new Error("Signed registry must contain a resource");
 
@@ -115,7 +135,7 @@ function decodeSignature(value) {
 
 /** Canonical bytes that an offline release signer must sign with Ed25519. */
 export function signedRegistryMessage({ schemaVersion, keyId, registry }) {
-  if (schemaVersion !== 1) throw new Error("Signed registry schemaVersion must equal 1");
+  if (schemaVersion !== 2) throw new Error("Signed registry schemaVersion must equal 2");
   requireIdentifier(keyId, "keyId");
   // Validate semantics before signing too, so a release tool cannot produce a
   // valid-looking envelope whose payload a supervisor later refuses.
