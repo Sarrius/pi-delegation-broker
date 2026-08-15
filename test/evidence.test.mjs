@@ -104,7 +104,7 @@ test("kind-specific semantic recapture ignores declared volatility and detects m
       exitCode: 0,
       stdout: "2026-08-15T10:00:00Z pid 123 /private/tmp/run/a\nbeta",
       stderr: "",
-      normalization: { rootPaths: ["/private/tmp/run"], unorderedLines: true },
+      normalization: { stripTimestamps: true, stripPids: true, rootPaths: ["/private/tmp/run"], unorderedLines: true },
     },
   });
   assert.equal(store.compareSemantic(command, {
@@ -131,11 +131,57 @@ test("kind-specific semantic recapture ignores declared volatility and detects m
 
   const url = store.captureObservation({
     kind: "url", claim: "url check", capturedAt: 1_003,
-    observation: { status: 200, retrievedAt: 1_003, body: "updated 2026-08-15T10:00:00Z" },
+    observation: { status: 200, retrievedAt: 1_003, body: "updated 2026-08-15T10:00:00Z", normalization: { stripTimestamps: true } },
   });
   const urlComparison = store.compareSemantic(url, { status: 200, retrievedAt: 9_999, body: "updated 2026-08-16T11:12:13Z" });
   assert.equal(urlComparison.status, "match");
   assert.deepEqual({ baseline: urlComparison.baselineRetrievedAt, candidate: urlComparison.candidateRetrievedAt }, { baseline: 1_003, candidate: 9_999 });
+}));
+
+test("volatile fields are strict by default and cannot be normalized away from a named criterion", () => withStore((store) => {
+  const strict = store.captureObservation({
+    kind: "command", claim: "deploy timestamp and PID match", capturedAt: 1_000,
+    observation: { exitCode: 0, stdout: "timestamp 2026-08-15T10:00:00Z pid 123", stderr: "" },
+  });
+  assert.equal(store.compareSemantic(strict, {
+    exitCode: 0, stdout: "timestamp 2026-08-16T11:12:13Z pid 999", stderr: "",
+  }).status, "mismatch");
+
+  const unsafe = store.captureObservation({
+    kind: "command", claim: "deploy timestamp matches", capturedAt: 1_001,
+    observation: {
+      exitCode: 0, stdout: "2026-08-15T10:00:00Z", stderr: "",
+      normalization: { stripTimestamps: true },
+    },
+  });
+  const result = {
+    evidence: [unsafe],
+    validationPerformed: [{ check: "deploy timestamp matches", outcome: "pass", evidenceRef: unsafe.ref }],
+  };
+  const validation = validateResultEvidence(result, {
+    acceptance: ["deploy timestamp matches"], evidenceStore: store,
+    semanticRecaptures: { [unsafe.ref]: { exitCode: 0, stdout: "2026-08-16T11:12:13Z", stderr: "" } },
+  });
+  assert.equal(validation.status, "rejected");
+  assert.match(validation.reasons[0], /normalization policy conflicts/);
+  assert.equal(store.compareSemantic(unsafe, {
+    exitCode: 0, stdout: "2026-08-16T11:12:13Z", stderr: "",
+  }).status, "policy_conflict");
+
+  for (const [claim, normalization] of [
+    ["час розгортання збігається", { stripTimestamps: true }],
+    ["PID matches running process", { stripPids: true }],
+    ["line order is preserved", { unorderedLines: true }],
+    ["output path is exact", { rootPaths: ["/private/tmp/run"] }],
+  ]) {
+    const evidence = store.captureObservation({
+      kind: "command", claim, capturedAt: 1_002,
+      observation: { exitCode: 0, stdout: "pid 123 /private/tmp/run/a\nbeta", stderr: "", normalization },
+    });
+    assert.equal(store.compareSemantic(evidence, {
+      exitCode: 0, stdout: "pid 999 /private/tmp/run/a\nbeta", stderr: "",
+    }).status, "policy_conflict", claim);
+  }
 }));
 
 test("acceptance validator applies supplied semantic recaptures", () => withStore((store) => {

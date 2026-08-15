@@ -51,8 +51,8 @@ function normalizeOutput(value, policy = {}) {
     .replaceAll("\r\n", "\n")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
     .split("\n").map((line) => line.trimEnd()).join("\n").trim();
-  if (policy.stripTimestamps !== false) text = text.replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g, "<timestamp>");
-  if (policy.stripPids !== false) text = text.replace(/\b(pid|process)\s*[:=#]?\s*\d+\b/gi, "$1=<pid>");
+  if (policy.stripTimestamps === true) text = text.replace(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g, "<timestamp>");
+  if (policy.stripPids === true) text = text.replace(/\b(pid|process)\s*[:=#]?\s*\d+\b/gi, "$1=<pid>");
   for (const root of policy.rootPaths ?? []) {
     if (typeof root !== "string" || !isAbsolute(root)) throw new Error("semantic normalization rootPaths must be absolute paths");
     text = text.replaceAll(root, "<root>");
@@ -61,13 +61,23 @@ function normalizeOutput(value, policy = {}) {
   return text;
 }
 
+function normalizationConflicts(criterion, normalization) {
+  if (typeof criterion !== "string" || !normalization) return [];
+  const conflicts = [];
+  if (normalization.stripTimestamps === true && /(?:\b(?:timestamp|date|datetime|time)\b|час|дат(?:а|и|у|ою)?)/iu.test(criterion)) conflicts.push("timestamp");
+  if (normalization.stripPids === true && /(?:\b(?:pid|process[ _-]?id)\b|ідентифікатор\s+процесу)/iu.test(criterion)) conflicts.push("pid");
+  if (normalization.unorderedLines === true && /(?:\b(?:order|ordered|ordering|sequence)\b|порядок|послідовність)/iu.test(criterion)) conflicts.push("line order");
+  if ((normalization.rootPaths?.length ?? 0) > 0 && /(?:\b(?:path|directory|root)\b|шлях|каталог)/iu.test(criterion)) conflicts.push("path");
+  return conflicts;
+}
+
 function semanticProjection(kind, observation, baselinePolicy) {
   if (!observation || typeof observation !== "object") throw new Error("semantic evidence observation must be an object");
   if (kind === "command") {
     if (!Number.isSafeInteger(observation.exitCode)) throw new Error("semantic command evidence requires integer exitCode");
     const normalization = baselinePolicy ?? Object.freeze({
-      stripTimestamps: observation.normalization?.stripTimestamps !== false,
-      stripPids: observation.normalization?.stripPids !== false,
+      stripTimestamps: observation.normalization?.stripTimestamps === true,
+      stripPids: observation.normalization?.stripPids === true,
       unorderedLines: observation.normalization?.unorderedLines === true,
       rootPaths: Object.freeze([...(observation.normalization?.rootPaths ?? [])]),
     });
@@ -113,7 +123,7 @@ function semanticProjection(kind, observation, baselinePolicy) {
       throw new Error("semantic URL evidence requires HTTP status and retrievedAt");
     }
     const normalization = baselinePolicy ?? Object.freeze({
-      stripTimestamps: observation.normalization?.stripTimestamps !== false,
+      stripTimestamps: observation.normalization?.stripTimestamps === true,
       stripPids: false,
       unorderedLines: observation.normalization?.unorderedLines === true,
       rootPaths: Object.freeze([]),
@@ -225,11 +235,18 @@ export class ControllerEvidenceStore {
     });
   }
 
-  compareSemantic(descriptor, observation) {
+  compareSemantic(descriptor, observation, { criterion = descriptor?.claim } = {}) {
     if (!this.verify(descriptor)) return Object.freeze({ status: "invalid_evidence", differences: Object.freeze(["retained evidence is missing or corrupt"]) });
     if (typeof descriptor.semanticSchema !== "string") return Object.freeze({ status: "unsupported", differences: Object.freeze(["evidence has no semantic schema"]) });
     const retained = JSON.parse(this.artifact(descriptor).toString("utf8"));
     if (retained.schema !== descriptor.semanticSchema) return Object.freeze({ status: "invalid_evidence", differences: Object.freeze(["semantic schema does not match retained content"]) });
+    const policyConflicts = normalizationConflicts(criterion, retained.normalization);
+    if (policyConflicts.length > 0) {
+      return Object.freeze({
+        status: "policy_conflict",
+        differences: Object.freeze(policyConflicts.map((field) => `acceptance criterion names normalized field: ${field}`)),
+      });
+    }
     const candidate = semanticProjection(descriptor.kind, observation, retained.normalization);
     const expectedComparable = semanticComparable(retained);
     const candidateComparable = semanticComparable(candidate);
@@ -376,9 +393,11 @@ export function validateResultEvidence(result, { acceptance = [], evidenceStore,
         reasons.push(`semantic comparison is unavailable: ${check}`);
         continue;
       }
-      const comparison = evidenceStore.compareSemantic(evidence, semanticRecaptures[evidence.ref]);
+      const comparison = evidenceStore.compareSemantic(evidence, semanticRecaptures[evidence.ref], { criterion: check });
       if (comparison.status !== "match") {
-        reasons.push(`semantic recapture mismatch: ${check}`);
+        reasons.push(comparison.status === "policy_conflict"
+          ? `semantic normalization policy conflicts with acceptance: ${check}`
+          : `semantic recapture mismatch: ${check}`);
         continue;
       }
     }

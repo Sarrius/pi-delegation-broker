@@ -7,7 +7,7 @@ All notable changes are documented here. This project follows [Semantic Versioni
 - Added exact ready-task claim, pre-handoff requeue, `awaiting_result` crash reconciliation and terminal parent-result finalization.
 - Added clamped queue aging, protected control/verifier dispatch-window representatives and per-class p95/max wait metrics so neither strict priority nor an aged backlog hides a class.
 - Effect-capable contracts now fail closed with `behavioral_enforcement_unavailable` until a trusted launch path asserts a wired blocking monitor; the enforcement capability is carried on admitted leases.
-- Added command/file/test/URL semantic recapture projections and validator integration instead of byte-exact spot audit.
+- Added command/file/test/URL semantic recapture projections and validator integration instead of byte-exact spot audit; volatile normalization is opt-in and conflicts fail closed when acceptance names the stripped field.
 - Backward clock steps now fail closed against the durable ledger time floor rather than extending capabilities.
 - Added contract `doneWhen`, prompt-digest binding and positive latency-budget admission checks.
 - Added deterministic behavioral monitoring for no-progress, typed action mismatch, declared-change reconciliation and completion claims.
