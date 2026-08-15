@@ -6,7 +6,7 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 OIDC provenance validation release. No runtime changes from `0.1.0-alpha.0`.
 
-- Publishes through the configured GitHub Actions trusted publisher.
+- Published through the verified GitHub Actions trusted publisher with provenance.
 
 ## 0.1.0-alpha.0 - 2026-08-15
 

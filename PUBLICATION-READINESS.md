@@ -1,10 +1,10 @@
 # Publication readiness record
 
-**Candidate:** `@sars267/pi-delegation-broker@0.1.0-alpha.0`
+**Candidate:** `@sars267/pi-delegation-broker@0.1.0-alpha.1`
 
 **Local Git commit:** see `git log -1 --oneline` (recorded after final local release preparation)
 
-**Publication state:** public GitHub repository and prerelease created; `@sars267/pi-delegation-broker@0.1.0-alpha.0` is published on npm. No real provider request was made.
+**Publication state:** public GitHub repository and prereleases created; `@sars267/pi-delegation-broker@0.1.0-alpha.0` and the OIDC-attested `0.1.0-alpha.1` are published on npm. No real provider request was made.
 
 ## Passed local evidence
 
@@ -20,11 +20,10 @@
 - GitHub Actions CI passed on Ubuntu and macOS for the pushed `main` commit. `main` requires both CI checks, linear history and resolved conversations; force-push and branch deletion are disabled.
 - Private vulnerability reporting, Dependabot configuration and a reviewer-protected `npm-publish` GitHub Environment are enabled.
 - npm registry consumer installation/import passed for the published tarball (15 public files; integrity `sha512-Mi8bAtYmpnuAVwZ4P7K+6D5qoY5qifaUBpR903+DGCYnsN8hhwWGQrY3Sbg1kc/jNPinKm5lPuk58XhYjx0eDw==`).
-- GitHub publish workflow dry-run passed. The first OIDC upload attempt correctly failed before write because the new npm package had no trusted-publisher association; the first alpha was then bootstrap-published through the authenticated npm CLI.
+- GitHub publish workflow dry-run and the OIDC-attested `0.1.0-alpha.1` upload both passed. Trusted-publisher record `85654e64-5b40-43f2-b52e-d3ddc5ec2746` restricts publishing to `Sarrius/pi-delegation-broker`, `publish.yml`, `npm-publish`, and package creation.
 
 ## Required human/remote actions before first public release
 
-1. Configure npm trusted publishing for the now-existing `@sars267/pi-delegation-broker` package and exactly `.github/workflows/publish.yml`. Do not add an npm token to GitHub secrets; validate the next release with a dry-run first.
-2. Resolve npm's first-release `latest` dist-tag mapping through the package account’s required 2FA/permission flow before publishing a non-alpha version. `next` also maps to `0.1.0-alpha.0`.
-3. Verify the npm provenance attestation and tarball manifest for the first successful OIDC-published successor before promoting any version to a stable channel.
-4. Do not claim production readiness or connect real accounts/credentials until the provider-proxy, signing-key lifecycle, controller reconciliation and read-only capacity-inventory gates are complete.
+1. Keep using the protected GitHub OIDC workflow; do not add an npm token to GitHub secrets. Start every future release with its dry-run.
+2. Resolve npm's first-release `latest` dist-tag mapping through the package account’s required 2FA/permission flow before publishing a non-alpha version. `next` maps to `0.1.0-alpha.1`; `latest` still maps to `0.1.0-alpha.0`.
+3. Do not claim production readiness or connect real accounts/credentials until the provider-proxy, signing-key lifecycle, controller reconciliation and read-only capacity-inventory gates are complete.
