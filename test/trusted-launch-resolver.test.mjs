@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import test from "node:test";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fixtureContract, fixtureRegistry } from "../src/broker.mjs";
 import { signedRegistryMessage } from "../src/signed-registry.mjs";
@@ -30,7 +31,7 @@ function request(childId) {
   return {
     childId,
     promptDigest: "a".repeat(64),
-    requestedCwd: "/private/tmp",
+    requestedCwd: tmpdir(),
     isolation: "none",
     schemaRequested: false,
     model: { ...MODEL, thinkingLevel: "off" },
@@ -49,7 +50,7 @@ function resolverFor(supervisor, root, selectContract) {
 }
 
 test("controller resolver admits a matching child with only scoped policy data and releases pre-handoff failure", async () => {
-  const root = mkdtempSync("/private/tmp/broker-resolver-");
+  const root = mkdtempSync(join(tmpdir(), "br-"));
   const supervisor = signedSupervisor(root);
   let resolver;
   try {
@@ -91,7 +92,7 @@ test("controller resolver admits a matching child with only scoped policy data a
 });
 
 test("controller resolver preserves and safely reconciles a release after controller IPC failure", async () => {
-  const root = mkdtempSync("/private/tmp/broker-resolver-release-failure-");
+  const root = mkdtempSync(join(tmpdir(), "br-rf-"));
   const supervisor = signedSupervisor(root);
   let restarted;
   try {
@@ -125,7 +126,7 @@ test("controller resolver preserves and safely reconciles a release after contro
 });
 
 test("controller resolver denies a model mismatch before reservation and capacity exhaustion without a fallback", async () => {
-  const root = mkdtempSync("/private/tmp/broker-resolver-capacity-");
+  const root = mkdtempSync(join(tmpdir(), "br-c-"));
   const registry = fixtureRegistry();
   delete registry.resources.R2;
   delete registry.resources.R3;
