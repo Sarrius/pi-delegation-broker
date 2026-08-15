@@ -1,0 +1,17 @@
+node_modules/
+coverage/
+.nyc_output/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sock
+*.lock
+*.log
+.env
+.env.*
+!.env.example
+auth.json
+provider-failover*.json
+.npmrc
+.DS_Store
+*.tgz

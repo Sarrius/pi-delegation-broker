@@ -1,0 +1,27 @@
+name: Bug report
+description: Report a reproducible non-sensitive defect
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, account IDs, raw prompts, provider responses, broker databases, sockets, capabilities or controller tokens. See SECURITY.md.
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized reproduction
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Package version and Node version
+    validations:
+      required: true

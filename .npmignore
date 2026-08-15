@@ -1,0 +1,18 @@
+# Defense in depth. package.json "files" is the primary npm allowlist.
+test/
+patches/
+scripts/
+.github/
+RELEASE.md
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+THIRD_PARTY_NOTICES.md
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sock
+*.lock
+*.log
+.env
+.env.*
+auth.json

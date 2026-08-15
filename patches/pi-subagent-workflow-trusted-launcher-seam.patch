@@ -1,0 +1,760 @@
+diff --git a/src/runner/runner.ts b/src/runner/runner.ts
+index b698382..c005eed 100644
+--- a/src/runner/runner.ts
++++ b/src/runner/runner.ts
+@@ -12,6 +12,7 @@ import { reportDiagnostic } from "../diagnostics.js";
+ import { errorMessage } from "../util.js";
+ import { followUpSpawn, submittedSpec, type ChildSpawnSpec, type ParentContext } from "./child.js";
+ import { spawnSubprocessChild } from "./subprocess/spawn-child.js";
++import { resolveTrustedChildLaunchPolicy, type TrustedChildLaunchPolicy, type TrustedChildLaunchResolver } from "./trusted-launch-policy.js";
+ import type { ChildSession } from "./child-session.js";
+ import { STRUCTURED_REPAIR_PROMPT } from "./schema-tool.js";
+ import type { SchemaCapture } from "./schema-tool.js";
+@@ -275,6 +276,7 @@ export class SubagentRunner {
+     isExpectedStop: (error: unknown) => boolean;
+   }>();
+   private childCounter = 0;
++  private trustedLaunchRequired = false;
+   private finalizedRuns = new Set<string>();
+   private deliveredRuns = new Set<string>();
+   private agentTimeoutMinutes = 0;
+@@ -293,6 +295,7 @@ export class SubagentRunner {
+     private buildStore: StoreBuilder = (runId, parent, storeOptions) =>
+       new RunStore(runId, parent.ctx.cwd, parent.ctx.sessionManager.getSessionId(), parent.ctx.sessionManager.getSessionFile(), storeOptions),
+     private delay: Delay = defaultDelay,
++    private trustedLaunchResolver?: TrustedChildLaunchResolver,
+   ) {}
+
+   /** Apply a process-wide admission limit. Existing agents are never cancelled. */
+@@ -307,6 +310,23 @@ export class SubagentRunner {
+     this.agentTimeoutMinutes = minutes;
+   }
+
++  /**
++   * Install a controller-only launch resolver. It runs before worktree/shim/
++   * process creation; it can allow an isolated policy or deny, never mutate a
++   * public SubagentSpec. Undefined preserves legacy behavior.
++   */
++  setTrustedChildLaunchResolver(resolver: TrustedChildLaunchResolver | undefined): void {
++    this.trustedLaunchResolver = resolver;
++  }
++
++  /**
++   * Fail closed before worktree/shim/process creation when the runner is used
++   * in brokered mode but no trusted policy resolver has been installed.
++   */
++  setTrustedChildLaunchRequired(required: boolean): void {
++    this.trustedLaunchRequired = required;
++  }
++
+   /** Observe new child fan-outs. Telemetry listeners cannot affect runner lifecycle. */
+   subscribeSpawns(listener: (run: SpawnedRun) => void): () => void {
+     this.spawnListeners.add(listener);
+@@ -570,19 +590,73 @@ export class SubagentRunner {
+       release();
+     };
+     handle.releaseAdmission = releaseAdmission;
++    let worktree: { sourceCwd: string; tree: Worktree } | undefined;
++    let retainWorktree = false;
++    let launchPolicy: TrustedChildLaunchPolicy | undefined;
++    let launchPolicyHandedToChild = false;
++    let launchPolicyAbandoned = false;
++    let launchPolicyOpened = false;
++    let launchPolicyFinalized = false;
++    const abandonUnhandedPolicy = async (reason: "cancelled_before_child" | "child_construction_failed"): Promise<void> => {
++      if (launchPolicyAbandoned || launchPolicyHandedToChild || !launchPolicy?.onBeforeChildAbandoned) return;
++      launchPolicyAbandoned = true;
++      try {
++        await launchPolicy.onBeforeChildAbandoned(reason);
++      } catch (error) {
++        // A broker release hook is cleanup, never a reason to hide the primary
++        // child-construction failure or to leak raw controller detail to it.
++        reportDiagnostic(`[subagent-workflow] trusted child pre-handoff cleanup failed: ${errorMessage(error)}`);
++      }
++    };
++    const notifyHandedPolicy = async (): Promise<void> => {
++      if (launchPolicyOpened || !launchPolicyHandedToChild || !launchPolicy?.onChildSessionOpened) return;
++      launchPolicyOpened = true;
++      try {
++        await launchPolicy.onChildSessionOpened();
++      } catch (error) {
++        // Handoff bookkeeping cannot invalidate an already constructed child;
++        // its close hook still has a chance to reconcile later.
++        reportDiagnostic(`[subagent-workflow] trusted child handoff notification failed: ${errorMessage(error)}`);
++      }
++    };
++    const finalizeHandedPolicy = async (): Promise<void> => {
++      if (launchPolicyFinalized || !launchPolicyHandedToChild || !launchPolicy?.onChildSessionClosed) return;
++      launchPolicyFinalized = true;
++      try {
++        await launchPolicy.onChildSessionClosed();
++      } catch (error) {
++        // Child process teardown remains complete even if controller-side
++        // bookkeeping/agent-dir cleanup fails; do not revive the child.
++        reportDiagnostic(`[subagent-workflow] trusted child post-session cleanup failed: ${errorMessage(error)}`);
++      }
++    };
+     const disposeSessionAndRetire = async (): Promise<void> => {
+       // Terminal work no longer needs model capacity. Release it before waiting
+       // for construction abort or extension shutdown, either of which can stall.
+       releaseAdmission();
+       await handle.waitForConstructionAbort();
+       await handle.disposeSession();
++      await finalizeHandedPolicy();
+       void this.retire(handle);
+     };
+-    let worktree: { sourceCwd: string; tree: Worktree } | undefined;
+-    let retainWorktree = false;
+     try {
+       if (admission.signal.aborted && !handle.isTerminal) handle.finish(this.abortedResult(handle));
+       if (handle.isTerminal) return;
++      // This happens before worktree/shim/process creation. A controller may
++      // only return a policy for an isolated child or deny the launch.
++      if (this.trustedLaunchRequired && !this.trustedLaunchResolver) {
++        throw new Error("Trusted child launch policy is required but no resolver is installed");
++      }
++      launchPolicy = await resolveTrustedChildLaunchPolicy(
++        this.trustedLaunchResolver,
++        handle.id,
++        handle.spec,
++        handle.parent,
++      );
++      if (handle.isTerminal) {
++        await abandonUnhandedPolicy("cancelled_before_child");
++        return;
++      }
+       handle.setStatus("running");
+       let childSpec = handle.spec;
+       if (handle.spec.isolation === "worktree") {
+@@ -592,13 +666,21 @@ export class SubagentRunner {
+         childSpec = { ...handle.spec, cwd: tree.cwd };
+       }
+       if (handle.isTerminal) {
++        await abandonUnhandedPolicy("cancelled_before_child");
+         releaseAdmission();
+         return;
+       }
+       const child = await this.buildChild(childSpec, handle.parent, {
++
+         sessionsDir: store.sessionsDir,
+         forkSessionFile: handle.forkSessionFile,
++        launchPolicy,
+       });
++      // From this point the child process/session owns its own broker cleanup
++      // (e.g. the scoped provider's session_shutdown release). Do not call the
++      // pre-handoff hook as well.
++      launchPolicyHandedToChild = true;
++      await notifyHandedPolicy();
+       handle.session = child.session;
+       if (handle.isTerminal) {
+         await disposeSessionAndRetire();
+@@ -628,6 +710,7 @@ export class SubagentRunner {
+         // Shutdown hooks can make final worktree writes. Dispose the session
+         // before collecting so those writes are included in the patch.
+         await handle.disposeSession();
++        await finalizeHandedPolicy();
+         if (worktree) {
+           try {
+             const changes = await collectWorktree(worktree.tree);
+@@ -649,9 +732,13 @@ export class SubagentRunner {
+       handle.inFlightPrompt = runAndFinish;
+       try { await runAndFinish; } finally { handle.inFlightPrompt = undefined; }
+     } catch (error) {
++      await abandonUnhandedPolicy(handle.wasExternallyCancelled ? "cancelled_before_child" : "child_construction_failed");
+       handle.finish(this.failure(handle, error));
+       await disposeSessionAndRetire();
+     } finally {
++      // Covers early returns introduced by a future construction path. The
++      // hook is idempotent and has no child-visible authority.
++      await abandonUnhandedPolicy(handle.wasExternallyCancelled ? "cancelled_before_child" : "child_construction_failed");
+       if (worktree && !retainWorktree) {
+         try {
+           await cleanupWorktree(worktree.sourceCwd, worktree.tree.path);
+@@ -796,7 +883,7 @@ function summarizeCall(name: string, args: unknown): string {
+ // Bump whenever Handle/SubagentRunner state or behavior changes incompatibly.
+ // A separate key from the semaphore lets a hot reload adopt the new runner
+ // without temporarily creating a second concurrency pool.
+-const RUNNER_STATE_VERSION = "v17";
++const RUNNER_STATE_VERSION = "v18";
+ const RUNNER_KEY = `__piSubagentWorkflowRunner_${RUNNER_STATE_VERSION}__`;
+ const runnerScope = globalThis as unknown as Record<string, SubagentRunner | undefined>;
+ export const subagentRunner: SubagentRunner = runnerScope[RUNNER_KEY] ??= new SubagentRunner();
+diff --git a/src/runner/subprocess/child-args.ts b/src/runner/subprocess/child-args.ts
+index 007df98..5f41b71 100644
+--- a/src/runner/subprocess/child-args.ts
++++ b/src/runner/subprocess/child-args.ts
+@@ -22,6 +22,14 @@ export interface ChildProcessConfig {
+   appendSystemPrompt: string;
+   /** Absolute path of the child-shim extension, when the spec needs one. */
+   shimPath?: string;
++  /** Trusted explicit extensions allowed in a discovery-free brokered child. */
++  trustedExtensionPaths?: readonly string[];
++  /** Disable ambient project/global discovery; explicit extensions still load. */
++  isolatedDiscovery?: boolean;
++  /** Restrict brokered child model selection to its lease-issued model. */
++  scopedModel?: string;
++  /** Disable Pi startup network operations for a non-live/fake child. */
++  offline?: boolean;
+ }
+
+ /** Tools children must never expose: the recursion guard, now per-process. */
+@@ -36,6 +44,9 @@ export function buildChildArgs(config: ChildProcessConfig): string[] {
+   const excludeTools = [...new Set([...(config.excludeTools ?? []), ...RECURSION_GUARD_TOOLS])];
+   const args = [
+     "--mode", "rpc",
++    ...(config.offline ? ["--offline"] : []),
++    ...(config.isolatedDiscovery ? ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files"] : []),
++    ...(config.scopedModel ? ["--models", config.scopedModel] : []),
+     "--provider", config.provider,
+     "--model", config.modelId,
+     "--thinking", config.thinkingLevel,
+@@ -49,5 +60,6 @@ export function buildChildArgs(config: ChildProcessConfig): string[] {
+   if (config.tools !== undefined) args.push("--tools", config.tools.join(","));
+   if (config.forkSessionFile) args.push("--fork", config.forkSessionFile);
+   if (config.shimPath) args.push("--extension", config.shimPath);
++  for (const extensionPath of config.trustedExtensionPaths ?? []) args.push("--extension", extensionPath);
+   return args;
+ }
+diff --git a/src/runner/subprocess/spawn-child.ts b/src/runner/subprocess/spawn-child.ts
+index da0132a..6a6406b 100644
+--- a/src/runner/subprocess/spawn-child.ts
++++ b/src/runner/subprocess/spawn-child.ts
+@@ -11,11 +11,16 @@ import { fileURLToPath } from "node:url";
+ import { childLabel } from "../../util.js";
+ import { missingExplicitTools, resolveModel, SUBAGENT_FRAMING, type ConstructedChild, type ParentContext } from "../child.js";
+ import type { SchemaCapture } from "../schema-tool.js";
+-import type { SubagentSpec } from "../../types.js";
++import type { SubagentSpec, ThinkingLevel } from "../../types.js";
+ import { buildChildArgs } from "./child-args.js";
+ import { RpcChildSession } from "./rpc-child-session.js";
+ import { spawnChildRpc, type ChildRpc } from "./rpc-transport.js";
+ import { readToolReport, SHIM_SPEC_ENV, type ShimToolReport } from "./shim-contract.js";
++import {
++  isolatedChildEnvironment,
++  normalizeTrustedChildLaunchPolicy,
++  type TrustedChildLaunchPolicy,
++} from "../trusted-launch-policy.js";
+
+ /** How long a child pi process gets to boot, load extensions, and report its toolset. */
+ const TOOL_REPORT_TIMEOUT_MS = 60_000;
+@@ -60,6 +65,15 @@ export interface LaunchArtifactOverrides {
+   childPiEntry?: string;
+   shimPath?: string;
+   forkSessionFile?: string;
++  /** Controller-only policy; never sourced from a public SubagentSpec. */
++  launchPolicy?: TrustedChildLaunchPolicy;
++}
++
++export interface ChildPersistence {
++  sessionsDir: string;
++  forkSessionFile?: string;
++  /** A resolver-approved policy passed by SubagentRunner. */
++  launchPolicy?: TrustedChildLaunchPolicy;
+ }
+
+ function validateLaunchArtifact(path: string, label: string): void {
+@@ -74,8 +88,23 @@ function validateLaunchArtifact(path: string, label: string): void {
+   if (!isFile) throw new Error(`${label} ${JSON.stringify(path)} is not a readable regular file: path is not a regular file`);
+ }
+
++export interface PreflightSubprocessChildResult {
++  cwd: string;
++  model: { provider: string; id: string };
++  thinking: ThinkingLevel;
++  tools?: string[];
++  excludeTools?: string[];
++  shimPath: string;
++  childPiEntry: string;
++  launchPolicy?: TrustedChildLaunchPolicy;
++}
++
+ /** Side-effect-free checks that must pass before any launch artifact is written. */
+-export function preflightSubprocessChild(spec: SubagentSpec, parent: ParentContext, overrides: LaunchArtifactOverrides = {}) {
++export function preflightSubprocessChild(
++  spec: SubagentSpec,
++  parent: ParentContext,
++  overrides: LaunchArtifactOverrides = {},
++): PreflightSubprocessChildResult {
+   const cwd = spec.cwd ?? parent.ctx.cwd;
+   let isDirectory: boolean;
+   try {
+@@ -98,21 +127,23 @@ export function preflightSubprocessChild(spec: SubagentSpec, parent: ParentConte
+   validateLaunchArtifact(childPiEntry, "Child pi CLI entry");
+   validateLaunchArtifact(shimPath, "Child shim");
+   if (overrides.forkSessionFile !== undefined) validateLaunchArtifact(overrides.forkSessionFile, "Fork session file");
+-  return { cwd, model, thinking, tools, excludeTools, shimPath, childPiEntry };
++  const launchPolicy = overrides.launchPolicy === undefined ? undefined : normalizeTrustedChildLaunchPolicy(overrides.launchPolicy);
++  return { cwd, model, thinking, tools, excludeTools, shimPath, childPiEntry, launchPolicy };
+ }
+
+ /** The child construction backend; the runner's ChildBuilder seam. */
+ export async function spawnSubprocessChild(
+   spec: SubagentSpec,
+   parent: ParentContext,
+-  persistence: { sessionsDir: string; forkSessionFile?: string },
++  persistence: ChildPersistence,
+   spawnRpc: SpawnRpc = spawnChildRpc,
+ ): Promise<ConstructedChild> {
+   // Everything that can fail synchronously (cwd, model, arg validation, entry
+   // resolution) runs before any file is written. buildChildArgs rechecks its
+   // own pure boundary rules as construction-time defense in depth.
+-  const { cwd, model, thinking, tools, excludeTools, shimPath, childPiEntry } = preflightSubprocessChild(spec, parent, {
++  const { cwd, model, thinking, tools, excludeTools, shimPath, childPiEntry, launchPolicy } = preflightSubprocessChild(spec, parent, {
+     forkSessionFile: persistence.forkSessionFile,
++    launchPolicy: persistence.launchPolicy,
+   });
+   const capture: SchemaCapture | undefined = spec.schema ? { called: false } : undefined;
+   const args = buildChildArgs({
+@@ -125,6 +156,10 @@ export async function spawnSubprocessChild(
+     forkSessionFile: persistence.forkSessionFile,
+     appendSystemPrompt: SUBAGENT_FRAMING,
+     shimPath,
++    trustedExtensionPaths: launchPolicy?.extensionPaths,
++    isolatedDiscovery: launchPolicy !== undefined,
++    scopedModel: launchPolicy ? `${model.provider}/${model.id}` : undefined,
++    offline: launchPolicy?.offline,
+   });
+
+   const shimDir = join(dirname(persistence.sessionsDir), "shim");
+@@ -138,7 +173,9 @@ export async function spawnSubprocessChild(
+   try {
+     rpc = spawnRpc([process.execPath, childPiEntry, ...args], {
+       cwd,
+-      env: { ...process.env, [SHIM_SPEC_ENV]: specPath },
++      env: launchPolicy
++        ? isolatedChildEnvironment(launchPolicy, specPath)
++        : { ...process.env, [SHIM_SPEC_ENV]: specPath },
+     });
+   } catch (error) {
+     rmSync(specPath, { force: true });
+diff --git a/src/runner/trusted-launch-policy.ts b/src/runner/trusted-launch-policy.ts
+new file mode 100644
+index 0000000..ccf52e2
+--- /dev/null
++++ b/src/runner/trusted-launch-policy.ts
+@@ -0,0 +1,180 @@
++import { createHash } from "node:crypto";
++import { accessSync, constants, realpathSync, statSync } from "node:fs";
++import { isAbsolute } from "node:path";
++import type { SubagentSpec, ThinkingLevel } from "../types.js";
++import { resolveModel, type ParentContext } from "./child.js";
++import { SHIM_SPEC_ENV } from "./subprocess/shim-contract.js";
++
++/**
++ * Controller-only child configuration. It deliberately has no provider/model,
++ * tool, cwd, prompt, or credential fields: a trusted resolver can allow a
++ * launch in an isolated Pi environment, but cannot silently change the task.
++ */
++export interface TrustedChildLaunchPolicy {
++  readonly policyId: string;
++  /** Existing, absolute, owner-only Pi agent dir selected by the controller. */
++  readonly agentDir: string;
++  /** Explicit extensions permitted in the otherwise discovery-free child. */
++  readonly extensionPaths?: readonly string[];
++  /** Disable Pi startup network operations for non-live/fake child runs. */
++  readonly offline?: boolean;
++  /**
++   * Parent-only handoff failure hook. It is never serialized into child argv,
++   * env, prompt, or shim spec. A broker uses it to release an unhanded lease
++   * when worktree/child construction fails before a ChildSession exists.
++   */
++  readonly onBeforeChildAbandoned?: (reason: "cancelled_before_child" | "child_construction_failed") => void | Promise<void>;
++  /** Parent-only handoff hook, after ChildSession construction succeeds. */
++  readonly onChildSessionOpened?: () => void | Promise<void>;
++  /** Parent-only completion hook, after ChildSession disposal/process exit. */
++  readonly onChildSessionClosed?: () => void | Promise<void>;
++  /**
++   * Broker routing metadata and a short-lived lease-scoped capability. This
++   * must never carry a provider credential or controller/master capability.
++   */
++  readonly environment?: Readonly<Record<string, string>>;
++}
++
++/** Facts resolved before creating a worktree, shim file, or child process. */
++export interface TrustedChildLaunchRequest {
++  readonly childId: string;
++  /** SHA-256 only; raw prompt content is not copied into policy telemetry. */
++  readonly promptDigest: string;
++  readonly requestedCwd: string;
++  readonly isolation: "none" | "worktree";
++  readonly label?: string;
++  readonly schemaRequested: boolean;
++  readonly requestedTools?: readonly string[];
++  readonly excludedTools?: readonly string[];
++  readonly model: { readonly provider: string; readonly modelId: string; readonly thinkingLevel: ThinkingLevel };
++}
++
++export type TrustedChildLaunchDecision =
++  | { readonly action: "allow"; readonly policy: TrustedChildLaunchPolicy }
++  | { readonly action: "deny"; readonly reason: string };
++
++export type TrustedChildLaunchResolver =
++  (request: TrustedChildLaunchRequest) => Promise<TrustedChildLaunchDecision> | TrustedChildLaunchDecision;
++
++const ALLOWED_POLICY_ENVIRONMENT = new Set([
++  "PI_BROKER_SOCKET",
++  "PI_BROKER_LEASE_ID",
++  "PI_BROKER_FENCING_TOKEN",
++  "PI_BROKER_CAPABILITY",
++]);
++
++const SAFE_INHERITED_ENVIRONMENT = [
++  "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR",
++  "SSL_CERT_FILE", "SSL_CERT_DIR",
++] as const;
++
++function readonlyList(values: readonly string[] | undefined): readonly string[] | undefined {
++  return values === undefined ? undefined : Object.freeze([...values]);
++}
++
++/** Resolve and validate a controller decision before any child-side artifact exists. */
++export async function resolveTrustedChildLaunchPolicy(
++  resolver: TrustedChildLaunchResolver | undefined,
++  childId: string,
++  spec: SubagentSpec,
++  parent: ParentContext,
++): Promise<TrustedChildLaunchPolicy | undefined> {
++  if (!resolver) return undefined;
++  const { model, thinking } = resolveModel(spec, parent.ctx, parent.thinkingLevel);
++  const request: TrustedChildLaunchRequest = Object.freeze({
++    childId,
++    promptDigest: createHash("sha256").update(spec.prompt).digest("hex"),
++    requestedCwd: spec.cwd ?? parent.ctx.cwd,
++    isolation: spec.isolation ?? "none",
++    ...(spec.label === undefined ? {} : { label: spec.label }),
++    schemaRequested: spec.schema !== undefined,
++    ...(spec.tools === undefined ? {} : { requestedTools: readonlyList(spec.tools) }),
++    ...(spec.excludeTools === undefined ? {} : { excludedTools: readonlyList(spec.excludeTools) }),
++    model: Object.freeze({ provider: model.provider, modelId: model.id, thinkingLevel: thinking }),
++  });
++  const decision = await resolver(request);
++  if (decision.action === "deny") throw new Error(`Trusted child launch denied: ${decision.reason}`);
++  return normalizeTrustedChildLaunchPolicy(decision.policy);
++}
++
++/**
++ * Defensively copy and validate policy input. This runs both before worktree
++ * creation (via the resolver) and again just before subprocess spawn.
++ */
++export function normalizeTrustedChildLaunchPolicy(input: TrustedChildLaunchPolicy): TrustedChildLaunchPolicy {
++  if (!input || typeof input.policyId !== "string" || !input.policyId.trim() || input.policyId.includes("\0")) {
++    throw new Error("Trusted child launch policy must have a non-empty policyId");
++  }
++  if (typeof input.agentDir !== "string" || !isAbsolute(input.agentDir)) {
++    throw new Error("Trusted child launch policy agentDir must be an absolute path");
++  }
++  let agentDir: string;
++  try {
++    agentDir = realpathSync(input.agentDir);
++    const stat = statSync(agentDir);
++    accessSync(agentDir, constants.R_OK | constants.X_OK);
++    if (!stat.isDirectory()) throw new Error("path is not a directory");
++    // A broker child config can contain package/settings metadata and must not
++    // be writable/readable by another local account.
++    if ((stat.mode & 0o077) !== 0) throw new Error("directory permissions grant group or other access");
++  } catch (error) {
++    const detail = error instanceof Error ? error.message : String(error);
++    throw new Error(`Trusted child launch policy agentDir is not an owner-only usable directory: ${detail}`, { cause: error });
++  }
++
++  const extensionPaths = (input.extensionPaths ?? []).map((path) => {
++    if (typeof path !== "string" || !isAbsolute(path)) throw new Error("Trusted child launch policy extension path must be absolute");
++    try {
++      const resolved = realpathSync(path);
++      const stat = statSync(resolved);
++      accessSync(resolved, constants.R_OK);
++      if (!stat.isFile()) throw new Error("path is not a regular file");
++      return resolved;
++    } catch (error) {
++      const detail = error instanceof Error ? error.message : String(error);
++      throw new Error(`Trusted child launch policy extension is not a readable regular file: ${detail}`, { cause: error });
++    }
++  });
++
++  const environment: Record<string, string> = {};
++  for (const [key, value] of Object.entries(input.environment ?? {})) {
++    if (!ALLOWED_POLICY_ENVIRONMENT.has(key)) throw new Error(`Trusted child launch policy cannot set environment variable ${key}`);
++    if (typeof value !== "string" || value.includes("\0")) throw new Error(`Trusted child launch policy environment ${key} is invalid`);
++    environment[key] = value;
++  }
++  if (input.offline !== undefined && typeof input.offline !== "boolean") {
++    throw new Error("Trusted child launch policy offline must be boolean when set");
++  }
++  if (input.onBeforeChildAbandoned !== undefined && typeof input.onBeforeChildAbandoned !== "function") {
++    throw new Error("Trusted child launch policy onBeforeChildAbandoned must be a function when set");
++  }
++  if (input.onChildSessionOpened !== undefined && typeof input.onChildSessionOpened !== "function") {
++    throw new Error("Trusted child launch policy onChildSessionOpened must be a function when set");
++  }
++  if (input.onChildSessionClosed !== undefined && typeof input.onChildSessionClosed !== "function") {
++    throw new Error("Trusted child launch policy onChildSessionClosed must be a function when set");
++  }
++  return Object.freeze({
++    policyId: input.policyId,
++    agentDir,
++    ...(input.offline ? { offline: true } : {}),
++    ...(input.onBeforeChildAbandoned ? { onBeforeChildAbandoned: input.onBeforeChildAbandoned } : {}),
++    ...(input.onChildSessionOpened ? { onChildSessionOpened: input.onChildSessionOpened } : {}),
++    ...(input.onChildSessionClosed ? { onChildSessionClosed: input.onChildSessionClosed } : {}),
++    ...(extensionPaths.length ? { extensionPaths: Object.freeze(extensionPaths) } : {}),
++    ...(Object.keys(environment).length ? { environment: Object.freeze(environment) } : {}),
++  });
++}
++
++/** Build a deliberately small child environment; never spread parent process.env in brokered mode. */
++export function isolatedChildEnvironment(policy: TrustedChildLaunchPolicy, shimSpecPath: string): NodeJS.ProcessEnv {
++  const environment: NodeJS.ProcessEnv = {};
++  for (const key of SAFE_INHERITED_ENVIRONMENT) {
++    const value = process.env[key];
++    if (value !== undefined) environment[key] = value;
++  }
++  environment.PI_CODING_AGENT_DIR = policy.agentDir;
++  for (const [key, value] of Object.entries(policy.environment ?? {})) environment[key] = value;
++  environment[SHIM_SPEC_ENV] = shimSpecPath;
++  return environment;
++}
+diff --git a/tests/runner.test.ts b/tests/runner.test.ts
+index e67d5bc..aeda67f 100644
+--- a/tests/runner.test.ts
++++ b/tests/runner.test.ts
+@@ -16,11 +16,11 @@ import { WorkflowRunError } from "../src/workflow/workflow-runner.js";
+
+ const zeroUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+
+-test("runner hot reload ignores the old v16 process singleton", async () => {
++test("runner hot reload ignores the old v17 process singleton", async () => {
+   const moduleUrl = new URL("../src/runner/runner.ts", import.meta.url).href;
+   const script = [
+-    "const oldKey = '__piSubagentWorkflowRunner_v16__';",
+-    "const currentKey = '__piSubagentWorkflowRunner_v17__';",
++    "const oldKey = '__piSubagentWorkflowRunner_v17__';",
++    "const currentKey = '__piSubagentWorkflowRunner_v18__';",
+     "const sentinel = {};",
+     "globalThis[oldKey] = sentinel;",
+     "const { subagentRunner } = await import(" + JSON.stringify(moduleUrl) + ");",
+@@ -93,6 +93,135 @@ test("runner records the fully resolved spec and never rejects", async () => {
+   expect(result.usage).toMatchObject({ input: 1, output: 2, turns: 1 });
+ });
+
++test("trusted launch resolver runs before construction, sees no raw prompt, and forwards only a validated policy", async () => {
++  const agentDir = mkdtempSync(join(tmpdir(), "trusted-child-agent-"));
++  const resolved: ResolvedSpec = { provider: "openai-codex", modelId: "gpt-5.6-terra", thinkingLevel: "high", tools: ["read"], cwd: "/tmp", label: "brokered" };
++  const session = {
++    sessionFile: "/brokered-child.jsonl",
++    latestAssistant: { role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } }, stopReason: "stop" },
++    usage: zeroUsage(), subscribe: () => () => {}, prompt: async () => {}, steer: async () => {}, abort: async () => {}, dispose: async () => {},
++  } as unknown as ChildSession;
++  let constructed = false;
++  let openedPolicyCount = 0;
++  let closedPolicyCount = 0;
++  let request: Record<string, unknown> | undefined;
++  let forwardedPolicy: unknown;
++  const parent = {
++    ctx: {
++      cwd: "/tmp",
++      model: { provider: "openai-codex", id: "gpt-5.6-terra" },
++      modelRegistry: {
++        find: (provider: string, id: string) => provider === "openai-codex" && id === "gpt-5.6-terra" ? { provider, id } : undefined,
++        getAll: () => [{ provider: "openai-codex", id: "gpt-5.6-terra" }],
++      },
++      sessionManager: { getSessionId: () => "parent", getSessionFile: () => "/parent.jsonl" },
++    },
++    thinkingLevel: "high",
++    selfPath: "/extension.ts",
++  } as unknown as ParentContext;
++  const runner = new SubagentRunner(
++    async (_spec, _parent, persistence) => {
++      constructed = true;
++      forwardedPolicy = persistence.launchPolicy;
++      return { session, resolved };
++    },
++    new Semaphore(1),
++    temporaryStore,
++    undefined,
++    (input) => {
++      request = input as unknown as Record<string, unknown>;
++      return { action: "allow", policy: { policyId: "lease-7", agentDir, onChildSessionOpened: () => { openedPolicyCount += 1; }, onChildSessionClosed: () => { closedPolicyCount += 1; } } };
++    },
++  );
++
++  const result = await runner.spawn({ prompt: "raw prompt must not reach policy telemetry", tools: ["read"] }, parent).result;
++
++  expect(result.status).toBe("completed");
++  expect(constructed).toBe(true);
++  expect(request).toMatchObject({ requestedCwd: "/tmp", model: { provider: "openai-codex", modelId: "gpt-5.6-terra", thinkingLevel: "high" } });
++  expect(request).not.toHaveProperty("prompt");
++  expect((forwardedPolicy as { policyId: string }).policyId).toBe("lease-7");
++  expect(openedPolicyCount).toBe(1);
++  expect(closedPolicyCount).toBe(1);
++});
++
++test("trusted launch denial stops before child construction", async () => {
++  let constructed = false;
++  const runner = new SubagentRunner(
++    async () => { constructed = true; throw new Error("must not construct"); },
++    new Semaphore(1),
++    temporaryStore,
++    undefined,
++    () => ({ action: "deny", reason: "no compatible lease" }),
++  );
++  const parent = {
++    ctx: {
++      cwd: "/tmp",
++      model: { provider: "openai-codex", id: "gpt-5.6-terra" },
++      modelRegistry: { find: () => ({ provider: "openai-codex", id: "gpt-5.6-terra" }), getAll: () => [] },
++      sessionManager: { getSessionId: () => "parent", getSessionFile: () => "/parent.jsonl" },
++    },
++    thinkingLevel: "high",
++    selfPath: "/extension.ts",
++  } as unknown as ParentContext;
++
++  const result = await runner.spawn({ prompt: "deny this" }, parent).result;
++
++  expect(constructed).toBe(false);
++  expect(result).toMatchObject({ status: "failed", error: "Trusted child launch denied: no compatible lease" });
++});
++
++test("trusted policy releases an unhanded lease exactly once when child construction fails", async () => {
++  const agentDir = mkdtempSync(join(tmpdir(), "trusted-child-abandon-"));
++  const releases: string[] = [];
++  const parent = {
++    ctx: {
++      cwd: "/tmp",
++      model: { provider: "openai-codex", id: "gpt-5.6-terra" },
++      modelRegistry: {
++        find: (provider: string, id: string) => provider === "openai-codex" && id === "gpt-5.6-terra" ? { provider, id } : undefined,
++        getAll: () => [{ provider: "openai-codex", id: "gpt-5.6-terra" }],
++      },
++      sessionManager: { getSessionId: () => "parent", getSessionFile: () => "/parent.jsonl" },
++    },
++    thinkingLevel: "high",
++    selfPath: "/extension.ts",
++  } as unknown as ParentContext;
++  const runner = new SubagentRunner(
++    async () => { throw new Error("synthetic child launcher failure"); },
++    new Semaphore(1),
++    temporaryStore,
++    undefined,
++    () => ({
++      action: "allow",
++      policy: {
++        policyId: "lease-release-on-failure",
++        agentDir,
++        onBeforeChildAbandoned: async (reason) => { releases.push(reason); },
++      },
++    }),
++  );
++
++  const result = await runner.spawn({ prompt: "construction must fail" }, parent).result;
++
++  expect(result).toMatchObject({ status: "failed", error: "synthetic child launcher failure" });
++  expect(releases).toEqual(["child_construction_failed"]);
++});
++
++test("required trusted launch policy blocks raw child construction when no resolver is installed", async () => {
++  let constructed = false;
++  const runner = new SubagentRunner(
++    async () => { constructed = true; throw new Error("must not construct"); },
++    new Semaphore(1),
++    temporaryStore,
++  );
++  runner.setTrustedChildLaunchRequired(true);
++  const result = await runner.spawn({ prompt: "raw spawn must fail closed" }, runnerParent()).result;
++
++  expect(constructed).toBe(false);
++  expect(result).toMatchObject({ status: "failed", error: "Trusted child launch policy is required but no resolver is installed" });
++});
++
+ test("terminal extraction clears the retained assistant while preserving the full result text", async () => {
+   const fullText = "complete result ".repeat(4_000);
+   const resolved: ResolvedSpec = { provider: "test", modelId: "tiny", thinkingLevel: "off", tools: [], cwd: "/tmp", label: "memory" };
+diff --git a/tests/subprocess-spawn.test.ts b/tests/subprocess-spawn.test.ts
+index e22b178..234e021 100644
+--- a/tests/subprocess-spawn.test.ts
++++ b/tests/subprocess-spawn.test.ts
+@@ -1,5 +1,5 @@
+ import { afterEach, describe, expect, test } from "bun:test";
+-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
++import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+@@ -19,6 +19,7 @@ const tempDir = (): string => {
+ afterEach(() => {
+   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+   delete process.env[SHIM_SPEC_ENV];
++  delete process.env.PARENT_SECRET_SENTINEL;
+ });
+
+ function fakeParent(cwd: string): ParentContext {
+@@ -115,6 +116,70 @@ describe("spawnSubprocessChild", () => {
+     expect(child.session.sessionFile).toBe(join(sessionsDir, "child.jsonl"));
+   });
+
++  test("brokered policy uses an owner-only agent dir, explicit extensions, and a minimal environment", async () => {
++    const runDir = tempDir();
++    const agentDir = tempDir(); // mkdtemp creates 0700.
++    const brokerProvider = join(runDir, "broker-provider.ts");
++    writeFileSync(brokerProvider, "// trusted broker provider fixture\n");
++    process.env.PARENT_SECRET_SENTINEL = "must-not-reach-brokered-child";
++    const controls = fakeSpawn({});
++
++    await spawnSubprocessChild(
++      { prompt: "audit", tools: ["read"] },
++      fakeParent(runDir),
++      {
++        sessionsDir: join(runDir, "sessions"),
++        launchPolicy: {
++          policyId: "lease-42",
++          agentDir,
++          offline: true,
++          extensionPaths: [brokerProvider],
++          environment: { PI_BROKER_SOCKET: "/tmp/broker.sock", PI_BROKER_LEASE_ID: "lease-42", PI_BROKER_FENCING_TOKEN: "7", PI_BROKER_CAPABILITY: "lease-scoped-fixture" },
++        },
++      },
++      spawnFor(controls),
++    );
++
++    const command = controls.spawnedCommands[0]!;
++    expect(command).toContain("--offline");
++    expect(command).toContain("--no-extensions");
++    expect(command).toContain("--no-skills");
++    expect(command).toContain("--no-context-files");
++    expect(command[command.indexOf("--models") + 1]).toBe("openai-codex/gpt-5.6-terra");
++    expect(command).toContain(realpathSync(brokerProvider));
++    const environment = controls.spawnedEnvs[0]!;
++    expect(environment.PI_CODING_AGENT_DIR).toBe(realpathSync(agentDir));
++    expect(environment.PI_BROKER_LEASE_ID).toBe("lease-42");
++    expect(environment.PI_BROKER_CAPABILITY).toBe("lease-scoped-fixture");
++    expect(environment.PARENT_SECRET_SENTINEL).toBeUndefined();
++    expect(environment[SHIM_SPEC_ENV]).toContain(join(runDir, "shim"));
++  });
++
++  test("brokered policy is rejected before shim files when the agent dir is not owner-only", async () => {
++    const runDir = tempDir();
++    const agentDir = join(runDir, "insecure-agent-dir");
++    mkdirSync(agentDir);
++    chmodSync(agentDir, 0o755);
++    const controls = fakeSpawn({});
++
++    await expect(spawnSubprocessChild(
++      { prompt: "audit" },
++      fakeParent(runDir),
++      { sessionsDir: join(runDir, "sessions"), launchPolicy: { policyId: "bad", agentDir } },
++      spawnFor(controls),
++    )).rejects.toThrow(/owner-only usable directory/);
++    expect(controls.spawnedCommands).toEqual([]);
++    expect(existsSync(join(runDir, "shim"))).toBe(false);
++  });
++
++  test("legacy child launches preserve the parent environment until broker mode is explicitly selected", async () => {
++    const runDir = tempDir();
++    process.env.PARENT_SECRET_SENTINEL = "legacy-inheritance";
++    const controls = fakeSpawn({});
++    await spawnSubprocessChild({ prompt: "audit" }, fakeParent(runDir), { sessionsDir: join(runDir, "sessions") }, spawnFor(controls));
++    expect(controls.spawnedEnvs[0]?.PARENT_SECRET_SENTINEL).toBe("legacy-inheritance");
++  });
++
+   test("rejects an unusable cwd before writing shim files or spawning", async () => {
+     const runDir = tempDir();
+     const missingCwd = join(runDir, "missing-cwd");
