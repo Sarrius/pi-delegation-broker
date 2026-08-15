@@ -4,6 +4,7 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## Unreleased
 
+- Implemented deterministic provider proxy protocol machinery: immutable `AttemptRouteSnapshot` with one-time route/credential fingerprinting, versioned framed envelope validation, strict stream grammar (block lifecycle, tool-call identity pinning, cumulative usage monotonicity), exactly-once terminal CAS, attempt phase machine with crash-repair classification, and closed terminal/outcome vocabulary with provenance and retry-eligibility properties. No transport, credential, or IPC wiring is included; live use remains prohibited.
 - Added the versioned controller-owned real-provider proxy design gate, including strict stream grammar, immutable route/account binding, terminal/outcome taxonomy, cancellation, backpressure and adversarial acceptance tests; implementation remains absent and live use remains prohibited.
 - Behavioral action/result hashing now uses one bounded detached lossless-JSON snapshot; lossy numbers, sparse/decorated arrays, cycles, accessors and exotic containers fail closed instead of colliding or changing after declaration.
 - Added exact ready-task claim, pre-handoff requeue, `awaiting_result` crash reconciliation and terminal parent-result finalization.

@@ -1,6 +1,6 @@
 # Controller-owned provider proxy protocol (design gate)
 
-Status: design contract for a future implementation. The published alpha does not implement this protocol and remains fake-only.
+Status: partially implemented. `src/provider-protocol.mjs` implements envelope validation, stream grammar, terminal CAS, phase machine, and outcome taxonomy as deterministic protocol primitives. Transport, credential resolution, framed IPC wiring, and a real provider adapter remain unimplemented; live use remains prohibited.
 
 ## Authority boundary
 

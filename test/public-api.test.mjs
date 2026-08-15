@@ -5,12 +5,21 @@ import * as testing from "../src/testing.mjs";
 
 test("public API excludes test fixtures and exposes fake transport only through the testing subpath", () => {
   assert.deepEqual(Object.keys(api).sort(), [
+    "AttemptSettlement",
     "BehavioralRunMonitor",
     "BrokerIpcServer",
     "BrokeredLaunchResolver",
     "ControllerEvidenceStore",
+    "OUTCOME_PROPERTIES",
+    "PROVIDER_PROTOCOL_VERSION",
+    "ProviderProtocolError",
+    "ProviderStreamAssembler",
     "SingleHostBrokerSupervisor",
     "SqliteLeaseBroker",
+    "TERMINAL_OUTCOMES",
+    "createAttemptRouteSnapshot",
+    "isTerminalOutcome",
+    "outcomeProperties",
     "provisionBrokeredAgentDir",
     "requestBrokerIpc",
     "signedRegistryMessage",

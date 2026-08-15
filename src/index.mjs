@@ -8,6 +8,17 @@ export { SqliteLeaseBroker } from "./broker.mjs";
 export { ControllerEvidenceStore, validateResultEvidence } from "./evidence.mjs";
 export { BrokerIpcServer, requestBrokerIpc } from "./ipc.mjs";
 export { provisionBrokeredAgentDir } from "./isolated-child-config.mjs";
+export {
+  AttemptSettlement,
+  OUTCOME_PROPERTIES,
+  PROVIDER_PROTOCOL_VERSION,
+  ProviderProtocolError,
+  ProviderStreamAssembler,
+  TERMINAL_OUTCOMES,
+  createAttemptRouteSnapshot,
+  isTerminalOutcome,
+  outcomeProperties,
+} from "./provider-protocol.mjs";
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";
 export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
 export { BrokeredLaunchResolver } from "./trusted-launch-resolver.mjs";
