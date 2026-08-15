@@ -29,7 +29,9 @@ Verify the version has the intended prerelease/channel semantics:
 node -p "require('./package.json').version"
 ```
 
-For this alpha, use `0.1.0-alpha.N` and dist-tag `next`. Never manually run `npm publish` from a credential-bearing workstation.
+For this alpha, use `0.1.0-alpha.N` and dist-tag `next`. After trusted publishing is configured, never manually run `npm publish` from a credential-bearing workstation.
+
+A new package can require a one-time authenticated bootstrap before npm will accept its first OIDC publication. Treat that as an exception requiring explicit maintainer approval, the same complete release gate, an account protected by 2FA, and a documented transition to OIDC before the next version. It must not become the routine release path.
 
 ## Publish
 
