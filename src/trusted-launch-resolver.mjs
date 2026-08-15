@@ -1,5 +1,6 @@
 import { existsSync, lstatSync, mkdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { compileEffectiveChildCapability, createEffectiveChildCapability, deriveAllowedTools } from "./capability-compiler.mjs";
 import { provisionBrokeredAgentDir } from "./isolated-child-config.mjs";
 import { requestBrokerIpc } from "./ipc.mjs";
 
@@ -99,6 +100,27 @@ export class BrokeredLaunchResolver {
       const issued = await this.#controller("issueLeaseCapability", { leaseId: lease.leaseId, fencingToken: lease.fencingToken });
       if (issued?.status !== "issued" || typeof issued.capability !== "string") throw new Error("Broker declined lease capability issuance");
       agentDir = provisionBrokeredAgentDir(join(this.#agentRoot, request.childId)).agentDir;
+      const capability = createEffectiveChildCapability({
+        schemaVersion: 1,
+        taskId: lease.taskId,
+        operationClass: selection.contract.operationClass,
+        admissionClass: selection.contract.admissionClass,
+        doneWhen: selection.contract.doneWhen,
+        allowedTools: selection.contract.allowedTools ?? deriveAllowedTools(selection.contract.operationClass),
+        profileSupports: selection.contract.capability.required,
+        budget: {
+          ...(lease.maxOutputTokens !== undefined ? { maxOutputTokens: lease.maxOutputTokens } : {}),
+          ...(lease.maxInputTokens !== undefined ? { maxInputTokens: lease.maxInputTokens } : {}),
+          ...(lease.maxCostMicros !== undefined ? { maxCostMicros: lease.maxCostMicros } : {}),
+          enforcement: lease.enforcement,
+        },
+        latencyBudgetMs: selection.contract.latencyBudgetMs,
+        leaseTtlMs: selection.contract.leaseTtlMs ?? 30_000,
+        promptDigest: selection.contract.promptDigest,
+        behavioralEnforcement: lease.behavioralEnforcement,
+        downgradePolicy: selection.contract.capability.downgradePolicy,
+      });
+      const compiled = compileEffectiveChildCapability(capability);
       const admission = {
         lease,
         agentDir,
@@ -112,6 +134,8 @@ export class BrokeredLaunchResolver {
         policy: {
           policyId: lease.leaseId,
           agentDir,
+          promptRules: compiled.promptRules,
+          authorizationPolicy: compiled.authorizationPolicy,
           offline: this.#offline,
           extensionPaths: this.#extensionPaths,
           environment: {

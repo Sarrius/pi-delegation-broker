@@ -21,6 +21,7 @@ test("public API excludes test fixtures and exposes fake transport only through 
     "compileEffectiveChildCapability",
     "createAttemptRouteSnapshot",
     "createEffectiveChildCapability",
+    "deriveAllowedTools",
     "isTerminalOutcome",
     "outcomeProperties",
     "provisionBrokeredAgentDir",

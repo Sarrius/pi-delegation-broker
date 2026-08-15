@@ -235,3 +235,30 @@ test("controller resolver denies a model mismatch before reservation and capacit
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("resolver policy includes compiled capability prompt rules and authorization policy", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-cap-"));
+  const supervisor = signedSupervisor(root);
+  let resolver;
+  try {
+    await supervisor.start();
+    resolver = resolverFor(supervisor, root, () => ({
+      expectedModel: MODEL,
+      contract: fixtureContract({ taskId: "task-capability" }),
+    }));
+    const decision = await resolver.resolve(request("child_cap"));
+    assert.equal(decision.action, "allow");
+    assert.equal(typeof decision.policy.promptRules, "string");
+    assert.ok(decision.policy.promptRules.includes("operation_class: observe"));
+    assert.ok(decision.policy.promptRules.includes("allowed_tools:"));
+    assert.ok(decision.policy.authorizationPolicy);
+    assert.ok(decision.policy.authorizationPolicy.allowedTools instanceof Set);
+    assert.ok(decision.policy.authorizationPolicy.allowedTools.has("read"));
+    assert.equal(decision.policy.authorizationPolicy.effectCapable, false);
+    assert.equal(decision.policy.authorizationPolicy.operationClass, "observe");
+    await decision.policy.onBeforeChildAbandoned("test_cleanup");
+  } finally {
+    await supervisor.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

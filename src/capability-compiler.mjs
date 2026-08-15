@@ -19,6 +19,22 @@ const CAPABILITY_FIELDS = [
   "promptDigest", "behavioralEnforcement", "downgradePolicy",
 ];
 
+const OBSERVE_TOOLS = Object.freeze(["read", "grep", "ls", "find", "test"]);
+
+/**
+ * Derive a default allowed-tools set from the operation class. The observe set
+ * is read-only; each higher class adds its namesake tool. Contracts may override
+ * this with an explicit allowedTools field.
+ */
+export function deriveAllowedTools(operationClass) {
+  if (!OPERATION_CLASSES.has(operationClass)) throw new Error(`unknown operationClass: ${operationClass}`);
+  const tools = [...OBSERVE_TOOLS];
+  if (operationClass === "propose_patch" || operationClass === "apply" || operationClass === "external_write") tools.push("propose_patch");
+  if (operationClass === "apply" || operationClass === "external_write") tools.push("apply");
+  if (operationClass === "external_write") tools.push("external_write");
+  return Object.freeze(tools);
+}
+
 function boundedStringArray(value, name, max = 20, maxLen = 500) {
   if (!Array.isArray(value) || value.length < 1 || value.length > max) {
     throw new Error(`${name} must be an array of 1..${max} strings`);
