@@ -11,6 +11,7 @@
   "files": [
     "src",
     "docs/INTEGRATION.md",
+    "docs/PROVIDER-PROXY-PROTOCOL.md",
     "README.md",
     "LICENSE",
     "SECURITY.md",

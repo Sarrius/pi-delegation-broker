@@ -83,7 +83,7 @@ The controller owns all of these values:
 
 A child receives only a short-lived lease capability. Never pass a controller token, registry signing key, OAuth token, API key or complete account inventory to child environment, prompt, result or log.
 
-See [`docs/INTEGRATION.md`](docs/INTEGRATION.md) for the intended boundary and [`RELEASE.md`](RELEASE.md) before publishing.
+See [`docs/INTEGRATION.md`](docs/INTEGRATION.md) for the launcher boundary, [`docs/PROVIDER-PROXY-PROTOCOL.md`](docs/PROVIDER-PROXY-PROTOCOL.md) for the unimplemented fail-closed provider protocol, and [`RELEASE.md`](RELEASE.md) before publishing.
 
 ## Verification
 

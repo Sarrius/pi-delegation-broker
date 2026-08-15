@@ -4,6 +4,7 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## Unreleased
 
+- Added the versioned controller-owned real-provider proxy design gate, including strict stream grammar, immutable route/account binding, terminal/outcome taxonomy, cancellation, backpressure and adversarial acceptance tests; implementation remains absent and live use remains prohibited.
 - Behavioral action/result hashing now uses one bounded detached lossless-JSON snapshot; lossy numbers, sparse/decorated arrays, cycles, accessors and exotic containers fail closed instead of colliding or changing after declaration.
 - Added exact ready-task claim, pre-handoff requeue, `awaiting_result` crash reconciliation and terminal parent-result finalization.
 - Added clamped queue aging, protected control/verifier dispatch-window representatives and per-class p95/max wait metrics so neither strict priority nor an aged backlog hides a class.
