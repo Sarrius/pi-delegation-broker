@@ -1,5 +1,5 @@
 diff --git a/src/runner/runner.ts b/src/runner/runner.ts
-index b698382..c005eed 100644
+index b698382..f147a23 100644
 --- a/src/runner/runner.ts
 +++ b/src/runner/runner.ts
 @@ -12,6 +12,7 @@ import { reportDiagnostic } from "../diagnostics.js";
@@ -10,7 +10,15 @@ index b698382..c005eed 100644
  import type { ChildSession } from "./child-session.js";
  import { STRUCTURED_REPAIR_PROMPT } from "./schema-tool.js";
  import type { SchemaCapture } from "./schema-tool.js";
-@@ -275,6 +276,7 @@ export class SubagentRunner {
+@@ -137,6 +138,7 @@ class Handle implements SubagentHandle {
+   async steer(text: string): Promise<void> { if (this.session) return this.session.steer(text); this.steering.push(text); }
+   async flushSteering(): Promise<void> { for (const text of this.steering.splice(0)) await this.session?.steer(text); }
+   get isTerminal(): boolean { return this.terminal !== undefined; }
++  get terminalResult(): SubagentResult | undefined { return this.terminal; }
+   /** Whether the handle is doing live work right now. */
+   get isLive(): boolean { return this.status === "pending" || this.status === "running"; }
+   get isDisposingSession(): boolean { return this.sessionDisposal !== undefined; }
+@@ -275,6 +277,7 @@ export class SubagentRunner {
      isExpectedStop: (error: unknown) => boolean;
    }>();
    private childCounter = 0;
@@ -18,18 +26,18 @@ index b698382..c005eed 100644
    private finalizedRuns = new Set<string>();
    private deliveredRuns = new Set<string>();
    private agentTimeoutMinutes = 0;
-@@ -293,6 +295,7 @@ export class SubagentRunner {
+@@ -293,6 +296,7 @@ export class SubagentRunner {
      private buildStore: StoreBuilder = (runId, parent, storeOptions) =>
        new RunStore(runId, parent.ctx.cwd, parent.ctx.sessionManager.getSessionId(), parent.ctx.sessionManager.getSessionFile(), storeOptions),
      private delay: Delay = defaultDelay,
 +    private trustedLaunchResolver?: TrustedChildLaunchResolver,
    ) {}
-
+ 
    /** Apply a process-wide admission limit. Existing agents are never cancelled. */
-@@ -307,6 +310,23 @@ export class SubagentRunner {
+@@ -307,6 +311,23 @@ export class SubagentRunner {
      this.agentTimeoutMinutes = minutes;
    }
-
+ 
 +  /**
 +   * Install a controller-only launch resolver. It runs before worktree/shim/
 +   * process creation; it can allow an isolated policy or deny, never mutate a
@@ -50,7 +58,7 @@ index b698382..c005eed 100644
    /** Observe new child fan-outs. Telemetry listeners cannot affect runner lifecycle. */
    subscribeSpawns(listener: (run: SpawnedRun) => void): () => void {
      this.spawnListeners.add(listener);
-@@ -570,19 +590,73 @@ export class SubagentRunner {
+@@ -570,19 +591,73 @@ export class SubagentRunner {
        release();
      };
      handle.releaseAdmission = releaseAdmission;
@@ -83,11 +91,11 @@ index b698382..c005eed 100644
 +        reportDiagnostic(`[subagent-workflow] trusted child handoff notification failed: ${errorMessage(error)}`);
 +      }
 +    };
-+    const finalizeHandedPolicy = async (): Promise<void> => {
-+      if (launchPolicyFinalized || !launchPolicyHandedToChild || !launchPolicy?.onChildSessionClosed) return;
++    const finalizeHandedPolicy = async (result: SubagentResult | undefined): Promise<void> => {
++      if (launchPolicyFinalized || !launchPolicyHandedToChild || !launchPolicy?.onChildSessionClosed || !result) return;
 +      launchPolicyFinalized = true;
 +      try {
-+        await launchPolicy.onChildSessionClosed();
++        await launchPolicy.onChildSessionClosed({ status: result.status, ...(result.error === undefined ? {} : { error: result.error }) });
 +      } catch (error) {
 +        // Child process teardown remains complete even if controller-side
 +        // bookkeeping/agent-dir cleanup fails; do not revive the child.
@@ -100,7 +108,7 @@ index b698382..c005eed 100644
        releaseAdmission();
        await handle.waitForConstructionAbort();
        await handle.disposeSession();
-+      await finalizeHandedPolicy();
++      await finalizeHandedPolicy(handle.terminalResult);
        void this.retire(handle);
      };
 -    let worktree: { sourceCwd: string; tree: Worktree } | undefined;
@@ -126,7 +134,7 @@ index b698382..c005eed 100644
        handle.setStatus("running");
        let childSpec = handle.spec;
        if (handle.spec.isolation === "worktree") {
-@@ -592,13 +666,21 @@ export class SubagentRunner {
+@@ -592,13 +667,21 @@ export class SubagentRunner {
          childSpec = { ...handle.spec, cwd: tree.cwd };
        }
        if (handle.isTerminal) {
@@ -148,15 +156,14 @@ index b698382..c005eed 100644
        handle.session = child.session;
        if (handle.isTerminal) {
          await disposeSessionAndRetire();
-@@ -628,6 +710,7 @@ export class SubagentRunner {
-         // Shutdown hooks can make final worktree writes. Dispose the session
-         // before collecting so those writes are included in the patch.
-         await handle.disposeSession();
-+        await finalizeHandedPolicy();
-         if (worktree) {
-           try {
-             const changes = await collectWorktree(worktree.tree);
-@@ -649,9 +732,13 @@ export class SubagentRunner {
+@@ -643,15 +726,20 @@ export class SubagentRunner {
+             result.error = `${errorMessage(error)} - worktree retained at ${path}`;
+           }
+         }
++        await finalizeHandedPolicy(result);
+         handle.finish(result);
+         return result;
+       })();
        handle.inFlightPrompt = runAndFinish;
        try { await runAndFinish; } finally { handle.inFlightPrompt = undefined; }
      } catch (error) {
@@ -170,7 +177,7 @@ index b698382..c005eed 100644
        if (worktree && !retainWorktree) {
          try {
            await cleanupWorktree(worktree.sourceCwd, worktree.tree.path);
-@@ -796,7 +883,7 @@ function summarizeCall(name: string, args: unknown): string {
+@@ -796,7 +884,7 @@ function summarizeCall(name: string, args: unknown): string {
  // Bump whenever Handle/SubagentRunner state or behavior changes incompatibly.
  // A separate key from the semaphore lets a hot reload adopt the new runner
  // without temporarily creating a second concurrency pool.
@@ -196,7 +203,7 @@ index 007df98..5f41b71 100644
 +  /** Disable Pi startup network operations for a non-live/fake child. */
 +  offline?: boolean;
  }
-
+ 
  /** Tools children must never expose: the recursion guard, now per-process. */
 @@ -36,6 +44,9 @@ export function buildChildArgs(config: ChildProcessConfig): string[] {
    const excludeTools = [...new Set([...(config.excludeTools ?? []), ...RECURSION_GUARD_TOOLS])];
@@ -234,7 +241,7 @@ index da0132a..6a6406b 100644
 +  normalizeTrustedChildLaunchPolicy,
 +  type TrustedChildLaunchPolicy,
 +} from "../trusted-launch-policy.js";
-
+ 
  /** How long a child pi process gets to boot, load extensions, and report its toolset. */
  const TOOL_REPORT_TIMEOUT_MS = 60_000;
 @@ -60,6 +65,15 @@ export interface LaunchArtifactOverrides {
@@ -251,12 +258,12 @@ index da0132a..6a6406b 100644
 +  /** A resolver-approved policy passed by SubagentRunner. */
 +  launchPolicy?: TrustedChildLaunchPolicy;
  }
-
+ 
  function validateLaunchArtifact(path: string, label: string): void {
 @@ -74,8 +88,23 @@ function validateLaunchArtifact(path: string, label: string): void {
    if (!isFile) throw new Error(`${label} ${JSON.stringify(path)} is not a readable regular file: path is not a regular file`);
  }
-
+ 
 +export interface PreflightSubprocessChildResult {
 +  cwd: string;
 +  model: { provider: string; id: string };
@@ -286,7 +293,7 @@ index da0132a..6a6406b 100644
 +  const launchPolicy = overrides.launchPolicy === undefined ? undefined : normalizeTrustedChildLaunchPolicy(overrides.launchPolicy);
 +  return { cwd, model, thinking, tools, excludeTools, shimPath, childPiEntry, launchPolicy };
  }
-
+ 
  /** The child construction backend; the runner's ChildBuilder seam. */
  export async function spawnSubprocessChild(
    spec: SubagentSpec,
@@ -314,7 +321,7 @@ index da0132a..6a6406b 100644
 +    scopedModel: launchPolicy ? `${model.provider}/${model.id}` : undefined,
 +    offline: launchPolicy?.offline,
    });
-
+ 
    const shimDir = join(dirname(persistence.sessionsDir), "shim");
 @@ -138,7 +173,9 @@ export async function spawnSubprocessChild(
    try {
@@ -329,10 +336,10 @@ index da0132a..6a6406b 100644
      rmSync(specPath, { force: true });
 diff --git a/src/runner/trusted-launch-policy.ts b/src/runner/trusted-launch-policy.ts
 new file mode 100644
-index 0000000..ccf52e2
+index 0000000..53a3e99
 --- /dev/null
 +++ b/src/runner/trusted-launch-policy.ts
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,185 @@
 +import { createHash } from "node:crypto";
 +import { accessSync, constants, realpathSync, statSync } from "node:fs";
 +import { isAbsolute } from "node:path";
@@ -345,6 +352,11 @@ index 0000000..ccf52e2
 + * tool, cwd, prompt, or credential fields: a trusted resolver can allow a
 + * launch in an isolated Pi environment, but cannot silently change the task.
 + */
++export interface TrustedChildTerminalResult {
++  readonly status: "completed" | "failed" | "aborted";
++  readonly error?: string;
++}
++
 +export interface TrustedChildLaunchPolicy {
 +  readonly policyId: string;
 +  /** Existing, absolute, owner-only Pi agent dir selected by the controller. */
@@ -362,7 +374,7 @@ index 0000000..ccf52e2
 +  /** Parent-only handoff hook, after ChildSession construction succeeds. */
 +  readonly onChildSessionOpened?: () => void | Promise<void>;
 +  /** Parent-only completion hook, after ChildSession disposal/process exit. */
-+  readonly onChildSessionClosed?: () => void | Promise<void>;
++  readonly onChildSessionClosed?: (result: TrustedChildTerminalResult) => void | Promise<void>;
 +  /**
 +   * Broker routing metadata and a short-lived lease-scoped capability. This
 +   * must never carry a provider credential or controller/master capability.
@@ -514,13 +526,13 @@ index 0000000..ccf52e2
 +  return environment;
 +}
 diff --git a/tests/runner.test.ts b/tests/runner.test.ts
-index e67d5bc..aeda67f 100644
+index e67d5bc..39593e6 100644
 --- a/tests/runner.test.ts
 +++ b/tests/runner.test.ts
 @@ -16,11 +16,11 @@ import { WorkflowRunError } from "../src/workflow/workflow-runner.js";
-
+ 
  const zeroUsage = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
-
+ 
 -test("runner hot reload ignores the old v16 process singleton", async () => {
 +test("runner hot reload ignores the old v17 process singleton", async () => {
    const moduleUrl = new URL("../src/runner/runner.ts", import.meta.url).href;
@@ -532,10 +544,10 @@ index e67d5bc..aeda67f 100644
      "const sentinel = {};",
      "globalThis[oldKey] = sentinel;",
      "const { subagentRunner } = await import(" + JSON.stringify(moduleUrl) + ");",
-@@ -93,6 +93,135 @@ test("runner records the fully resolved spec and never rejects", async () => {
+@@ -93,6 +93,145 @@ test("runner records the fully resolved spec and never rejects", async () => {
    expect(result.usage).toMatchObject({ input: 1, output: 2, turns: 1 });
  });
-
+ 
 +test("trusted launch resolver runs before construction, sees no raw prompt, and forwards only a validated policy", async () => {
 +  const agentDir = mkdtempSync(join(tmpdir(), "trusted-child-agent-"));
 +  const resolved: ResolvedSpec = { provider: "openai-codex", modelId: "gpt-5.6-terra", thinkingLevel: "high", tools: ["read"], cwd: "/tmp", label: "brokered" };
@@ -547,6 +559,7 @@ index e67d5bc..aeda67f 100644
 +  let constructed = false;
 +  let openedPolicyCount = 0;
 +  let closedPolicyCount = 0;
++  let closedPolicyResult: unknown;
 +  let request: Record<string, unknown> | undefined;
 +  let forwardedPolicy: unknown;
 +  const parent = {
@@ -573,7 +586,15 @@ index e67d5bc..aeda67f 100644
 +    undefined,
 +    (input) => {
 +      request = input as unknown as Record<string, unknown>;
-+      return { action: "allow", policy: { policyId: "lease-7", agentDir, onChildSessionOpened: () => { openedPolicyCount += 1; }, onChildSessionClosed: () => { closedPolicyCount += 1; } } };
++      return {
++        action: "allow",
++        policy: {
++          policyId: "lease-7",
++          agentDir,
++          onChildSessionOpened: () => { openedPolicyCount += 1; },
++          onChildSessionClosed: (terminal) => { closedPolicyCount += 1; closedPolicyResult = terminal; },
++        },
++      };
 +    },
 +  );
 +
@@ -586,6 +607,7 @@ index e67d5bc..aeda67f 100644
 +  expect((forwardedPolicy as { policyId: string }).policyId).toBe("lease-7");
 +  expect(openedPolicyCount).toBe(1);
 +  expect(closedPolicyCount).toBe(1);
++  expect(closedPolicyResult).toEqual({ status: "completed" });
 +});
 +
 +test("trusted launch denial stops before child construction", async () => {
@@ -685,12 +707,12 @@ index e22b178..234e021 100644
    delete process.env[SHIM_SPEC_ENV];
 +  delete process.env.PARENT_SECRET_SENTINEL;
  });
-
+ 
  function fakeParent(cwd: string): ParentContext {
 @@ -115,6 +116,70 @@ describe("spawnSubprocessChild", () => {
      expect(child.session.sessionFile).toBe(join(sessionsDir, "child.jsonl"));
    });
-
+ 
 +  test("brokered policy uses an owner-only agent dir, explicit extensions, and a minimal environment", async () => {
 +    const runDir = tempDir();
 +    const agentDir = tempDir(); // mkdtemp creates 0700.

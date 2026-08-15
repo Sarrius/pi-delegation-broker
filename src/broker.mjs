@@ -4,8 +4,9 @@ import { DatabaseSync } from "node:sqlite";
 const ENFORCEMENT = Object.freeze({ hard: 2, metered_best_effort: 1, unavailable: 0 });
 const ADMISSION_CLASSES = new Set(["control", "verify", "work"]);
 const INVENTORY_CONFIDENCE = new Set(["measured", "observed", "assumed"]);
-const PENDING_STATES = new Set(["waiting", "ready", "escalated", "completed", "failed"]);
+const PENDING_STATES = new Set(["waiting", "ready", "claimed", "awaiting_result", "escalated", "completed", "failed"]);
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
 const SECRET_PATTERNS = [
   /sk-[A-Za-z0-9_-]{8,}/g,
   /(?:api[_-]?key|token|authorization)\s*[:=]\s*[^\s,;]+/gi,
@@ -60,13 +61,18 @@ function asLease(row) {
 export class SqliteLeaseBroker {
   #db;
   #maxPendingTasks;
+  #agingStepMs;
 
-  constructor({ path, registry, maxPendingTasks = 1_000 }) {
+  constructor({ path, registry, maxPendingTasks = 1_000, agingStepMs = 30_000 }) {
     if (!path) throw new Error("SQLite broker needs a database path");
     if (!Number.isSafeInteger(maxPendingTasks) || maxPendingTasks < 1 || maxPendingTasks > 100_000) {
       throw new Error("maxPendingTasks must be an integer between 1 and 100000");
     }
+    if (!Number.isSafeInteger(agingStepMs) || agingStepMs < 1 || agingStepMs > 86_400_000) {
+      throw new Error("agingStepMs must be an integer between 1 and 86400000");
+    }
     this.#maxPendingTasks = maxPendingTasks;
+    this.#agingStepMs = agingStepMs;
     this.#db = new DatabaseSync(path);
     try {
       // Configure the connection wait before contending for the database-wide
@@ -108,7 +114,7 @@ export class SqliteLeaseBroker {
         this.#record(now, "ReservationDenied", { taskId: contract?.taskId, ...result });
         return result;
       }
-      const activePending = this.#db.prepare("SELECT count(*) AS count FROM pending_tasks WHERE state IN ('waiting', 'ready', 'escalated')").get().count;
+      const activePending = this.#db.prepare("SELECT count(*) AS count FROM pending_tasks WHERE state IN ('waiting', 'ready', 'claimed', 'awaiting_result', 'escalated')").get().count;
       if (activePending >= this.#maxPendingTasks) {
         const result = {
           status: "denied_capacity",
@@ -149,21 +155,28 @@ export class SqliteLeaseBroker {
     });
   }
 
-  /** Atomically retry eligible queued contracts in control/verify/work order. */
+  /** Atomically retry eligible queued contracts with class preference plus bounded aging. */
   dispatchPending(now, limit = 100) {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) throw new Error("dispatch limit must be between 1 and 1000");
     return this.#transaction(() => {
       this.#expire(now);
-      const overdue = this.#db.prepare("SELECT task_id, recovery_owner FROM pending_tasks WHERE state = 'waiting' AND deadline_at <= ?").all(now);
-      this.#db.prepare("UPDATE pending_tasks SET state = 'escalated', updated_at = ? WHERE state = 'waiting' AND deadline_at <= ?").run(now, now);
-      for (const task of overdue) this.#record(now, "TaskEscalated", { taskId: task.task_id, recoveryOwner: task.recovery_owner, reason: "capacity_wait_deadline" });
+      const overdue = this.#db.prepare("SELECT task_id, recovery_owner, state FROM pending_tasks WHERE state IN ('waiting', 'awaiting_result') AND deadline_at <= ?").all(now);
+      this.#db.prepare("UPDATE pending_tasks SET state = 'escalated', updated_at = ?, eligible_at = NULL WHERE state IN ('waiting', 'awaiting_result') AND deadline_at <= ?").run(now, now);
+      for (const task of overdue) this.#record(now, "TaskEscalated", {
+        taskId: task.task_id,
+        recoveryOwner: task.recovery_owner,
+        reason: task.state === "awaiting_result" ? "result_reconciliation_deadline" : "capacity_wait_deadline",
+      });
 
       const queued = this.#db.prepare(`
         SELECT * FROM pending_tasks
         WHERE state = 'waiting' AND eligible_at IS NOT NULL AND eligible_at <= ? AND deadline_at > ?
-        ORDER BY CASE admission_class WHEN 'control' THEN 0 WHEN 'verify' THEN 1 ELSE 2 END, created_at, task_id
+        ORDER BY (
+          CASE admission_class WHEN 'control' THEN 0 WHEN 'verify' THEN 1 ELSE 2 END
+          - CAST((? - created_at) / ? AS INTEGER)
+        ), created_at, task_id
         LIMIT ?
-      `).all(now, now, limit);
+      `).all(now, now, now, this.#agingStepMs, limit);
       const ready = [];
       for (const pending of queued) {
         const reservation = this.#reserveCore(parseJson(pending.contract), now);
@@ -217,6 +230,66 @@ export class SqliteLeaseBroker {
     });
   }
 
+  claimReadyTask(taskId, leaseId, contract, now) {
+    return this.#transaction(() => {
+      this.#expire(now);
+      const pending = this.#db.prepare(`
+        SELECT p.contract, l.*
+        FROM pending_tasks p JOIN leases l ON l.lease_id = p.lease_id
+        WHERE p.task_id = ? AND p.lease_id = ? AND p.state = 'ready' AND l.expires_at > ?
+      `).get(taskId, leaseId, now);
+      if (!pending || pending.task_id !== taskId || JSON.stringify(redact(contract)) !== pending.contract) {
+        return { status: "denied_policy", reasons: ["ready task contract or lease does not match"] };
+      }
+      const claimed = this.#db.prepare("UPDATE pending_tasks SET state = 'claimed', updated_at = ? WHERE task_id = ? AND state = 'ready'")
+        .run(now, taskId);
+      if (claimed.changes !== 1) return { status: "denied_policy", reasons: ["ready task was already claimed"] };
+      const lease = asLease(pending);
+      this.#record(now, "TaskClaimed", { taskId, leaseId });
+      return { status: "leased", lease };
+    });
+  }
+
+  abandonClaimedTask(taskId, leaseId, fencingToken, now) {
+    return this.#transaction(() => {
+      const pending = this.#db.prepare("SELECT deadline_at, recovery_owner FROM pending_tasks WHERE task_id = ? AND lease_id = ? AND state = 'claimed'")
+        .get(taskId, leaseId);
+      if (!pending) return { status: "denied_policy" };
+      const lease = this.#db.prepare("SELECT * FROM leases WHERE lease_id = ? AND fencing_token = ?").get(leaseId, fencingToken);
+      if (lease) {
+        this.#db.prepare("DELETE FROM leases WHERE lease_id = ?").run(leaseId);
+        this.#afterLeaseRemoved(lease, now);
+      }
+      const state = pending.deadline_at > now ? "waiting" : "escalated";
+      this.#db.prepare("UPDATE pending_tasks SET state = ?, eligible_at = ?, updated_at = ?, lease_id = NULL WHERE task_id = ? AND state = 'claimed'")
+        .run(state, state === "waiting" ? now : null, now, taskId);
+      this.#record(now, state === "waiting" ? "TaskRequeued" : "TaskEscalated", {
+        taskId,
+        recoveryOwner: pending.recovery_owner,
+        reason: "claimed_child_not_handed",
+      });
+      return { status: state };
+    });
+  }
+
+  finalizeClaimedTask(taskId, leaseId, fencingToken, terminalState, now) {
+    if (terminalState !== "completed" && terminalState !== "failed") return { status: "denied_policy" };
+    return this.#transaction(() => {
+      const pending = this.#db.prepare("SELECT 1 FROM pending_tasks WHERE task_id = ? AND lease_id = ? AND state IN ('claimed', 'awaiting_result')")
+        .get(taskId, leaseId);
+      if (!pending) return { status: "denied_policy" };
+      const lease = this.#db.prepare("SELECT * FROM leases WHERE lease_id = ? AND fencing_token = ?").get(leaseId, fencingToken);
+      if (lease) {
+        this.#db.prepare("DELETE FROM leases WHERE lease_id = ?").run(leaseId);
+        this.#afterLeaseRemoved(lease, now);
+      }
+      this.#db.prepare("UPDATE pending_tasks SET state = ?, eligible_at = NULL, updated_at = ?, lease_id = NULL WHERE task_id = ? AND state IN ('claimed', 'awaiting_result')")
+        .run(terminalState, now, taskId);
+      this.#record(now, "TaskTerminal", { taskId, status: terminalState, source: "claimed_child_result" });
+      return { status: terminalState };
+    });
+  }
+
   readyTasks() {
     return this.#db.prepare(`
       SELECT p.task_id AS pending_task_id, l.*
@@ -224,6 +297,26 @@ export class SqliteLeaseBroker {
       WHERE p.state = 'ready'
       ORDER BY p.updated_at, p.task_id
     `).all().map((row) => Object.freeze({ taskId: row.pending_task_id, lease: Object.freeze(asLease(row)) }));
+  }
+
+  queueWaitMetrics(now) {
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error("queue wait metrics require a non-negative safe-integer time");
+    const rows = this.#db.prepare(`
+      SELECT admission_class, created_at FROM pending_tasks
+      WHERE state IN ('waiting', 'ready', 'claimed', 'awaiting_result', 'escalated')
+      ORDER BY admission_class, created_at
+    `).all();
+    const metrics = {};
+    for (const admissionClass of ADMISSION_CLASSES) {
+      const waits = rows.filter((row) => row.admission_class === admissionClass).map((row) => Math.max(0, now - row.created_at)).sort((a, b) => a - b);
+      const p95Index = waits.length === 0 ? -1 : Math.ceil(waits.length * 0.95) - 1;
+      metrics[admissionClass] = Object.freeze({
+        count: waits.length,
+        p95WaitMs: p95Index < 0 ? 0 : waits[p95Index],
+        maxWaitMs: waits.length === 0 ? 0 : waits[waits.length - 1],
+      });
+    }
+    return Object.freeze(metrics);
   }
 
   pendingTasks() {
@@ -306,6 +399,10 @@ export class SqliteLeaseBroker {
       if (!lease) return { status: "denied_lease" };
       this.#db.prepare("DELETE FROM leases WHERE lease_id = ?").run(leaseId);
       this.#afterLeaseRemoved(lease, now);
+      this.#db.prepare(`
+        UPDATE pending_tasks SET state = 'awaiting_result', updated_at = ?
+        WHERE lease_id = ? AND state = 'claimed'
+      `).run(now, leaseId);
       this.#record(now, "LeaseReleased", { leaseId, fencingToken, reason });
       return { status: "released" };
     });
@@ -479,7 +576,7 @@ export class SqliteLeaseBroker {
         task_id TEXT PRIMARY KEY,
         contract TEXT NOT NULL,
         admission_class TEXT NOT NULL CHECK (admission_class IN ('control', 'verify', 'work')),
-        state TEXT NOT NULL CHECK (state IN ('waiting', 'ready', 'escalated', 'completed', 'failed')),
+        state TEXT NOT NULL CHECK (state IN ('waiting', 'ready', 'claimed', 'awaiting_result', 'escalated', 'completed', 'failed')),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         eligible_at INTEGER,
@@ -637,6 +734,14 @@ export class SqliteLeaseBroker {
           UPDATE pending_tasks SET state = 'escalated', eligible_at = NULL, updated_at = ?, lease_id = NULL
           WHERE lease_id = ? AND state = 'ready' AND deadline_at <= ?
         `).run(now, row.lease_id, now);
+        const claimed = this.#db.prepare("SELECT task_id, recovery_owner FROM pending_tasks WHERE lease_id = ? AND state = 'claimed'").get(row.lease_id);
+        if (claimed) {
+          this.#db.prepare(`
+            UPDATE pending_tasks SET state = 'escalated', eligible_at = NULL, updated_at = ?, lease_id = NULL
+            WHERE task_id = ? AND state = 'claimed'
+          `).run(now, claimed.task_id);
+          this.#record(now, "TaskEscalated", { taskId: claimed.task_id, recoveryOwner: claimed.recovery_owner, reason: "claimed_lease_expired" });
+        }
         this.#record(now, "LeaseExpired", { leaseId: row.lease_id, fencingToken: row.fencing_token });
       }
     }
@@ -784,6 +889,12 @@ export class SqliteLeaseBroker {
   #validateContract(contract) {
     if (!IDENTIFIER.test(contract?.taskId ?? "") || !contract?.capability?.minimumProfile || !Array.isArray(contract.capability.required)) return "invalid contract";
     if (!ADMISSION_CLASSES.has(contract.admissionClass)) return "contract requires admissionClass control, verify, or work";
+    if (!SHA256.test(contract.promptDigest ?? "")) return "contract requires the exact child promptDigest";
+    if (!Array.isArray(contract.doneWhen) || contract.doneWhen.length < 1 || contract.doneWhen.length > 20
+      || contract.doneWhen.some((criterion) => typeof criterion !== "string" || criterion.length < 1 || criterion.length > 500 || /[\0\r\n]/.test(criterion))) {
+      return "contract requires 1-20 bounded child-facing doneWhen criteria";
+    }
+    if (!Number.isSafeInteger(contract.latencyBudgetMs) || contract.latencyBudgetMs < 1) return "contract requires a positive latencyBudgetMs";
     if (contract.leaseTtlMs !== undefined && (!Number.isSafeInteger(contract.leaseTtlMs) || contract.leaseTtlMs < 1)) return "leaseTtlMs must be a positive safe integer";
     if (contract.capability.downgradePolicy !== "forbid") return "only forbid downgrade policy is implemented in broker MVP";
     if (!this.#profile(contract.capability.minimumProfile)) return "unknown or unapproved minimum profile";
@@ -864,6 +975,9 @@ export function fixtureContract(overrides = {}) {
     taskId: "task-1",
     admissionClass: "control",
     operationClass: "observe",
+    promptDigest: "a".repeat(64),
+    doneWhen: ["Return the requested repository finding with controller-verifiable evidence references"],
+    latencyBudgetMs: 120_000,
     capability: { minimumProfile: "reasoning-high/v1", required: ["code_reasoning", "repo_navigation"], downgradePolicy: "forbid" },
     budget: { maxInputTokens: 1_000, maxOutputTokens: 100, enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" } },
     leaseTtlMs: 30_000,

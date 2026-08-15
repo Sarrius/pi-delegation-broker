@@ -5,7 +5,7 @@ import { dirname } from "node:path";
 const MAX_REQUEST_BYTES = 64 * 1024;
 const CHILD_METHODS = new Set(["heartbeat", "release", "providerAttempt"]);
 const CONTROLLER_METHODS = new Set([
-  "reserve", "submit", "dispatchPending", "pendingTasks", "readyTasks", "reschedulePending", "finishPending",
+  "reserve", "submit", "dispatchPending", "pendingTasks", "queueWaitMetrics", "readyTasks", "claimReadyTask", "abandonClaimedTask", "finalizeClaimedTask", "reschedulePending", "finishPending",
   "issueLeaseCapability", "markRateLimited", "markUnknown", "markHealthy", "release", "configureFakeProvider",
 ]);
 
@@ -159,7 +159,11 @@ export class BrokerIpcServer {
       if (method === "submit") return this.#broker.submit(params.contract, now);
       if (method === "dispatchPending") return this.#broker.dispatchPending(now, params.limit);
       if (method === "pendingTasks") return this.#broker.pendingTasks();
+      if (method === "queueWaitMetrics") return this.#broker.queueWaitMetrics(now);
       if (method === "readyTasks") return this.#broker.readyTasks();
+      if (method === "claimReadyTask") return this.#broker.claimReadyTask(params.taskId, params.leaseId, params.contract, now);
+      if (method === "abandonClaimedTask") return this.#broker.abandonClaimedTask(params.taskId, params.leaseId, params.fencingToken, now);
+      if (method === "finalizeClaimedTask") return this.#broker.finalizeClaimedTask(params.taskId, params.leaseId, params.fencingToken, params.terminalState, now);
       if (method === "reschedulePending") return this.#broker.reschedulePending(params.taskId, params.recoveryOwner, params.eligibleAt, now);
       if (method === "finishPending") return this.#broker.finishPending(params.taskId, params.state, now);
       if (method === "issueLeaseCapability") return this.#broker.issueLeaseCapability(params.leaseId, params.fencingToken, now);

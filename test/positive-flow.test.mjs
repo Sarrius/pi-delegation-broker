@@ -23,7 +23,7 @@ test("non-live discover, audit, verify and merge flow reaches controller-accepte
     const verifier = broker.reserve(fixtureContract({ taskId: "reference-verifier", admissionClass: "verify" }), 1_000);
     assert.deepEqual([root.status, audit.status, verifier.status], ["leased", "leased", "leased"]);
 
-    const evidenceStore = new ControllerEvidenceStore();
+    const evidenceStore = new ControllerEvidenceStore({ root: join(directory, "evidence") });
     const discovered = evidenceStore.capture({
       kind: "file",
       claim: "repository inventory captured",

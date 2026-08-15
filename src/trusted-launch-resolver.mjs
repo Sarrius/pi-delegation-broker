@@ -68,12 +68,30 @@ export class BrokeredLaunchResolver {
     const selection = await this.#selectContract(Object.freeze({ ...request }));
     if (selection?.action === "deny") return { action: "deny", reason: safeReason(selection.reason) };
     if (!selection?.contract) throw new Error("Broker launch selection did not return a contract");
+    if (selection.contract.promptDigest !== request.promptDigest) {
+      return { action: "deny", reason: "child prompt is not bound to the selected broker contract" };
+    }
     const expected = expectedModel(selection);
     if (request.model?.provider !== expected.provider || request.model?.modelId !== expected.modelId) {
       return { action: "deny", reason: "resolved model is not approved for this broker contract" };
     }
 
-    const reservation = await this.#controller("reserve", { contract: selection.contract });
+    let queuedTaskId;
+    let reservation;
+    if (selection.readyTask !== undefined) {
+      if (!selection.readyTask || selection.readyTask.taskId !== selection.contract.taskId
+        || typeof selection.readyTask.leaseId !== "string" || !selection.readyTask.leaseId) {
+        return { action: "deny", reason: "ready task selection does not match broker contract" };
+      }
+      queuedTaskId = selection.readyTask.taskId;
+      reservation = await this.#controller("claimReadyTask", {
+        taskId: queuedTaskId,
+        leaseId: selection.readyTask.leaseId,
+        contract: selection.contract,
+      });
+    } else {
+      reservation = await this.#controller("reserve", { contract: selection.contract });
+    }
     if (reservation?.status !== "leased") return { action: "deny", reason: reservation?.status === "denied_capacity" ? "no compatible broker capacity" : "broker policy denied launch" };
     const lease = reservation.lease;
     let agentDir;
@@ -81,7 +99,13 @@ export class BrokeredLaunchResolver {
       const issued = await this.#controller("issueLeaseCapability", { leaseId: lease.leaseId, fencingToken: lease.fencingToken });
       if (issued?.status !== "issued" || typeof issued.capability !== "string") throw new Error("Broker declined lease capability issuance");
       agentDir = provisionBrokeredAgentDir(join(this.#agentRoot, request.childId)).agentDir;
-      const admission = { lease, agentDir, capability: issued.capability, phase: "pending_handoff" };
+      const admission = {
+        lease,
+        agentDir,
+        capability: issued.capability,
+        phase: "pending_handoff",
+        ...(queuedTaskId === undefined ? {} : { queuedTaskId }),
+      };
       this.#admissions.set(request.childId, admission);
       return {
         action: "allow",
@@ -98,11 +122,12 @@ export class BrokeredLaunchResolver {
           },
           onBeforeChildAbandoned: async () => this.releaseUnhanded(request.childId),
           onChildSessionOpened: async () => this.markChildHanded(request.childId),
-          onChildSessionClosed: async () => this.finalizeHandedChild(request.childId),
+          onChildSessionClosed: async (result) => this.finalizeHandedChild(request.childId, result),
         },
       };
     } catch (error) {
-      await this.#releaseLease(lease).catch(() => undefined);
+      if (queuedTaskId === undefined) await this.#releaseLease(lease).catch(() => undefined);
+      else await this.#abandonClaimed(queuedTaskId, lease).catch(() => undefined);
       if (agentDir) this.#removeAgentDir(agentDir);
       throw error;
     }
@@ -122,8 +147,8 @@ export class BrokeredLaunchResolver {
   }
 
   /** Idempotent post-session cleanup called only after trusted runner disposal. */
-  async finalizeHandedChild(childId) {
-    return this.#releaseAdmission(childId, "closed_release_pending");
+  async finalizeHandedChild(childId, result) {
+    return this.#releaseAdmission(childId, "closed_release_pending", result?.status === "completed" ? "completed" : "failed");
   }
 
   /** Retry only records explicitly known to be unhanded or session-closed. */
@@ -132,7 +157,7 @@ export class BrokeredLaunchResolver {
     for (const [childId, admission] of this.#admissions) {
       if (admission.phase !== "release_pending" && admission.phase !== "closed_release_pending") continue;
       try {
-        outcomes.push(Object.freeze({ childId, ...(await this.#releaseAdmission(childId, admission.phase)) }));
+        outcomes.push(Object.freeze({ childId, ...(await this.#releaseAdmission(childId, admission.phase, admission.terminalState)) }));
       } catch {
         outcomes.push(Object.freeze({ childId, status: "pending" }));
       }
@@ -148,20 +173,30 @@ export class BrokeredLaunchResolver {
       fencingToken: admission.lease.fencingToken,
       expiresAt: admission.lease.expiresAt,
       phase: admission.phase,
+      ...(admission.queuedTaskId === undefined ? {} : { queuedTaskId: admission.queuedTaskId }),
     })));
   }
 
-  async #releaseAdmission(childId, pendingPhase) {
+  async #releaseAdmission(childId, pendingPhase, terminalState) {
     const admission = this.#admissions.get(childId);
     if (!admission) return { status: "already_released" };
     admission.phase = pendingPhase;
+    if (terminalState !== undefined) admission.terminalState = terminalState;
     // Do not forget an admission before controller IPC confirms. On a broker
     // transport failure the controller retains a redacted record and agent dir
     // for explicit retry/reconciliation instead of silently relying on TTL.
-    await this.#releaseLease(admission.lease);
+    let result;
+    if (admission.queuedTaskId === undefined) {
+      await this.#releaseLease(admission.lease);
+      result = { status: "released" };
+    } else if (pendingPhase === "release_pending") {
+      result = await this.#abandonClaimed(admission.queuedTaskId, admission.lease);
+    } else {
+      result = await this.#finalizeClaimed(admission.queuedTaskId, admission.lease, admission.terminalState ?? "failed");
+    }
     this.#removeAgentDir(admission.agentDir);
     this.#admissions.delete(childId);
-    return { status: "released" };
+    return result;
   }
 
   async #controller(method, params) {
@@ -175,6 +210,23 @@ export class BrokeredLaunchResolver {
 
   async #releaseLease(lease) {
     await this.#controller("release", { leaseId: lease.leaseId, fencingToken: lease.fencingToken });
+  }
+
+  async #abandonClaimed(taskId, lease) {
+    return this.#controller("abandonClaimedTask", {
+      taskId,
+      leaseId: lease.leaseId,
+      fencingToken: lease.fencingToken,
+    });
+  }
+
+  async #finalizeClaimed(taskId, lease, terminalState) {
+    return this.#controller("finalizeClaimedTask", {
+      taskId,
+      leaseId: lease.leaseId,
+      fencingToken: lease.fencingToken,
+      terminalState,
+    });
   }
 
   #removeAgentDir(agentDir) {

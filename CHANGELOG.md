@@ -4,6 +4,11 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## Unreleased
 
+- Added exact ready-task claim, pre-handoff requeue, `awaiting_result` crash reconciliation and terminal parent-result finalization.
+- Added queue aging and per-class p95/max wait metrics so reserves do not turn into strict-priority starvation.
+- Added contract `doneWhen`, prompt-digest binding and positive latency-budget admission checks.
+- Added deterministic behavioral monitoring for no-progress, typed action mismatch, declared-change reconciliation and completion claims.
+- Replaced digest-only evidence indexing with redacted content-addressed retention, restart verification, corruption detection and explicit pruning.
 - Added durable task waiting with explicit recovery owner/deadline and supervisor dispatch.
 - Added `control | verify | work` admission reserves to prevent work fan-out from starving merger/verifier capacity.
 - Added confidence-labelled schema-v2 inventory enforcement, registry-defined cooldowns and a one-probe half-open breaker.

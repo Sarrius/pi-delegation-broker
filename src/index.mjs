@@ -3,6 +3,7 @@
  * It intentionally contains no provider credential, HTTP client, or automatic
  * provider failover implementation.
  */
+export { BehavioralRunMonitor } from "./behavior-monitor.mjs";
 export { SqliteLeaseBroker } from "./broker.mjs";
 export { ControllerEvidenceStore, validateResultEvidence } from "./evidence.mjs";
 export { BrokerIpcServer, requestBrokerIpc } from "./ipc.mjs";

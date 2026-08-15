@@ -20,9 +20,11 @@ Validated locally on Node 26 with deterministic fake transport only. The fake tr
 
 - SQLite (`BEGIN IMMEDIATE` + WAL) lease reservation, TTL, fencing and shared capacity groups.
 - Durable bounded task waiting with named recovery owner/deadline and supervisor wake-up after capacity changes.
-- `control | verify | work` admission classes with capacity reserved for merger/verifier control paths.
+- `control | verify | work` admission classes with reserved control capacity plus queue aging so old work is not starved.
+- Contract admission requires child-facing `doneWhen`, exact prompt-digest binding and a positive latency budget.
+- A deterministic behavioral monitor for typed action reconciliation, no-progress detection and evidence-bound completion claims.
 - Registry-defined inventory confidence, pessimistic cooldown policy and one half-open probe per group.
-- Controller-rooted evidence capture/validation; self-reported evidence cannot satisfy acceptance.
+- Persistent content-addressed, redacted controller evidence with explicit retention/pruning; self-reported evidence cannot satisfy acceptance.
 - SHA-256-hashed lease capabilities for owner-only Unix-socket IPC.
 - Signed Ed25519 capability-registry verification before supervisor startup.
 - Owner-only state directory, lock, socket, bounded shutdown and periodic TTL sweep.
@@ -53,7 +55,7 @@ The first public prerelease should use the `next` npm tag:
 npm install @sars267/pi-delegation-broker@next
 ```
 
-Do not install from npm until the repository release checklist is complete and the package name is confirmed available.
+The published prerelease is a research artifact only; installing it does not authorize connection to any real provider/account.
 
 ## Minimal API shape
 
@@ -61,11 +63,14 @@ Do not install from npm until the repository release checklist is complete and t
 import {
   SingleHostBrokerSupervisor,
   BrokeredLaunchResolver,
+  BehavioralRunMonitor,
   ControllerEvidenceStore,
   validateResultEvidence,
   verifySignedRegistry,
 } from "@sars267/pi-delegation-broker";
 ```
+
+`ControllerEvidenceStore` requires an absolute owner-only `root`; text artifacts are redacted before hashing/retention, while binary artifacts require `artifactIsRedacted: true`. `BehavioralRunMonitor` is deterministic reference state: a Pi integration must call action authorization from a blocking pre-tool hook and result observation only after tool completion.
 
 A supervisor requires signed registry schema v2 by default. Registry capacity groups must declare admission reserves, inventory confidence, default cooldown and probe interval; resources must declare their own inventory confidence. These fields are fail-closed because inferred capacity must not masquerade as measured capacity. If a durable database contains different policy values or removed/extra registry IDs, startup refuses an implicit transition and requires an audited migration/new state directory. Passing an unsigned fixture requires the explicit `allowUnsignedFixture: true` escape hatch, which exists only for deterministic tests.
 

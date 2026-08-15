@@ -123,6 +123,70 @@ test("queued capacity work wakes after lease release and becomes ready without a
   }, registry);
 });
 
+test("ready work is claimed against the exact contract and reconciled to terminal completion", () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  withBroker((broker) => {
+    const occupant = leased(broker, fixtureContract({ taskId: "claim-occupant" }), 1_000);
+    const contract = fixtureContract({ taskId: "claim-task", recovery: { owner: "root-controller", deadlineAt: 60_000 } });
+    assert.equal(broker.submit(contract, 1_001).status, "queued");
+    broker.release(occupant.leaseId, occupant.fencingToken, "capacity released", 1_002);
+    const [ready] = broker.dispatchPending(1_002);
+    assert.equal(ready.taskId, "claim-task");
+    assert.equal(broker.claimReadyTask("claim-task", ready.lease.leaseId, { ...contract, operationClass: "validate" }, 1_003).status, "denied_policy");
+    const claimed = broker.claimReadyTask("claim-task", ready.lease.leaseId, contract, 1_003);
+    assert.equal(claimed.status, "leased");
+    assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["claimed"]);
+    assert.equal(broker.claimReadyTask("claim-task", ready.lease.leaseId, contract, 1_003).status, "denied_policy");
+
+    broker.release(claimed.lease.leaseId, claimed.lease.fencingToken, "child provider shutdown", 1_004);
+    assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["awaiting_result"]);
+    assert.equal(broker.finalizeClaimedTask("claim-task", claimed.lease.leaseId, claimed.lease.fencingToken, "completed", 1_005).status, "completed");
+    assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["completed"]);
+    assert.equal(broker.leases().length, 0);
+  }, registry);
+});
+
+test("a claimed child release without a parent result escalates at the task deadline", () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  withBroker((broker) => {
+    const occupant = leased(broker, fixtureContract({ taskId: "lost-result-occupant" }), 1_000);
+    const contract = fixtureContract({ taskId: "lost-result-task", recovery: { owner: "result-owner", deadlineAt: 2_000 } });
+    broker.submit(contract, 1_001);
+    broker.release(occupant.leaseId, occupant.fencingToken, "capacity released", 1_002);
+    const [ready] = broker.dispatchPending(1_002);
+    const claimed = broker.claimReadyTask(contract.taskId, ready.lease.leaseId, contract, 1_003);
+    broker.release(claimed.lease.leaseId, claimed.lease.fencingToken, "child provider shutdown", 1_004);
+    assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["awaiting_result"]);
+    broker.dispatchPending(2_000);
+    assert.deepEqual(broker.pendingTasks().map((task) => ({ state: task.state, owner: task.recoveryOwner })), [
+      { state: "escalated", owner: "result-owner" },
+    ]);
+    assert.equal(broker.events().at(-1).payload.reason, "result_reconciliation_deadline");
+  }, registry);
+});
+
+test("an unhanded claimed task is atomically requeued with no lease leak", () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  withBroker((broker) => {
+    const occupant = leased(broker, fixtureContract({ taskId: "abandon-occupant" }), 1_000);
+    const contract = fixtureContract({ taskId: "abandon-task", recovery: { owner: "root-controller", deadlineAt: 60_000 } });
+    broker.submit(contract, 1_001);
+    broker.release(occupant.leaseId, occupant.fencingToken, "capacity released", 1_002);
+    const [ready] = broker.dispatchPending(1_002);
+    const claimed = broker.claimReadyTask("abandon-task", ready.lease.leaseId, contract, 1_003);
+    assert.equal(claimed.status, "leased");
+    assert.equal(broker.abandonClaimedTask("abandon-task", claimed.lease.leaseId, claimed.lease.fencingToken, 1_004).status, "waiting");
+    assert.equal(broker.leases().length, 0);
+    assert.deepEqual(broker.pendingTasks().map((task) => ({ state: task.state, eligibleAt: task.eligibleAt })), [{ state: "waiting", eligibleAt: 1_004 }]);
+  }, registry);
+});
+
 test("queued work without a named recovery owner and deadline is rejected instead of waiting forever", () => {
   const registry = fixtureRegistry();
   delete registry.resources.R2;
@@ -173,6 +237,44 @@ test("capacity wait reaches explicit owner escalation at its deadline", () => {
     ]);
     assert.equal(broker.events().some((event) => event.type === "TaskEscalated" && event.payload.taskId === "deadline-waiter"), true);
   }, registry);
+});
+
+test("aging admits old work under a sustained stream of newer control tasks", () => {
+  const directory = mkdtempSync(join(tmpdir(), "delegation-broker-aging-"));
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  registry.capacityGroups["G-shared"].maxConcurrent = 2;
+  const broker = new SqliteLeaseBroker({ path: join(directory, "broker.sqlite"), registry, agingStepMs: 10 });
+  try {
+    leased(broker, fixtureContract({ taskId: "aging-control-floor" }), 1_000);
+    let occupant = leased(broker, fixtureContract({ taskId: "aging-occupant" }), 1_000);
+    const work = fixtureContract({
+      taskId: "aging-work",
+      admissionClass: "work",
+      recovery: { owner: "scheduler", deadlineAt: 10_000 },
+    });
+    assert.equal(broker.submit(work, 1_001).status, "queued");
+    let workReadyAt;
+    for (let round = 0; round < 5 && workReadyAt === undefined; round += 1) {
+      const now = 1_002 + round * 10;
+      const control = fixtureContract({
+        taskId: `aging-control-${round}`,
+        recovery: { owner: "scheduler", deadlineAt: 10_000 },
+      });
+      assert.equal(broker.submit(control, now).status, "queued");
+      broker.release(occupant.leaseId, occupant.fencingToken, "round complete", now);
+      const [ready] = broker.dispatchPending(now);
+      assert.ok(ready);
+      if (ready.taskId === work.taskId) workReadyAt = now;
+      occupant = ready.lease;
+    }
+    assert.ok(workReadyAt !== undefined, "old work must outrank a continuing stream of newer control tasks");
+    assert.ok(workReadyAt <= 1_032, `work wait was not bounded by aging: ${workReadyAt}`);
+  } finally {
+    broker.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("work fan-out cannot consume control and verifier admission reserves", () => {
@@ -254,6 +356,13 @@ test("a pre-cooldown in-flight success cannot close a breaker opened by another 
     assert.equal(blocked.earliestCompatibleAt, cooldown.until);
   }, registry);
 });
+
+test("contract admission requires child-facing done criteria, prompt binding, and latency budget", () => withBroker((broker) => {
+  assert.equal(broker.reserve(fixtureContract({ taskId: "missing-done", doneWhen: [] }), 1_000).status, "denied_policy");
+  assert.equal(broker.reserve(fixtureContract({ taskId: "missing-prompt", promptDigest: "not-a-digest" }), 1_000).status, "denied_policy");
+  assert.equal(broker.reserve(fixtureContract({ taskId: "missing-latency", latencyBudgetMs: 0 }), 1_000).status, "denied_policy");
+  assert.equal(broker.leases().length, 0);
+}));
 
 test("high-risk work is denied before lease when a requested budget dimension is not hard", () => withBroker((broker) => {
   const result = broker.reserve(fixtureContract({ operationClass: "external_write" }), 1_000);

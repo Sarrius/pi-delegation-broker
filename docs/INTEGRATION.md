@@ -10,8 +10,10 @@ A compatible launcher must enforce all of the following before a brokered child 
 4. Start the child with minimal inherited environment, isolated `PI_CODING_AGENT_DIR`, explicit extensions and model scope.
 5. Pass only `PI_BROKER_SOCKET`, lease metadata and `PI_BROKER_CAPABILITY` to the child.
 6. Invoke parent-only hooks after child-session handoff, before-handoff failure and session-process closure.
-7. Poll/observe controller-only pending readiness and launch only the exact task/lease returned by `dispatchPending`; a queued contract is not itself authority to spawn.
-8. Capture acceptance evidence through controller-owned tools and validate it against `ControllerEvidenceStore`; child-supplied `source: controller` text is not trusted without a matching ledger entry.
+7. Bind the selected contract's `promptDigest` to the launch request and include its `doneWhen`; mismatched frames are denied before lease reservation.
+8. Poll/observe controller-only pending readiness and launch only the exact task/lease returned by `dispatchPending`; atomically `claimReadyTask` before spawn and reconcile the terminal child result. A queued contract is not itself authority to spawn.
+9. Wire `BehavioralRunMonitor.authorizeAction` to Pi's blocking `tool_call` hook and `observeActionResult` to completed `tool_result`; a parent RPC event after execution is too late to block a mismatched effect.
+10. Capture acceptance evidence through controller-owned tools into an owner-only retained `ControllerEvidenceStore` and validate it; child-supplied `source: controller` text is not trusted without matching metadata and content.
 
 The [source-repository-only reference patch](https://github.com/Sarrius/pi-delegation-broker/blob/main/patches/pi-subagent-workflow-trusted-launcher-seam.patch) demonstrates such a seam against `pi-subagent-workflow` commit `0c28ce87bc45f4c3d66e0100b58ae13cf345978c`. It is an unaccepted local patch and is not part of the npm tarball. Applying it, accepting it upstream, or replacing it with an equivalent stable API remains a human release decision.
 
@@ -20,7 +22,7 @@ The [source-repository-only reference patch](https://github.com/Sarrius/pi-deleg
 ## Failure semantics
 
 - Before handoff: controller release cleans up the lease/agent directory. If controller IPC fails, the resolver retains an explicitly pending record for later reconciliation.
-- After handoff: child provider shutdown releases its lease; parent completion cleanup is idempotent.
+- After handoff: child provider shutdown releases its lease and moves a claimed queued task to `awaiting_result`; parent completion cleanup is idempotent and finalizes it. A lost parent result escalates at the task deadline.
 - Capacity unavailable: `submit` queues only when the contract names a recovery owner and future deadline. Release/expiry/cooldown transitions make timed work eligible; the supervisor scheduler moves admitted entries to `ready`, while the controller remains responsible for child launch.
 - Wait deadline reached: the task becomes `escalated`; it never remains an ownerless, unbounded `paused_capacity` row.
 - Provider transport missing: `BrokerIpcServer` returns `provider_transport_unavailable`; it never falls back to fake success.
