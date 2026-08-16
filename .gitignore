@@ -15,3 +15,4 @@ provider-failover*.json
 .npmrc
 .DS_Store
 *.tgz
+.diag/
