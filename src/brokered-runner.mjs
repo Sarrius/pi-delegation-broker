@@ -52,7 +52,7 @@ export class BrokeredChildRunner {
    * allow/deny before any process starts. Returns a handle whose `result`
    * promise resolves to the child's terminal result (not task acceptance).
    */
-  async spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel }) {
+  async spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt }) {
     if (this.#handles.has(childId)) throw new Error(`Duplicate child id: ${childId}`);
 
     const admission = new AbortController();
@@ -80,6 +80,7 @@ export class BrokeredChildRunner {
         model: `${model.provider}/${model.modelId}`,
         thinkingLevel: thinkingLevel ?? "off",
         cwd,
+        prompt,
         ...(tools ? { tools } : {}),
         ...(excludeTools ? { excludeTools } : {}),
         label: label ?? "brokered-child",
@@ -139,14 +140,25 @@ export class BrokeredChildRunner {
       await session.prompt(spec.prompt ?? "");
       const message = session.latestAssistantMessage;
       const usage = session.usage;
-      result = {
-        id: handle.id,
-        status: "completed",
-        text: assistantText(message),
-        usage,
-        resolved: handle.resolved,
-        ...(worktree ? await this.#collectWorktree(worktree) : {}),
-      };
+      if (message?.stopReason === "error") {
+        result = {
+          id: handle.id,
+          status: "failed",
+          text: assistantText(message),
+          error: message.errorMessage ?? "Child model request failed",
+          usage,
+          resolved: handle.resolved,
+        };
+      } else {
+        result = {
+          id: handle.id,
+          status: "completed",
+          text: assistantText(message),
+          usage,
+          resolved: handle.resolved,
+          ...(worktree ? await this.#collectWorktree(worktree) : {}),
+        };
+      }
     } catch (error) {
       result = {
         id: handle.id,
