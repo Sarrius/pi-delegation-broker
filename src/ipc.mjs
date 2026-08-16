@@ -230,6 +230,7 @@ export class BrokerIpcServer {
       endpointId: route.endpointId,
       adapterId: route.adapterId,
       credentialRefFingerprint: route.credentialRefFingerprint,
+      cacheRetention: route.cacheRetention,
       retryOwner: "broker",
       sdkMaxRetries: 0,
       deadlineAt: lease.expiresAt,

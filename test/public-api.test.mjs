@@ -3,8 +3,12 @@ import test from "node:test";
 import * as api from "../src/index.mjs";
 import * as testing from "../src/testing.mjs";
 
-test("public API excludes test fixtures and exposes fake transport only through the testing subpath", () => {
+test("public API excludes test fixtures while exposing only unconfigured transport primitives", () => {
   assert.deepEqual(Object.keys(api).sort(), [
+    "ANTHROPIC_API_VERSION",
+    "ANTHROPIC_MESSAGES_ADAPTER_ID",
+    "AnthropicMessagesTransport",
+    "AnthropicMessagesTransportError",
     "ArtifactPipeline",
     "AttemptSettlement",
     "BehavioralRunMonitor",
@@ -19,6 +23,7 @@ test("public API excludes test fixtures and exposes fake transport only through 
     "SingleHostBrokerSupervisor",
     "SqliteLeaseBroker",
     "TERMINAL_OUTCOMES",
+    "buildAnthropicMessagesRequest",
     "catalogToBrokerRegistry",
     "compileEffectiveChildCapability",
     "createAttemptRouteSnapshot",

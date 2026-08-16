@@ -15,7 +15,10 @@ for (const required of ["package.json", "README.md", "LICENSE", "SECURITY.md", "
   if (!names.includes(required)) throw new Error(`npm package is missing required file: ${required}`);
 }
 const unpackedSize = packed[0].unpackedSize;
-if (!Number.isSafeInteger(unpackedSize) || unpackedSize > 250 * 1024) throw new Error(`npm package is unexpectedly large: ${unpackedSize}`);
+// The raw provider transport is intentionally source-shipped and independently
+// auditable rather than hidden in a generated artifact. Keep a bounded package
+// budget while allowing one reviewed streaming adapter plus its protocol docs.
+if (!Number.isSafeInteger(unpackedSize) || unpackedSize > 300 * 1024) throw new Error(`npm package is unexpectedly large: ${unpackedSize}`);
 const packageJson = statSync(join(root, "package.json"));
 if ((packageJson.mode & 0o022) !== 0) throw new Error("package.json permissions must not grant group/other write access");
 console.log(`package check: pass (${names.length} files, ${unpackedSize} bytes unpacked)`);

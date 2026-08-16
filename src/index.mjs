@@ -20,6 +20,13 @@ export {
   outcomeProperties,
 } from "./provider-protocol.mjs";
 export { catalogToBrokerRegistry, fixtureCatalog } from "./provider-catalog.mjs";
+export {
+  ANTHROPIC_API_VERSION,
+  ANTHROPIC_MESSAGES_ADAPTER_ID,
+  AnthropicMessagesTransport,
+  AnthropicMessagesTransportError,
+  buildAnthropicMessagesRequest,
+} from "./anthropic-messages-transport.mjs";
 export { RoutingBoard } from "./routing-board.mjs";
 export { compileEffectiveChildCapability, createEffectiveChildCapability, deriveAllowedTools } from "./capability-compiler.mjs";
 export { ArtifactPipeline } from "./artifact-pipeline.mjs";

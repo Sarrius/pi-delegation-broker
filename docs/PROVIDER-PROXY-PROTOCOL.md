@@ -1,6 +1,6 @@
 # Controller-owned provider proxy protocol (design gate)
 
-Status: partially implemented. `src/provider-protocol.mjs` implements envelope validation, stream grammar, terminal CAS, phase machine, and outcome taxonomy as deterministic protocol primitives. `src/ipc.mjs` wires framed streaming through the `providerStream` IPC method: children send bounded typed context, the controller validates it through `captureLosslessJson`, creates an immutable `AttemptRouteSnapshot`, streams frames through `ProviderStreamAssembler`-validated grammar, and settles through `AttemptSettlement`. A real provider adapter, credential resolution, and live use remain unimplemented and prohibited.
+Status: partially implemented. `src/provider-protocol.mjs` implements envelope validation, stream grammar, terminal CAS, phase machine, and outcome taxonomy as deterministic protocol primitives. `src/ipc.mjs` wires framed streaming through the `providerStream` IPC method with the deterministic fake transport. `src/anthropic-messages-transport.mjs` adds a separately tested raw Anthropic Messages SSE transport: exact injected credential/endpoint resolvers, no environment/keychain fallback, one raw fetch dispatch, no retry loop, bounded strict SSE normalization, and explicit terminal mapping. It is not yet wired into the IPC controller, has no credential configuration, and has never made a live call; live use remains prohibited pending the full adversarial acceptance suite.
 
 ## Authority boundary
 
@@ -41,6 +41,7 @@ Before any provider I/O the controller creates and retains an `AttemptRouteSnaps
   "endpointId": "non-secret signed endpoint identity",
   "adapterId": "implementation id and build hash",
   "credentialRefFingerprint": "non-secret fingerprint",
+  "cacheRetention": "none | short | long; explicit controller route policy",
   "retryOwner": "broker",
   "sdkMaxRetries": 0,
   "deadlineAt": 0,
@@ -51,7 +52,7 @@ Before any provider I/O the controller creates and retains an `AttemptRouteSnaps
 }
 ```
 
-All route facts and the credential are resolved from one generation. Configuration reload affects only later attempts. A named credential miss fails before send; the adapter may not fall through to ambient environment, keychain, OAuth account, or provider-native discovery.
+All route facts and the credential are resolved from one generation. Configuration reload affects only later attempts. A named credential miss fails before send; the adapter may not fall through to ambient environment, keychain, OAuth account, or provider-native discovery. Cache retention is a route fact, not an ambient `PI_CACHE_RETENTION` setting: `none`, `short`, and `long` are frozen into the attempt snapshot so a concurrent setting change cannot alter its context-cost semantics.
 
 The attempt handle is one-shot. Once admitted into controller middleware it cannot be dispatched again. Recovery creates a new `attemptId`; it never reuses a capability whose send status became ambiguous.
 

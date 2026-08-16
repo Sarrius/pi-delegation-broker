@@ -91,6 +91,7 @@ export class ScriptedFakeProvider {
       endpointId: `fake-${lease.resourceId}`,
       adapterId: "fake-adapter@0",
       credentialRefFingerprint: FAKE_CRED_FP,
+      cacheRetention: "short",
       accountAlias: "fake-account",
       registryFingerprint: FAKE_REGISTRY_FP,
       registryVersion: 1,

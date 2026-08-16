@@ -34,6 +34,7 @@ function snapshotInput(overrides = {}) {
     endpointId: "endpoint-1",
     adapterId: "adapter-x@abc123",
     credentialRefFingerprint: ONE64,
+    cacheRetention: "short",
     retryOwner: "broker",
     sdkMaxRetries: 0,
     deadlineAt: 1_800_000_000_000,
@@ -101,6 +102,7 @@ test("route snapshot refuses competing retry ownership and hidden SDK retries", 
   assert.throws(() => createAttemptRouteSnapshot(snapshotInput({ retryOwner: "sdk" })), /retryOwner must be broker/);
   assert.throws(() => createAttemptRouteSnapshot(snapshotInput({ sdkMaxRetries: 2 })), /sdkMaxRetries must be pinned to 0/);
   assert.throws(() => createAttemptRouteSnapshot(snapshotInput({ registryFingerprint: "not-a-digest" })), /registryFingerprint/);
+  assert.throws(() => createAttemptRouteSnapshot(snapshotInput({ cacheRetention: "ambient" })), /cacheRetention/);
   assert.throws(() => createAttemptRouteSnapshot(snapshotInput({ maxOutputTokens: 0 })), /maxOutputTokens/);
   assert.throws(() => createAttemptRouteSnapshot(snapshotInput({ surprise: true })), /unknown snapshot field/);
   assert.throws(() => createAttemptRouteSnapshot(snapshotInput({ reasoningEffort: undefined })), /reasoningEffort/);

@@ -27,6 +27,7 @@ function snapshotInput(overrides = {}) {
     endpointId: "endpoint-1",
     adapterId: "adapter-1@abc",
     credentialRefFingerprint: ONE64,
+    cacheRetention: "short",
     retryOwner: "broker",
     sdkMaxRetries: 0,
     deadlineAt: 1_800_000_000_000,
