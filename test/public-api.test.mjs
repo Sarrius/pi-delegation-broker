@@ -15,6 +15,7 @@ test("public API excludes test fixtures and exposes fake transport only through 
     "PROVIDER_PROTOCOL_VERSION",
     "ProviderProtocolError",
     "ProviderStreamAssembler",
+    "RoutingBoard",
     "SingleHostBrokerSupervisor",
     "SqliteLeaseBroker",
     "TERMINAL_OUTCOMES",

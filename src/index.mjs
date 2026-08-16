@@ -20,6 +20,7 @@ export {
   outcomeProperties,
 } from "./provider-protocol.mjs";
 export { catalogToBrokerRegistry, fixtureCatalog } from "./provider-catalog.mjs";
+export { RoutingBoard } from "./routing-board.mjs";
 export { compileEffectiveChildCapability, createEffectiveChildCapability, deriveAllowedTools } from "./capability-compiler.mjs";
 export { ArtifactPipeline } from "./artifact-pipeline.mjs";
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";
