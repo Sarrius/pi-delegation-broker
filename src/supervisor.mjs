@@ -83,6 +83,7 @@ export class SingleHostBrokerSupervisor {
   #routeResolver;
   #verificationReceiptVerifier;
   #resourceRanker;
+  #behavioralEnforcement;
   #dynamicProviders;
   #providerWatcher;
   #sweepIntervalMs;
@@ -109,6 +110,7 @@ export class SingleHostBrokerSupervisor {
     routeResolver,
     verificationReceiptVerifier,
     resourceRanker,
+    behavioralEnforcement = "unavailable",
     sweepIntervalMs = 1_000,
     shutdownDrainMs = 2_000,
     dynamicProviders = false,
@@ -161,6 +163,9 @@ export class SingleHostBrokerSupervisor {
     this.#routeResolver = routeResolver;
     this.#verificationReceiptVerifier = verificationReceiptVerifier;
     this.#resourceRanker = resourceRanker;
+    // Effect-capable contracts are refused unless a blocking monitor is actually wired, so this
+    // stays an explicit claim by the host rather than something the supervisor assumes.
+    this.#behavioralEnforcement = behavioralEnforcement;
     this.#sweepIntervalMs = sweepIntervalMs;
     this.#shutdownDrainMs = shutdownDrainMs;
     this.#dynamicProviders = dynamicProviders;
@@ -219,6 +224,7 @@ export class SingleHostBrokerSupervisor {
         registry: this.#registry,
         ...(this.#verificationReceiptVerifier === undefined ? {} : { verificationReceiptVerifier: this.#verificationReceiptVerifier }),
         ...(this.#resourceRanker === undefined ? {} : { resourceRanker: this.#resourceRanker }),
+        behavioralEnforcement: this.#behavioralEnforcement,
       });
       hardenFile(this.databasePath);
       this.#server = new BrokerIpcServer({

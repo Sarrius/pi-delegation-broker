@@ -22,7 +22,7 @@
  */
 
 import { preferenceMatches, taskModelTier } from "./model-preferences.mjs";
-import { meetsQualityFloor } from "./model-quality-catalog.mjs";
+import { meetsQualityFloor, qualityForModel, QUALITY_TIERS } from "./model-quality-catalog.mjs";
 
 const CONFIDENCE_RANK = Object.freeze({ measured: 0, observed: 1, assumed: 2 });
 const OPERATION_CLASSES = Object.freeze(new Set(["observe", "propose_patch", "apply", "external_write"]));
@@ -36,7 +36,8 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_REASON = /^[A-Za-z0-9 _.-]{1,120}$/;
 
 const DEFAULT_LATENCY_BUDGET_MS = 120_000;
-const DEFAULT_BUDGET = Object.freeze({ maxInputTokens: 200_000, maxOutputTokens: 16_000, maxCostMicros: 2_000_000 });
+// No money dimension: the broker cannot observe spend, so it budgets what it can enforce.
+const DEFAULT_BUDGET = Object.freeze({ maxInputTokens: 200_000, maxOutputTokens: 16_000 });
 
 /**
  * Keyword evidence for each capability beyond plain text generation. Matching is intentionally
@@ -134,9 +135,18 @@ function usable(resourceId, live, { now, requiresHardBudget, resourceConfidence,
   return true;
 }
 
-function costOf(resource) {
-  const hint = resource?.catalog?.costHint;
-  return Number.isFinite(hint) ? hint : Number.POSITIVE_INFINITY;
+/**
+ * Cold-start ordering without a price table. A published price is not something this broker can
+ * verify it ever paid, so it is not a criterion here; the closest sufficient quality class is.
+ * Spending a frontier model on cheap-tier work is the inefficiency that actually shows up in the
+ * measure the controller does own — tokens, latency and attempts — and once verified receipts
+ * exist the learned ranker overrides this ordering anyway.
+ */
+function qualityFit(resource, id, modelTier) {
+  const identity = resource?.model ?? parseResourceModel(id);
+  const quality = identity && qualityForModel(identity);
+  if (quality === undefined) return Number.POSITIVE_INFINITY;
+  return Math.abs(QUALITY_TIERS[quality] - (QUALITY_TIERS[modelTier] ?? QUALITY_TIERS.standard));
 }
 
 /**
@@ -158,7 +168,7 @@ function currencyIndex(currency) {
   return index;
 }
 
-function rankResources(entries, learnedRanker, capabilities) {
+function rankResources(entries, learnedRanker, capabilities, modelTier) {
   const baseline = [...entries].sort((left, right) => {
     const confidence = (CONFIDENCE_RANK[left.resource.confidence] ?? 3) - (CONFIDENCE_RANK[right.resource.confidence] ?? 3);
     if (confidence !== 0) return confidence;
@@ -166,8 +176,8 @@ function rankResources(entries, learnedRanker, capabilities) {
     // routing all entries are current already, so this is a no-op.
     const generation = (left.generation ?? 0) - (right.generation ?? 0);
     if (generation !== 0) return generation;
-    const cost = costOf(left.resource) - costOf(right.resource);
-    if (cost !== 0) return cost;
+    const fit = qualityFit(left.resource, left.id, modelTier) - qualityFit(right.resource, right.id, modelTier);
+    if (fit !== 0) return fit;
     return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
   });
   if (typeof learnedRanker !== "function") return baseline;
@@ -198,9 +208,15 @@ function candidateProfiles(registry, required) {
 
 function buildBudget(constraints, effectCapable) {
   const budget = { ...DEFAULT_BUDGET, ...(constraints.budget ?? {}) };
-  const enforcement = constraints.budget?.enforcement ?? (effectCapable
-    ? { input: "hard", output: "hard", cost: "hard" }
-    : { input: "hard", output: "hard", cost: "metered_best_effort" });
+  // Token consumption is enforceable: the controller caps input and clamps the child's output
+  // request. Money is not — no provider exposes a synchronous spend ledger, and subscription
+  // accounts have no per-request price at all. Demanding hard cost for every effect-capable task
+  // asked resources for a guarantee none can honestly declare, which left the effect path
+  // unroutable on the real fleet. What actually protects an effect is the blocking behavioral
+  // monitor, pinned extension attestation, and controller verification of the result — all
+  // enforced elsewhere. A caller who genuinely needs a hard money cap still asks for one, and
+  // then only resources that truly declare hard cost enforcement match.
+  const enforcement = constraints.budget?.enforcement ?? { input: "hard", output: "hard", cost: "metered_best_effort" };
   return Object.freeze({
     ...(Number.isSafeInteger(budget.maxInputTokens) ? { maxInputTokens: budget.maxInputTokens } : {}),
     ...(Number.isSafeInteger(budget.maxOutputTokens) ? { maxOutputTokens: budget.maxOutputTokens } : {}),
@@ -275,7 +291,7 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         // A class spanning several accounts can absorb one dying; a class living in one account
         // cannot. Surfacing it lets a caller prefer breadth when throughput matters.
         capacityGroups: Object.freeze([...new Set(entries.map((entry) => entry.resource.capacityGroup))]),
-        resources: Object.freeze(rankResources(entries, userOnly ? undefined : learnedRanker, requirement.capabilities).map((entry) => Object.freeze({
+        resources: Object.freeze(rankResources(entries, userOnly ? undefined : learnedRanker, requirement.capabilities, modelTier).map((entry) => Object.freeze({
           resourceId: entry.id,
           capacityGroup: entry.resource.capacityGroup,
           confidence: entry.resource.confidence,

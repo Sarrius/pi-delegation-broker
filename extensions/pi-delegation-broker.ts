@@ -51,6 +51,7 @@ import {
   writeModelPreferences,
   signedRegistryMessage,
   requestBrokerIpc,
+  verifyProposedPatch,
   writeScopedChildAuth,
   // @ts-expect-error — resolved relative to this file's real location
 } from "../src/index.mjs";
@@ -99,6 +100,9 @@ const DELEGATE_PARAMS = Type.Object({
     argv: Type.Array(Type.String({ description: "One literal argv token; no shell syntax." }), { minItems: 1, maxItems: 32 }),
     timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 120000 })),
   }), { minItems: 1, maxItems: 20, description: "Fixed controller-owned checks. Omit when no independent acceptance check exists; such work cannot train routing affinity." })),
+  proposeChangesIn: Type.Optional(Type.String({
+    description: "Absolute path to a git repository the child may edit. The child works in a throwaway worktree; the controller verifies the resulting patch in a scratch tree and returns it for review. Requires acceptance checks. Nothing is applied to this repository.",
+  })),
 });
 
 interface BrokerRuntime {
@@ -196,6 +200,9 @@ async function startBroker(): Promise<BrokerRuntime> {
 
   const supervisor = new SingleHostBrokerSupervisor({
     stateDir: STATE_DIR,
+    // Every child is launched with the attested behavioral enforcement extension, which is what
+    // makes effect-capable contracts admissible at all.
+    behavioralEnforcement: "blocking_monitor",
     signedRegistry,
     trustedRegistryKeys: { [REGISTRY_KEY_ID]: keys.publicKey },
     dynamicProviders: true,
@@ -380,11 +387,20 @@ export default function piDelegationBroker(pi: any) {
     promptSnippet: "Delegate a self-contained subtask to an isolated brokered child agent",
     promptGuidelines: [
       "Use delegate when a subtask is self-contained: reading or summarizing files, answering a focused question, drafting text that does not need this conversation's context.",
-      "Do not use delegate for work that needs this conversation's history, your judgement about the user's intent, or edits to the user's project — children are observe-class and cannot apply changes.",
+      "Do not use delegate for work that needs this conversation's history or your judgement about the user's intent.",
+      "To get a code change, pass proposeChangesIn with the repository path and acceptance checks: the child edits an isolated worktree and the controller returns a verified patch that you or the user still have to apply.",
       "Write the delegate task as a complete brief: the child sees nothing of this conversation, so include file paths, context, and exactly what output you expect.",
     ],
     parameters: DELEGATE_PARAMS,
-    async execute(_toolCallId: string, params: { task: string; capabilities?: string[]; tier?: "cheap" | "standard" | "frontier"; acceptance?: Array<{ id: string; claim: string; argv: string[]; timeoutMs?: number }> }, _signal: AbortSignal, onUpdate: any, ctx: any) {
+    async execute(_toolCallId: string, params: { task: string; capabilities?: string[]; tier?: "cheap" | "standard" | "frontier"; acceptance?: Array<{ id: string; claim: string; argv: string[]; timeoutMs?: number }>; proposeChangesIn?: string }, _signal: AbortSignal, onUpdate: any, ctx: any) {
+      // An effect nobody can check is not delegable: without controller-owned checks the only
+      // evidence a patch is good would be the child's own word for it.
+      if (params.proposeChangesIn && !params.acceptance?.length) {
+        return {
+          content: [{ type: "text", text: "proposeChangesIn requires at least one acceptance check: the controller must be able to verify the proposed patch itself." }],
+          isError: true,
+        };
+      }
       if (!enabled) {
         return { content: [{ type: "text", text: "Delegation broker is stopped. Run /delegation-broker start to allow new children." }], isError: true };
       }
@@ -408,11 +424,13 @@ export default function piDelegationBroker(pi: any) {
         result = await broker.runner.run({
           childId,
           promptDigest,
-          cwd: ctx.cwd,
+          cwd: params.proposeChangesIn ?? ctx.cwd,
+          ...(params.proposeChangesIn ? { isolation: "worktree" as const } : {}),
           thinkingLevel: "off",
           prompt: params.task,
           capabilityRequest: {
             taskDescription: params.task,
+            ...(params.proposeChangesIn ? { operationClass: "propose_patch" } : {}),
             ...(params.capabilities?.length ? { requiredCapabilities: params.capabilities } : {}),
             ...(params.tier ? { modelTier: params.tier } : {}),
           },
@@ -423,6 +441,33 @@ export default function piDelegationBroker(pi: any) {
       const route = (result.route ?? [])
         .map((hop: any) => `${hop.outcome}${hop.resourceId ? ` ${hop.resourceId}` : ""}`)
         .join(" → ");
+
+      if (result.status === "completed" && params.proposeChangesIn) {
+        onUpdate?.({ content: [{ type: "text", text: "Verifying the proposed patch in a controller-owned scratch tree…" }] });
+        const receipt = await verifyProposedPatch({
+          repoCwd: params.proposeChangesIn,
+          baseCommit: result.baseCommit,
+          patch: result.patch,
+          changed: result.changed,
+          checks: params.acceptance!.map((check) => ({ id: check.id, claim: check.claim, argv: check.argv, timeoutMs: check.timeoutMs ?? 30_000 })),
+        });
+        const summary = receipt.checks.map((entry: any) => `${entry.ok ? "pass" : `fail(${entry.exitCode})`} ${entry.id}`).join(", ");
+        if (!receipt.verified) {
+          return {
+            content: [{ type: "text", text: `Proposed change rejected by controller verification (${receipt.reason}).${summary ? `\nChecks: ${summary}` : ""}\nRoute: ${route}` }],
+            isError: true,
+            details: { route, receipt },
+          };
+        }
+        return {
+          content: [{
+            type: "text",
+            text: `Controller-verified patch against ${receipt.baseCommit.slice(0, 12)} — NOT applied to ${params.proposeChangesIn}.\n`
+              + `Files: ${receipt.changed.join(", ")}\nChecks: ${summary}\nRoute: ${route}\n\n${result.patch}`,
+          }],
+          details: { route, receipt, patch: result.patch, applied: false },
+        };
+      }
 
       if (result.status === "completed") {
         const usage = result.usage ? ` (${result.usage.input} in / ${result.usage.output} out)` : "";

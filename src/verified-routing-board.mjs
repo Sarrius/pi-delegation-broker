@@ -49,12 +49,13 @@ export class ControllerVerifiedRoutingBoard {
   }
 
   /** Record the terminal outcome only after broker finalization has succeeded. */
-  recordFinalized({ taskId, leaseId, fencingToken, verification, outcome, resourceId, capabilities, latencyMs, costMicros } = {}) {
+  recordFinalized({ taskId, leaseId, fencingToken, verification, outcome, resourceId, capabilities, latencyMs, tokens, attempts } = {}) {
     if (typeof taskId !== "string" || !ID.test(taskId) || typeof leaseId !== "string" || !ID.test(leaseId)
       || !Number.isSafeInteger(fencingToken) || fencingToken < 1
       || typeof resourceId !== "string" || !ID.test(resourceId)
       || !Number.isSafeInteger(latencyMs) || latencyMs < 0
-      || (costMicros !== undefined && (!Number.isSafeInteger(costMicros) || costMicros < 0))) {
+      || (tokens !== undefined && (!Number.isSafeInteger(tokens) || tokens < 0))
+      || (attempts !== undefined && (!Number.isSafeInteger(attempts) || attempts < 1))) {
       throw new Error("verified routing observation is invalid");
     }
     const requiredCapabilities = normalizedCapabilities(capabilities);
@@ -70,7 +71,8 @@ export class ControllerVerifiedRoutingBoard {
       outcome: verification.status === "accepted" ? "accepted" : "rejected",
       evidenceKind: EVIDENCE_KIND,
       latencyMs,
-      ...(costMicros === undefined ? {} : { costMicros }),
+      ...(tokens === undefined ? {} : { tokens }),
+      ...(attempts === undefined ? {} : { attempts }),
       timestamp,
     });
     for (const capability of requiredCapabilities) this.#board.record({ ...record, capability });
@@ -81,7 +83,8 @@ export class ControllerVerifiedRoutingBoard {
       capabilities: requiredCapabilities,
       outcome: record.outcome,
       latencyMs,
-      ...(costMicros === undefined ? {} : { costMicros }),
+      ...(tokens === undefined ? {} : { tokens }),
+      ...(attempts === undefined ? {} : { attempts }),
       timestamp,
     });
     return Object.freeze({ resourceId, capabilities: requiredCapabilities, outcome: record.outcome, evidenceKind: EVIDENCE_KIND, timestamp });

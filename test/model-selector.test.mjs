@@ -58,7 +58,7 @@ test("a whole-repository task additionally asks for a large context", () => {
   assert.ok(requirement.capabilities.includes("large_context"));
 });
 
-test("an effect-capable task never lands on the weakest class and gets hard budgets", () => {
+test("an effect-capable task never lands on the weakest class and is budgeted in what the controller can enforce", () => {
   const registry = registryOf([account("solo")]);
   const selected = selectModelForTask({
     taskDescription: "apply the patch to the repository",
@@ -67,8 +67,24 @@ test("an effect-capable task never lands on the weakest class and gets hard budg
   });
   assert.equal(selected.action, "allow");
   assert.ok(selected.contract.capability.required.includes("code_reasoning"), "effect work reasons about what it changes");
-  assert.deepEqual(selected.contract.budget.enforcement, { input: "hard", output: "hard", cost: "hard" });
-  assert.ok(selected.contract.budget.maxCostMicros > 0);
+  // Consumption is hard because the controller can actually enforce it. There is no money
+  // dimension at all: the broker never observes spend, so it does not pretend to bound it.
+  assert.deepEqual(selected.contract.budget.enforcement, { input: "hard", output: "hard", cost: "metered_best_effort" });
+  assert.equal(selected.contract.budget.maxCostMicros, undefined);
+});
+
+test("a caller that genuinely needs a hard money cap still gets one", () => {
+  const registry = registryOf([account("solo")]);
+  const selected = selectModelForTask({
+    taskDescription: "apply the patch to the repository",
+    registry,
+    constraints: baseConstraints({
+      operationClass: "apply",
+      budget: { maxInputTokens: 1_000, maxOutputTokens: 100, maxCostMicros: 5_000, enforcement: { input: "hard", output: "hard", cost: "hard" } },
+    }),
+  });
+  assert.equal(selected.action, "allow");
+  assert.equal(selected.contract.budget.enforcement.cost, "hard");
 });
 
 test("explicit controller capabilities override anything derived from the description", () => {

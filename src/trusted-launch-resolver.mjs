@@ -7,6 +7,12 @@ import { createLauncherAttestation } from "./launcher-attestation.mjs";
 
 const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
 
+/** Total tokens a route consumed, or undefined when the transport reported no usage. */
+function tokensOf(usage) {
+  const total = (Number.isSafeInteger(usage?.input) ? usage.input : 0) + (Number.isSafeInteger(usage?.output) ? usage.output : 0);
+  return total > 0 ? total : undefined;
+}
+
 function ownerOnlyDirectory(path, label) {
   if (typeof path !== "string" || !isAbsolute(path)) throw new Error(`${label} must be an absolute path`);
   mkdirSync(path, { recursive: true, mode: 0o700 });
@@ -306,7 +312,7 @@ export class BrokeredLaunchResolver {
    * Child teardown releases capacity but cannot complete the queued task. The
    * durable task waits for a separate controller verifier receipt.
    */
-  async finalizeHandedChild(childId, _result) {
+  async finalizeHandedChild(childId, result) {
     // Do not let the caller's child result influence terminal acceptance.
     const admission = this.#admissions.get(childId);
     const released = await this.#releaseAdmission(childId, "closed_release_pending");
@@ -319,6 +325,9 @@ export class BrokeredLaunchResolver {
         resourceId: admission.routingObservation.resourceId,
         capabilities: admission.routingObservation.capabilities,
         latencyMs: Math.max(0, Date.now() - admission.routingObservation.issuedAt),
+        // What this route consumed to reach a verifiable result. Absent when the transport
+        // reported no usage; the journal then records reliability without an efficiency sample.
+        ...(tokensOf(result?.usage) === undefined ? {} : { tokens: tokensOf(result.usage) }),
       }),
     });
     return Object.freeze({ ...released, verification });

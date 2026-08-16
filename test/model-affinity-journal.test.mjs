@@ -42,3 +42,42 @@ test("a verified routing bridge writes an affinity only after receipt/outcome va
     assert.equal(Object.keys(setup.journal.snapshot().observations).length, 1);
   } finally { rmSync(setup.root, { recursive: true, force: true }); }
 });
+test("between equally reliable routes the more efficient one is preferred", () => {
+  const setup = journal();
+  try {
+    const frugal = "zai/glm-5.3";
+    const wasteful = "openrouter/deepseek/deepseek-v4-pro";
+    for (let i = 0; i < 4; i++) {
+      setup.journal.recordVerified({ resourceId: frugal, capabilities: CAPS, outcome: "accepted", latencyMs: 1_000, tokens: 2_000, attempts: 1 });
+      setup.journal.recordVerified({ resourceId: wasteful, capabilities: CAPS, outcome: "accepted", latencyMs: 9_000, tokens: 40_000, attempts: 2 });
+    }
+    // Identical acceptance records, so only observed consumption can separate them.
+    assert.deepEqual(setup.journal.rank({ resourceIds: [wasteful, frugal], capabilities: CAPS }), [frugal, wasteful]);
+  } finally { rmSync(setup.root, { recursive: true, force: true }); }
+});
+
+test("efficiency never outranks reliability: a frugal route that fails verification loses", () => {
+  const setup = journal();
+  try {
+    const frugalButWrong = "openrouter/google/gemini-3.7-flash";
+    const heavyButRight = "anthropic/claude-opus-5";
+    for (let i = 0; i < 4; i++) {
+      setup.journal.recordVerified({ resourceId: frugalButWrong, capabilities: CAPS, outcome: "rejected", latencyMs: 200, tokens: 500, attempts: 1 });
+      setup.journal.recordVerified({ resourceId: heavyButRight, capabilities: CAPS, outcome: "accepted", latencyMs: 8_000, tokens: 60_000, attempts: 1 });
+    }
+    assert.deepEqual(setup.journal.rank({ resourceIds: [frugalButWrong, heavyButRight], capabilities: CAPS }), [heavyButRight, frugalButWrong]);
+  } finally { rmSync(setup.root, { recursive: true, force: true }); }
+});
+
+test("a route with no consumption sample is still ranked on reliability alone", () => {
+  const setup = journal();
+  try {
+    const measured = "zai/glm-5.3";
+    for (let i = 0; i < 3; i++) {
+      setup.journal.recordVerified({ resourceId: measured, capabilities: CAPS, outcome: "accepted", latencyMs: 500 });
+    }
+    const record = setup.journal.snapshot().observations[`${[...CAPS].sort().join("+")}\u0000${measured}`];
+    assert.equal(record.tokenTotal, 0, "an absent usage report must not be invented");
+    assert.deepEqual(setup.journal.rank({ resourceIds: ["ollama/kimi-k3", measured], capabilities: CAPS }), [measured, "ollama/kimi-k3"]);
+  } finally { rmSync(setup.root, { recursive: true, force: true }); }
+});

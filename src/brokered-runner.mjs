@@ -329,7 +329,13 @@ export class BrokeredChildRunner {
     } finally {
       handle.release();
       await session.dispose().catch(() => undefined);
-      await policy.onChildSessionClosed?.({ status: result.status, ...(result.error ? { error: result.error } : {}) });
+      // Consumption is the measure the controller can actually observe, so it travels with the
+      // close event: the verifier turns it into a routing observation once a receipt exists.
+      await policy.onChildSessionClosed?.({
+        status: result.status,
+        ...(result.error ? { error: result.error } : {}),
+        ...(result.usage ? { usage: result.usage } : {}),
+      });
       if (worktree) {
         try { await cleanupWorktree(worktree.sourceCwd, worktree.tree.path); }
         catch { /* worktree retained; child work still on disk */ }
@@ -342,7 +348,9 @@ export class BrokeredChildRunner {
   async #collectWorktree(worktree) {
     try {
       const changes = await collectWorktree(worktree.tree);
-      return { patch: changes.patch, changed: changes.changed };
+      // The base commit travels with the patch: without it a verifier cannot rebuild the exact
+      // tree the child started from, and "it applies to HEAD" is a different claim entirely.
+      return { patch: changes.patch, changed: changes.changed, baseCommit: worktree.tree.baseCommit };
     } catch (error) {
       if (error instanceof WorktreeCollectionError) {
         return { patch: "", changed: [], error: `Worktree retained at ${error.worktreePath}` };
