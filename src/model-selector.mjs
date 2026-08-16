@@ -21,6 +21,8 @@
  * child.
  */
 
+import { preferenceMatches, taskModelTier } from "./model-preferences.mjs";
+
 const CONFIDENCE_RANK = Object.freeze({ measured: 0, observed: 1, assumed: 2 });
 const OPERATION_CLASSES = Object.freeze(new Set(["observe", "propose_patch", "apply", "external_write"]));
 const ADMISSION_CLASSES = Object.freeze(new Set(["control", "verify", "work"]));
@@ -210,7 +212,7 @@ function requiresHardBudget(budget) {
  * `{action:"deny", reason}`. `alternatives` lists the remaining ranked classes so a caller that
  * hits `denied_capacity` can retry one tier up without re-deriving the requirement.
  */
-export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, currency, now } = {}) {
+export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, currency, preferences, now } = {}) {
   if (!registry?.profiles || !registry?.resources) throw new Error("selectModelForTask requires a broker registry");
   if (constraints !== undefined && (typeof constraints !== "object" || constraints === null || Array.isArray(constraints))) {
     throw new Error("selectModelForTask constraints must be an object");
@@ -228,9 +230,11 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
 
   const profiles = candidateProfiles(registry, requirement.capabilities);
   if (profiles.length === 0) return deny("no approved profile supports the required capabilities");
+  const modelTier = taskModelTier(requirement, constraints.modelTier);
+  const preferenceEntries = preferences?.tiers?.[modelTier] ?? [];
 
   let sawLegacy = false;
-  const buildTiers = (includeLegacy) => {
+  const buildTiers = (includeLegacy, userOnly = false) => {
     const tiers = [];
     for (const profile of profiles) {
       const entries = [];
@@ -238,6 +242,8 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         if (resource?.profile !== profile.id) continue;
         if (excluded.has(id)) continue;
         if (allowedProviders && !allowedProviders.has(resource.model?.provider ?? id)) continue;
+        const identity = resource.model ?? parseResourceModel(id);
+        if (userOnly && (!identity || !preferenceMatches(preferenceEntries, identity))) continue;
         const fact = currencyLookup.get(id);
         if (fact?.legacy === true) {
           if (!includeLegacy) { sawLegacy = true; continue; }
@@ -272,11 +278,20 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
 
   // First pass: current generations only. Legacy models (glm-4.x beside glm-5.3, gpt-4 beside
   // gpt-5.6, davinci beside anything) do not exist as far as this pass is concerned.
-  let tiers = buildTiers(false);
+  // Explicit user policy wins whenever it has a current, live route. Empty standard/cheap
+  // lists deliberately mean "let the controller decide". If every chosen route is unavailable,
+  // fall back to automatic selection rather than stranding work on a user preference.
+  let preferenceSource = preferenceEntries.length > 0 ? "user" : "auto";
+  let tiers = buildTiers(false, preferenceEntries.length > 0);
+  if (tiers.length === 0 && preferenceEntries.length > 0) {
+    preferenceSource = "auto_user_tier_unavailable";
+    tiers = buildTiers(false);
+  }
   let legacyFallback = false;
   if (tiers.length === 0 && sawLegacy) {
     // Last resort, and visible: the whole current fleet is unusable, so history gets one
     // chance — marked, so the route trail shows the harness ran on a stale model knowingly.
+    preferenceSource = "legacy_emergency";
     tiers = buildTiers(true);
     legacyFallback = tiers.length > 0;
   }
@@ -310,6 +325,8 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
       escalated: chosen.supports.length > requirement.capabilities.length,
       candidateCount: chosen.resources.length,
       capacityGroupCount: chosen.capacityGroups.length,
+      modelTier,
+      preferenceSource,
       ...(legacyFallback ? { legacyFallback: true } : {}),
     }),
     alternatives: Object.freeze(tiers.slice(1)),
@@ -394,11 +411,12 @@ function defaultDoneWhen(operationClass) {
  * The callback reads only `request.capabilityRequest`, never a prompt: the resolver contract is
  * that a launch request carries no raw task text.
  */
-export function createSelectContract({ registry, availability, currency, constraints = {}, now = () => Date.now() } = {}) {
+export function createSelectContract({ registry, availability, currency, preferences, constraints = {}, now = () => Date.now() } = {}) {
   if (registry === undefined) throw new Error("createSelectContract requires a registry or a registry provider");
   const readRegistry = typeof registry === "function" ? registry : () => registry;
   const readAvailability = typeof availability === "function" ? availability : () => availability;
   const readCurrency = typeof currency === "function" ? currency : () => currency;
+  const readPreferences = typeof preferences === "function" ? preferences : () => preferences;
 
   return (request) => {
     const capabilityRequest = request?.capabilityRequest ?? {};
@@ -413,6 +431,7 @@ export function createSelectContract({ registry, availability, currency, constra
       registry: readRegistry(),
       availability: readAvailability(),
       currency: readCurrency(),
+      preferences: readPreferences(),
       constraints: merged,
       now: now(),
     });

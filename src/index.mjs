@@ -49,6 +49,14 @@ export { RoutingBoard } from "./routing-board.mjs";
 export { ControllerVerifiedRoutingBoard } from "./verified-routing-board.mjs";
 export { captureProviderContext } from "./provider-context.mjs";
 export {
+  DEFAULT_MODEL_PREFERENCES,
+  loadModelPreferences,
+  normalizeModelPreferences,
+  preferenceMatches,
+  taskModelTier,
+  writeModelPreferences,
+} from "./model-preferences.mjs";
+export {
   FAMILY_STALENESS_MS,
   LEGACY_GENERATION,
   assignGenerations,

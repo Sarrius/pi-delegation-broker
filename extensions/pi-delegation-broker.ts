@@ -21,7 +21,7 @@
  */
 
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,9 +33,12 @@ import {
   SingleHostBrokerSupervisor,
   buildCurrencyMap,
   createSelectContract,
+  DEFAULT_MODEL_PREFERENCES,
+  loadModelPreferences,
   parseResourceModel,
   probeProviderModels,
   readProviderRegistry,
+  writeModelPreferences,
   signedRegistryMessage,
   writeScopedChildAuth,
   // @ts-expect-error — resolved relative to this file's real location
@@ -49,6 +52,8 @@ const CHILD_SHIM_PATH = join(EXTENSIONS_DIR, "child-shim.ts");
 const PARENT_AGENT_DIR = join(homedir(), ".pi", "agent");
 const STATE_DIR = join(PARENT_AGENT_DIR, "delegation-broker");
 const KEYS_PATH = join(STATE_DIR, "registry-keys.json");
+const PREFERENCES_PATH = join(STATE_DIR, "preferences.json");
+const ENABLED_PATH = join(STATE_DIR, "enabled.json");
 const REGISTRY_KEY_ID = "controller";
 const CURRENCY_REFRESH_MS = 15 * 60 * 1_000;
 
@@ -60,6 +65,9 @@ const DELEGATE_PARAMS = Type.Object({
   }),
   capabilities: Type.Optional(Type.Array(StringEnum([...CAPABILITIES]), {
     description: "Capability requirements if known (e.g. large_context for whole-repo analysis, vision_input for images). Omit to let the selector infer from the task text.",
+  })),
+  tier: Type.Optional(StringEnum(["cheap", "standard", "frontier"] as const, {
+    description: "Optional user task level. Omit for controller inference; frontier respects ~/.pi/agent/delegation-broker/preferences.json.",
   })),
 });
 
@@ -89,6 +97,12 @@ function readJson(path: string): Record<string, any> {
     const value = JSON.parse(readFileSync(path, "utf8"));
     return value && typeof value === "object" && !Array.isArray(value) ? value : {};
   } catch { return {}; }
+}
+
+function readEnabled() { return readJson(ENABLED_PATH).enabled !== false; }
+function writeEnabled(enabled: boolean) {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(ENABLED_PATH, `${JSON.stringify({ enabled })}\n`, { mode: 0o600 });
 }
 
 function registryModels(registry: any): Array<{ provider: string; modelId: string }> {
@@ -122,6 +136,7 @@ function probeRoutes(registry: any) {
 }
 
 async function startBroker(): Promise<BrokerRuntime> {
+  if (!existsSync(PREFERENCES_PATH)) writeModelPreferences(PREFERENCES_PATH, DEFAULT_MODEL_PREFERENCES);
   const keys = loadOrCreateRegistryKeys();
   const registry = readProviderRegistry(PARENT_AGENT_DIR);
   const now = Date.now();
@@ -177,6 +192,7 @@ async function startBroker(): Promise<BrokerRuntime> {
       registry: () => supervisor.providerWatcher.currentRegistry(),
       availability: () => supervisor.inventory(),
       currency,
+      preferences: () => loadModelPreferences(PREFERENCES_PATH),
     }),
     resolveModelForResource: parseResourceModel,
     provisionChildAuth: ({ agentDir, model }: { agentDir: string; model?: { provider: string; modelId: string } }) => {
@@ -200,6 +216,7 @@ async function startBroker(): Promise<BrokerRuntime> {
 export default function piDelegationBroker(pi: any) {
   let runtime: BrokerRuntime | undefined;
   let starting: Promise<BrokerRuntime> | undefined;
+  let enabled = readEnabled();
   let counter = 0;
 
   const ensureBroker = (): Promise<BrokerRuntime> => {
@@ -224,6 +241,33 @@ export default function piDelegationBroker(pi: any) {
     await current.supervisor.stop().catch(() => undefined);
   });
 
+  pi.registerCommand("delegation-broker", {
+    description: "Control the delegation broker: /delegation-broker start|stop|status",
+    handler: async (args: string, ctx: any) => {
+      const action = args.trim().toLowerCase();
+      if (action === "start") {
+        enabled = true;
+        writeEnabled(true);
+        await ensureBroker().catch(() => undefined);
+        ctx.ui.notify("Delegation broker enabled", "info");
+        return;
+      }
+      if (action === "stop") {
+        enabled = false;
+        writeEnabled(false);
+        ctx.ui.notify("Delegation broker stopped: no new children will launch; running children may finish", "info");
+        return;
+      }
+      if (action === "status") {
+        const preferences = loadModelPreferences(PREFERENCES_PATH);
+        const state = runtime ? runtime.supervisor.status().state : "not_started";
+        ctx.ui.notify(`Delegation broker: ${enabled ? "enabled" : "stopped"}; runtime: ${state}; frontier preferences: ${preferences.tiers.frontier.length}; standard: ${preferences.tiers.standard.length}; cheap: ${preferences.tiers.cheap.length}`, "info");
+        return;
+      }
+      ctx.ui.notify("Usage: /delegation-broker start|stop|status", "warning");
+    },
+  });
+
   pi.registerTool({
     name: "delegate",
     label: "Delegate subtask",
@@ -238,7 +282,10 @@ export default function piDelegationBroker(pi: any) {
       "Write the delegate task as a complete brief: the child sees nothing of this conversation, so include file paths, context, and exactly what output you expect.",
     ],
     parameters: DELEGATE_PARAMS,
-    async execute(_toolCallId: string, params: { task: string; capabilities?: string[] }, _signal: AbortSignal, onUpdate: any, ctx: any) {
+    async execute(_toolCallId: string, params: { task: string; capabilities?: string[]; tier?: "cheap" | "standard" | "frontier" }, _signal: AbortSignal, onUpdate: any, ctx: any) {
+      if (!enabled) {
+        return { content: [{ type: "text", text: "Delegation broker is stopped. Run /delegation-broker start to allow new children." }], isError: true };
+      }
       let broker: BrokerRuntime;
       try {
         broker = await ensureBroker();
@@ -262,6 +309,7 @@ export default function piDelegationBroker(pi: any) {
         capabilityRequest: {
           taskDescription: params.task,
           ...(params.capabilities?.length ? { requiredCapabilities: params.capabilities } : {}),
+          ...(params.tier ? { modelTier: params.tier } : {}),
         },
       });
 
