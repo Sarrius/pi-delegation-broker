@@ -140,14 +140,21 @@ test("transport resolves exactly one named credential and makes exactly one raw 
   });
 });
 
-test("named credential miss fails closed without environment or fallback dispatch", async () => {
+test("named credential miss fails closed even with an unrelated ambient API key", async () => {
   let sent = 0;
-  const transport = adapter({
-    credentialResolver: async () => undefined,
-    fetchImpl: async () => { sent += 1; return sse(successEvents()); },
-  });
-  await assert.rejects(() => collect(transport), (error) => error instanceof AnthropicMessagesTransportError && error.reasonCode === "credential_unavailable");
-  assert.equal(sent, 0);
+  const previous = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "ambient-key-that-must-not-be-read";
+  try {
+    const transport = adapter({
+      credentialResolver: async () => undefined,
+      fetchImpl: async () => { sent += 1; return sse(successEvents()); },
+    });
+    await assert.rejects(() => collect(transport), (error) => error instanceof AnthropicMessagesTransportError && error.reasonCode === "credential_unavailable");
+    assert.equal(sent, 0);
+  } finally {
+    if (previous === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = previous;
+  }
 });
 
 test("abort before exact credential resolution is a before-send terminal without dispatch", async () => {
