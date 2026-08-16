@@ -462,3 +462,24 @@ test("legacy providerAttempt still works alongside streaming", async () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+test("a void controller method answers its caller instead of hanging the request", async () => {
+  const { directory, broker, server } = createServer();
+  try {
+    await server.start();
+    const result = await Promise.race([
+      requestBrokerIpc({
+        socketPath: server.socketPath,
+        authorization: server.controllerToken,
+        method: "markUnknown",
+        params: { resourceId: "R1", reason: "controller probe" },
+      }),
+      new Promise((_, reject) => { const t = setTimeout(() => reject(new Error("markUnknown never answered")), 5_000); t.unref?.(); }),
+    ]);
+    assert.equal(result.status, "unknown");
+    assert.equal(result.resourceId, "R1");
+  } finally {
+    await server.stop({ drainMs: 0 }).catch(() => undefined);
+    broker.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

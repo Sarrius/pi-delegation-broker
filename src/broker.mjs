@@ -667,6 +667,9 @@ export class SqliteLeaseBroker {
       const update = this.#db.prepare("UPDATE resources SET state = 'unknown' WHERE id = ?").run(resourceId);
       if (update.changes !== 1) throw new Error(`Unknown resource ${resourceId}`);
       this.#record(now, "ResourceUnknown", { resourceId, reason });
+      // Return an explicit receipt: a void result is indistinguishable from "no reply" to a
+      // controller waiting on the IPC response.
+      return { status: "unknown", resourceId };
     });
   }
 

@@ -9,6 +9,10 @@ import { BehavioralRunMonitor } from "./behavior-monitor.mjs";
 import { ArtifactPipeline } from "./artifact-pipeline.mjs";
 import { AttemptSettlement, ProviderStreamAssembler, createAttemptRouteSnapshot, outcomeProperties } from "./provider-protocol.mjs";
 const MAX_REQUEST_BYTES = 1024 * 1024;
+// A handler that already wrote its own frames and ended the socket must say so explicitly.
+// Overloading `undefined` for that made every void controller method hang its caller, because
+// requestBrokerIpc only settles on the response.
+const STREAM_ALREADY_WRITTEN = Symbol("broker_stream_already_written");
 const CHILD_METHODS = new Set([
   "heartbeat", "release", "providerAttempt", "providerStream",
   "getEffectiveChildCapability", "declareBehavioralAction", "authorizeBehavioralAction", "observeBehavioralResult",
@@ -152,10 +156,10 @@ export class BrokerIpcServer {
       }
       void Promise.resolve(this.#dispatch(request, Date.now(), abortController.signal, socket)).then(
         (result) => {
-          if (result === undefined) return; // streaming already wrote and ended
+          if (result === STREAM_ALREADY_WRITTEN) return; // streaming wrote its frames and ended
           if (abortController.signal.aborted) return;
           responded = true;
-          this.#respond(socket, { id: request?.id ?? null, ok: true, result });
+          this.#respond(socket, { id: request?.id ?? null, ok: true, result: result === undefined ? null : result });
         },
         (error) => {
           if (abortController.signal.aborted) return;
@@ -406,7 +410,7 @@ export class BrokerIpcServer {
       // can retry persistence or escalate instead of treating this as settled.
     }
     socket.end();
-    return undefined; // streaming handled: #writeLine + end already done
+    return STREAM_ALREADY_WRITTEN; // streaming handled: #writeLine + end already done
   }
 
   /**
