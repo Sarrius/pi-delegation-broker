@@ -49,6 +49,7 @@ test("dynamic provider watcher reloads broker registry when catalog changes", as
 
     // Add a second provider
     writeFileSync(join(agentDir, "models-store.json"), JSON.stringify(modelsStore(["alpha", "beta"])), { mode: 0o600 });
+    writeFileSync(join(agentDir, "auth.json"), JSON.stringify(authJson(["alpha", "beta"])), { mode: 0o600 });
     const second = await watcher.refresh();
     assert.equal(second.status, "reloaded");
     assert.ok(reloadInfo.providers.includes("beta"));
@@ -62,6 +63,22 @@ test("dynamic provider watcher reloads broker registry when catalog changes", as
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("dynamic provider watcher excludes listed providers without an active credential", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dpw-auth-"));
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(agentDir, "models-store.json"), JSON.stringify(modelsStore(["authorized", "ghost"])), { mode: 0o600 });
+  writeFileSync(join(agentDir, "auth.json"), JSON.stringify(authJson(["authorized"])), { mode: 0o600 });
+  try {
+    const broker = new SqliteLeaseBroker({ path: join(root, "broker.sqlite"), registry: fixtureRegistry() });
+    const watcher = new DynamicProviderWatcher({ agentDir, broker });
+    await watcher.refresh();
+    assert.ok(watcher.currentRegistry().resources["authorized/test-model"]);
+    assert.equal(watcher.currentRegistry().resources["ghost/test-model"], undefined);
+    watcher.stop(); broker.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("dynamic provider watcher discovers pi-multi-account providers from auth.json", async () => {

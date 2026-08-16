@@ -26,9 +26,12 @@ function readPiCatalog(agentDir) {
   const catalog = [];
   const seen = new Set();
 
-  // 1. Providers from models-store.json (have full model details)
+  // 1. Providers from models-store.json (have full model details). A listed
+  // model is not an active route: admit it only when this controller has a
+  // credential for that exact provider. Otherwise a selector can lease an
+  // apparently live model which scoped child auth cannot provision.
   for (const [provider, entry] of Object.entries(store)) {
-    if (!entry?.models || !Array.isArray(entry.models)) continue;
+    if (!auth[provider] || !entry?.models || !Array.isArray(entry.models)) continue;
     if (seen.has(provider)) continue;
     seen.add(provider);
     const cfg = providersConfig[provider] ?? {};
