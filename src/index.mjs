@@ -21,7 +21,14 @@ export {
   isTerminalOutcome,
   outcomeProperties,
 } from "./provider-protocol.mjs";
-export { catalogToBrokerRegistry, fixtureCatalog } from "./provider-catalog.mjs";
+export { capabilityTierId, catalogToBrokerRegistry, deriveModelSupports, fixtureCatalog } from "./provider-catalog.mjs";
+export {
+  createResourceModelResolver,
+  createSelectContract,
+  deriveTaskRequirement,
+  parseResourceModel,
+  selectModelForTask,
+} from "./model-selector.mjs";
 export {
   ControllerAccountInventory,
   ControllerCredentialStore,
@@ -46,7 +53,7 @@ export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.m
 export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
 export { BrokeredLaunchResolver } from "./trusted-launch-resolver.mjs";
 export { DynamicProviderWatcher } from "./dynamic-provider-watcher.mjs";
-export { BrokeredChildRunner } from "./brokered-runner.mjs";
+export { BrokeredChildRunner, classifyChildFailure } from "./brokered-runner.mjs";
 export { spawnBrokeredChild } from "./child-launcher.mjs";
 export { Semaphore } from "./semaphore.mjs";
 export { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionError } from "./worktree.mjs";

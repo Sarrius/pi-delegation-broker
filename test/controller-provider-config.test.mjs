@@ -154,7 +154,8 @@ test("route configuration is owner-only, has no secret field, and inventory is o
     const inventory = new ControllerAccountInventory({ readCatalog: async () => fixtureCatalog(), now: () => 123 });
     const observed = await inventory.refresh();
     assert.equal(observed.capturedAt, 123);
-    assert.equal(observed.registryCandidate.resources["fake-anthropic"].confidence, "observed");
+    // One resource per (account, model): the account's own id is a capacity group, not a resource.
+    assert.equal(observed.registryCandidate.resources["fake-anthropic/claude-fake-1"].confidence, "observed");
     assert.equal(Object.hasOwn(observed, "credential"), false);
   } finally {
     rmSync(root, { recursive: true, force: true });

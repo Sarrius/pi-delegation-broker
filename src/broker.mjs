@@ -717,6 +717,45 @@ export class SqliteLeaseBroker {
     });
   }
 
+  /**
+   * Live controller-side view of what can actually be routed to right now: health, retirement,
+   * per-group cooldown and breaker state. The model selector needs this — a registry snapshot
+   * alone describes the shape of the world, not which parts of it are currently answering.
+   * Read-only and redaction-free: it carries no credential, capability or task data.
+   */
+  inventory(now) {
+    const rows = this.#db.prepare(`
+      SELECT
+        r.id, r.capacity_group, r.profile, r.state, r.retiring, r.cooldown_until,
+        r.inventory_confidence AS resource_confidence, r.enforcement,
+        g.inventory_confidence AS group_confidence, g.max_concurrent,
+        g.cooldown_until AS group_cooldown_until, g.breaker_state
+      FROM resources r JOIN capacity_groups g ON g.id = r.capacity_group
+      ORDER BY r.id
+    `).all();
+    const active = new Map();
+    if (Number.isSafeInteger(now)) {
+      for (const row of this.#db.prepare("SELECT capacity_group, count(*) AS count FROM leases WHERE expires_at > ? GROUP BY capacity_group").all(now)) {
+        active.set(row.capacity_group, row.count);
+      }
+    }
+    return Object.freeze(rows.map((row) => Object.freeze({
+      resourceId: row.id,
+      capacityGroup: row.capacity_group,
+      profile: row.profile,
+      state: row.state,
+      retiring: row.retiring === 1,
+      cooldownUntil: row.cooldown_until,
+      groupCooldownUntil: row.group_cooldown_until,
+      breakerState: row.breaker_state,
+      confidence: row.resource_confidence,
+      groupConfidence: row.group_confidence,
+      maxConcurrent: row.max_concurrent,
+      activeLeases: active.get(row.capacity_group) ?? 0,
+      enforcement: parseJson(row.enforcement),
+    })));
+  }
+
   leases() {
     return this.#db.prepare("SELECT * FROM leases ORDER BY issued_at, lease_id").all().map(asLease);
   }
@@ -754,7 +793,8 @@ export class SqliteLeaseBroker {
         state TEXT NOT NULL CHECK (state IN ('healthy', 'unknown')) DEFAULT 'healthy',
         cooldown_until INTEGER NOT NULL DEFAULT 0,
         inventory_confidence TEXT NOT NULL DEFAULT 'assumed' CHECK (inventory_confidence IN ('measured', 'observed', 'assumed')),
-        enforcement TEXT NOT NULL
+        enforcement TEXT NOT NULL,
+        retiring INTEGER NOT NULL DEFAULT 0 CHECK (retiring IN (0, 1))
       );
       CREATE TABLE IF NOT EXISTS leases (
         lease_id TEXT PRIMARY KEY,
@@ -833,6 +873,11 @@ export class SqliteLeaseBroker {
     for (const [column, sql] of groupMigrations) if (!groupColumns.includes(column)) this.#db.exec(sql);
     const resourceColumns = this.#db.prepare("PRAGMA table_info(resources)").all().map((column) => column.name);
     if (!resourceColumns.includes("inventory_confidence")) this.#db.exec("ALTER TABLE resources ADD COLUMN inventory_confidence TEXT NOT NULL DEFAULT 'assumed'");
+    // A resource withdrawn by an incremental registry update while it still carries a live
+    // lease is retired, not deleted: it stops taking new work immediately and disappears once
+    // its last lease ends. Carried as its own column rather than a new `state` value so an
+    // existing database migrates additively instead of rebuilding a CHECK constraint.
+    if (!resourceColumns.includes("retiring")) this.#db.exec("ALTER TABLE resources ADD COLUMN retiring INTEGER NOT NULL DEFAULT 0");
   }
 
   #validateRegistry(registry) {
@@ -954,6 +999,180 @@ export class SqliteLeaseBroker {
     });
   }
 
+  /**
+   * Incremental registry update that applies while work is in flight.
+   *
+   * `reloadRegistry` replaces the whole registry and therefore has to refuse whenever any
+   * lease or task is active. Under continuous delegation that moment never arrives, so a
+   * newly authenticated account would never become usable. This splits the update by blast
+   * radius instead:
+   *
+   * - **Additions apply immediately.** A profile, capacity group or resource that did not
+   *   exist cannot be referenced by anything in flight, so admitting it is safe at any time.
+   * - **Withdrawals drain.** A resource that still carries a live lease is marked retiring:
+   *   it stops taking new work at once and is deleted when its last lease ends. One with no
+   *   live lease is deleted immediately.
+   * - **Policy changes to a live capacity group are deferred**, not silently applied, because
+   *   admission counters and fencing tokens are already accounted against the old policy.
+   *
+   * A withdrawn resource that reappears before it finished draining is simply un-retired,
+   * which is what a provider recovering mid-drain looks like.
+   */
+  updateRegistry(candidate, now) {
+    this.#assertNondecreasingTime(now);
+    this.#validateRegistry(candidate);
+    return this.#transaction(() => {
+      const summary = { added: [], retired: [], removed: [], restored: [], deferred: [] };
+
+      for (const [id, profile] of Object.entries(candidate.profiles)) {
+        const capabilities = JSON.stringify(profile.supports);
+        const persisted = this.#db.prepare("SELECT status, capabilities FROM profiles WHERE id = ?").get(id);
+        if (!persisted) {
+          this.#db.prepare("INSERT INTO profiles (id, status, capabilities) VALUES (?, ?, ?)").run(id, profile.status, capabilities);
+          summary.added.push(`profile:${id}`);
+        } else if (persisted.status !== profile.status || persisted.capabilities !== capabilities) {
+          // A capability tier is an identity, not a mutable record: silently changing what a
+          // profile means would retroactively alter every contract already pinned to it.
+          summary.deferred.push(`profile:${id}`);
+        }
+      }
+
+      for (const [id, group] of Object.entries(candidate.capacityGroups)) {
+        const persisted = this.#db.prepare("SELECT max_concurrent, control_reserve, verify_reserve, inventory_confidence, default_cooldown_ms, probe_interval_ms FROM capacity_groups WHERE id = ?").get(id);
+        if (!persisted) {
+          this.#db.prepare(`
+            INSERT INTO capacity_groups (id, max_concurrent, control_reserve, verify_reserve, inventory_confidence, default_cooldown_ms, probe_interval_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).run(id, group.maxConcurrent, group.admission.controlReserve, group.admission.verifyReserve, group.confidence, group.cooldown.defaultMs, group.cooldown.probeIntervalMs);
+          summary.added.push(`capacityGroup:${id}`);
+          continue;
+        }
+        const unchanged = persisted.max_concurrent === group.maxConcurrent
+          && persisted.control_reserve === group.admission.controlReserve
+          && persisted.verify_reserve === group.admission.verifyReserve
+          && persisted.inventory_confidence === group.confidence
+          && persisted.default_cooldown_ms === group.cooldown.defaultMs
+          && persisted.probe_interval_ms === group.cooldown.probeIntervalMs;
+        if (unchanged) continue;
+        if (this.#groupHasLiveLease(id, now)) { summary.deferred.push(`capacityGroup:${id}`); continue; }
+        this.#db.prepare(`
+          UPDATE capacity_groups SET max_concurrent = ?, control_reserve = ?, verify_reserve = ?,
+            inventory_confidence = ?, default_cooldown_ms = ?, probe_interval_ms = ?
+          WHERE id = ?
+        `).run(group.maxConcurrent, group.admission.controlReserve, group.admission.verifyReserve, group.confidence, group.cooldown.defaultMs, group.cooldown.probeIntervalMs, id);
+        summary.added.push(`capacityGroup:${id}`);
+      }
+
+      for (const [id, resource] of Object.entries(candidate.resources)) {
+        const enforcement = JSON.stringify(resource.enforcement);
+        const persisted = this.#db.prepare("SELECT capacity_group, profile, inventory_confidence, enforcement, retiring FROM resources WHERE id = ?").get(id);
+        if (!persisted) {
+          this.#db.prepare(`
+            INSERT INTO resources (id, capacity_group, profile, state, cooldown_until, inventory_confidence, enforcement, retiring)
+            VALUES (?, ?, ?, 'healthy', 0, ?, ?, 0)
+          `).run(id, resource.capacityGroup, resource.profile, resource.confidence, enforcement);
+          summary.added.push(`resource:${id}`);
+          continue;
+        }
+        if (persisted.retiring === 1) {
+          this.#db.prepare("UPDATE resources SET retiring = 0 WHERE id = ?").run(id);
+          summary.restored.push(id);
+        }
+        const sameShape = persisted.capacity_group === resource.capacityGroup
+          && persisted.profile === resource.profile
+          && persisted.inventory_confidence === resource.confidence
+          && persisted.enforcement === enforcement;
+        if (sameShape) continue;
+        if (this.#resourceHasLiveLease(id, now)) { summary.deferred.push(`resource:${id}`); continue; }
+        this.#db.prepare(`
+          UPDATE resources SET capacity_group = ?, profile = ?, inventory_confidence = ?, enforcement = ? WHERE id = ?
+        `).run(resource.capacityGroup, resource.profile, resource.confidence, enforcement, id);
+        summary.added.push(`resource:${id}`);
+      }
+
+      for (const row of this.#db.prepare("SELECT id, retiring FROM resources ORDER BY id").all()) {
+        if (Object.hasOwn(candidate.resources, row.id)) continue;
+        if (this.#resourceHasLiveLease(row.id, now)) {
+          if (row.retiring !== 1) {
+            this.#db.prepare("UPDATE resources SET retiring = 1 WHERE id = ?").run(row.id);
+            summary.retired.push(row.id);
+          }
+          continue;
+        }
+        if (this.#deleteResource(row.id)) summary.removed.push(row.id);
+        else if (row.retiring !== 1) {
+          this.#db.prepare("UPDATE resources SET retiring = 1 WHERE id = ?").run(row.id);
+          summary.retired.push(row.id);
+        }
+      }
+
+      this.#pruneUnreferencedRegistry(candidate, summary);
+
+      const changed = summary.added.length + summary.retired.length + summary.removed.length + summary.restored.length;
+      if (changed > 0) {
+        this.#record(now, "RegistryUpdated", {
+          added: summary.added.length,
+          retired: summary.retired.length,
+          removed: summary.removed.length,
+          restored: summary.restored.length,
+          deferred: summary.deferred.length,
+        });
+      }
+      return Object.freeze({
+        status: "updated",
+        added: Object.freeze([...summary.added]),
+        retired: Object.freeze([...summary.retired]),
+        removed: Object.freeze([...summary.removed]),
+        restored: Object.freeze([...summary.restored]),
+        deferred: Object.freeze([...summary.deferred]),
+      });
+    });
+  }
+
+  #groupHasLiveLease(capacityGroup, now) {
+    return this.#db.prepare("SELECT 1 FROM leases WHERE capacity_group = ? AND expires_at > ? LIMIT 1").get(capacityGroup, now) !== undefined;
+  }
+
+  #resourceHasLiveLease(resourceId, now) {
+    return this.#db.prepare("SELECT 1 FROM leases WHERE resource_id = ? AND expires_at > ? LIMIT 1").get(resourceId, now) !== undefined;
+  }
+
+  /**
+   * Delete a resource only when nothing references it. An expired-but-not-yet-swept lease row
+   * still holds a foreign key, so report failure and let the caller retire it instead.
+   */
+  #deleteResource(resourceId) {
+    if (this.#db.prepare("SELECT 1 FROM leases WHERE resource_id = ? LIMIT 1").get(resourceId) !== undefined) return false;
+    this.#db.prepare("DELETE FROM resources WHERE id = ?").run(resourceId);
+    return true;
+  }
+
+  /** A retiring resource disappears for real once its last lease row is gone. */
+  #sweepRetiredResources(now) {
+    const retiring = this.#db.prepare("SELECT id FROM resources WHERE retiring = 1").all();
+    if (retiring.length === 0) return;
+    const dropped = [];
+    for (const row of retiring) if (this.#deleteResource(row.id)) dropped.push(row.id);
+    if (dropped.length > 0) this.#record(now, "RetiredResourcesRemoved", { resources: dropped });
+  }
+
+  /** Capacity groups and profiles outlive their last resource only until nothing points at them. */
+  #pruneUnreferencedRegistry(candidate, summary) {
+    for (const row of this.#db.prepare("SELECT id FROM capacity_groups ORDER BY id").all()) {
+      if (Object.hasOwn(candidate.capacityGroups, row.id)) continue;
+      if (this.#db.prepare("SELECT 1 FROM resources WHERE capacity_group = ? LIMIT 1").get(row.id) !== undefined) continue;
+      if (this.#db.prepare("SELECT 1 FROM leases WHERE capacity_group = ? LIMIT 1").get(row.id) !== undefined) continue;
+      this.#db.prepare("DELETE FROM capacity_groups WHERE id = ?").run(row.id);
+      summary.removed.push(`capacityGroup:${row.id}`);
+    }
+    for (const row of this.#db.prepare("SELECT id FROM profiles ORDER BY id").all()) {
+      if (Object.hasOwn(candidate.profiles, row.id)) continue;
+      if (this.#db.prepare("SELECT 1 FROM resources WHERE profile = ? LIMIT 1").get(row.id) !== undefined) continue;
+      this.#db.prepare("DELETE FROM profiles WHERE id = ?").run(row.id);
+      summary.removed.push(`profile:${row.id}`);
+    }
+  }
+
   #transaction(fn) {
     this.#db.exec("BEGIN IMMEDIATE");
     try {
@@ -1006,6 +1225,7 @@ export class SqliteLeaseBroker {
       UPDATE pending_tasks SET eligible_at = MIN(eligible_at, ?), updated_at = ?
       WHERE state = 'waiting' AND eligible_at IS NOT NULL
     `).run(now, now);
+    this.#sweepRetiredResources(now);
     if (lease.is_probe !== 1) return;
     this.#db.prepare(`
       UPDATE capacity_groups
@@ -1043,6 +1263,7 @@ export class SqliteLeaseBroker {
         g.inventory_confidence AS group_confidence,
         g.cooldown_until, g.breaker_state, g.probe_lease_id, g.probe_interval_ms
       FROM resources r JOIN capacity_groups g ON g.id = r.capacity_group
+      WHERE r.retiring = 0
       ORDER BY r.id
     `).all();
     rows = this.#rankResources(rows, contract, now);

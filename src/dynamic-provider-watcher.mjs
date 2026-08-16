@@ -122,19 +122,44 @@ export class DynamicProviderWatcher {
    */
   async refresh() {
     const catalog = readPiCatalog(this.#agentDir);
-    if (catalog.length === 0) return { status: "skipped", reason: "empty catalog" };
-    const fingerprint = JSON.stringify(catalog.map((e) => e.provider).sort());
+    if (catalog.length === 0) return this.#report({ status: "skipped", reason: "empty catalog" });
+    // Fingerprint the models too, not just the provider names: a provider that gains or
+    // loses a model is a different routing surface, and name-only fingerprinting reported
+    // "unchanged" and never reloaded.
+    const fingerprint = JSON.stringify(
+      catalog.map((entry) => [entry.provider, entry.models.map((model) => model.id).sort()])
+        .sort((left, right) => (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0)),
+    );
     if (fingerprint === this.#lastCatalogFingerprint) return { status: "unchanged" };
+
+    let registry;
+    try {
+      registry = catalogToBrokerRegistry(catalog, { confidence: "observed" });
+    } catch (error) {
+      // A catalog the broker cannot represent leaves the previous registry in place. Say so:
+      // a silently discarded failure looks exactly like a healthy dynamic registry, and the
+      // controller would keep routing against a stale or fixture provider set.
+      return this.#report({ status: "failed", reason: error.message });
+    }
+    // Only commit the fingerprint once the catalog is known to be representable, so a
+    // transient bad read is retried rather than remembered as the current state.
     this.#lastCatalogFingerprint = fingerprint;
 
-    const registry = catalogToBrokerRegistry(catalog, { confidence: "observed" });
     const now = Date.now();
     const result = this.#broker.reloadRegistry(registry, now);
     if (result.status === "reloaded") {
-      this.#onReload?.({ status: "reloaded", providerCount: catalog.length, providers: catalog.map((e) => e.provider) });
-      return { status: "reloaded", providerCount: catalog.length };
+      return this.#report({ status: "reloaded", providerCount: catalog.length, providers: catalog.map((e) => e.provider) });
     }
-    return { status: result.status, reason: "reload deferred — active leases or tasks" };
+    // A deferred reload must be retried when capacity frees up, so do not keep the
+    // fingerprint that would suppress the next attempt.
+    this.#lastCatalogFingerprint = undefined;
+    return this.#report({ status: result.status, reason: "reload deferred — active leases or tasks" });
+  }
+
+  #report(outcome) {
+    const frozen = Object.freeze({ ...outcome });
+    try { this.#onReload?.(frozen); } catch { /* controller callback failure must not stop watching */ }
+    return frozen;
   }
 
   /** Start watching the agent directory for auth/model changes. */

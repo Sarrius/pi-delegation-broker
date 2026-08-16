@@ -40,6 +40,7 @@ export class BrokeredLaunchResolver {
   #selectContract;
   #launcherAttestationConfig;
   #queuedTaskVerifier;
+  #resolveModelForResource;
   #admissions = new Map();
 
   constructor({
@@ -51,6 +52,7 @@ export class BrokeredLaunchResolver {
     selectContract,
     launcherAttestationConfig,
     queuedTaskVerifier,
+    resolveModelForResource,
   }) {
     if (typeof socketPath !== "string" || !isAbsolute(socketPath)) throw new Error("Broker launch resolver needs an absolute socketPath");
     if (typeof controllerToken !== "string" || controllerToken.length < 32) throw new Error("Broker launch resolver needs a controller-only token");
@@ -59,6 +61,9 @@ export class BrokeredLaunchResolver {
     }
     if (typeof offline !== "boolean") throw new Error("Broker launch resolver offline must be boolean");
     if (typeof selectContract !== "function") throw new Error("Broker launch resolver needs a controller selectContract function");
+    if (resolveModelForResource !== undefined && typeof resolveModelForResource !== "function") {
+      throw new Error("Broker launch resolver resolveModelForResource must be a controller-owned function");
+    }
     if (queuedTaskVerifier !== undefined && typeof queuedTaskVerifier.verifyAndFinalize !== "function") {
       throw new Error("Broker launch resolver queuedTaskVerifier must be a controller-owned verifier coordinator");
     }
@@ -81,6 +86,7 @@ export class BrokeredLaunchResolver {
       trustedExtensionDigests: Object.freeze([...launcherAttestationConfig.trustedExtensionDigests]),
     });
     this.#queuedTaskVerifier = queuedTaskVerifier;
+    this.#resolveModelForResource = resolveModelForResource;
   }
 
   /** Compatible with TrustedChildLaunchResolver; request has no raw prompt. */
@@ -174,8 +180,18 @@ export class BrokeredLaunchResolver {
         }),
       };
       this.#admissions.set(request.childId, admission);
+      // A contract pins a capability class, not one model, so the broker may lease a different
+      // resource in that class than the selection predicted — that indirection is exactly what
+      // lets a launch survive a provider dying between selection and reservation. Report which
+      // resource was actually leased, and the model it maps to, so the child runs on the model
+      // its budget is accounted against instead of the one that was merely expected.
+      const resolvedModel = this.#resolveModelForResource?.(lease.resourceId);
       return {
         action: "allow",
+        resource: Object.freeze({ id: lease.resourceId, profile: lease.profile, capacityGroup: lease.capacityGroup }),
+        ...(resolvedModel?.provider && resolvedModel?.modelId
+          ? { resolvedModel: Object.freeze({ provider: resolvedModel.provider, modelId: resolvedModel.modelId }) }
+          : {}),
         policy: {
           policyId: lease.leaseId,
           agentDir,
@@ -206,6 +222,29 @@ export class BrokeredLaunchResolver {
       if (agentDir) this.#removeAgentDir(agentDir);
       throw error;
     }
+  }
+
+  /**
+   * Report that a provider refused the work with a rate limit. This is the only way staleness
+   * can be observed at all: a throttled account still appears connected in Pi's own files, so
+   * nothing short of a failed attempt reveals it. The whole capacity group cools down, because
+   * every model of one account draws on one quota, and the broker's existing half-open probe
+   * brings it back on its own once the cooldown expires.
+   */
+  async reportProviderRateLimited(resourceId, retryAfterMs) {
+    return this.#controller("markRateLimited", {
+      resourceId,
+      ...(Number.isSafeInteger(retryAfterMs) && retryAfterMs > 0 ? { retryAfterMs } : {}),
+    });
+  }
+
+  /**
+   * Report that a provider is not usable for a reason a cooldown will not fix — a revoked or
+   * expired credential. Unlike a rate limit this does not recover by waiting, so the resource
+   * stays out until a controller explicitly repairs it.
+   */
+  async reportProviderUnavailable(resourceId, reason) {
+    return this.#controller("markUnknown", { resourceId, reason: safeReason(reason) });
   }
 
   /** Idempotent pre-handoff cleanup called only by the trusted parent runner. */
