@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { spawnBrokeredChild } from "./child-launcher.mjs";
 import { Semaphore } from "./semaphore.mjs";
+import { effectiveThinkingLevel } from "./model-thinking-policy.mjs";
 import { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionError } from "./worktree.mjs";
 
 const SETTLE_GRACE_MS = 15_000;
+const DEFAULT_PROMPT_TIMEOUT_MS = 180_000;
 const MAX_ROUTE_ATTEMPTS = 4;
 const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
 
@@ -21,6 +23,8 @@ const FAILURE_SIGNATURES = Object.freeze([
   // Capability/organization policy rejection is route-specific: the same task can run on
   // another account/model, so quarantine this resource and let controller failover continue.
   Object.freeze({ kind: "unavailable", pattern: /\b(unsupported_value|reasoning summaries|organization must be verified|model is not supported)\b/i }),
+  // A child that never answers is a dead route, not a dead task: fail over instead of hanging.
+  Object.freeze({ kind: "unavailable", pattern: /\bcontroller prompt deadline\b/i }),
   Object.freeze({ kind: "unavailable", pattern: /\b(50[0234]|service unavailable|bad gateway|upstream|connection (refused|reset)|econnrefused|etimedout|network)\b/i }),
 ]);
 
@@ -58,14 +62,19 @@ export class BrokeredChildRunner {
   #delay;
   #sessionsRoot;
   #spawnChild;
+  #promptTimeoutMs;
   #handles = new Map();
 
-  constructor({ resolver, semaphore = new Semaphore(4), sessionsRoot, delay = defaultDelay, spawnChild = spawnBrokeredChild }) {
+  constructor({ resolver, semaphore = new Semaphore(4), sessionsRoot, delay = defaultDelay, spawnChild = spawnBrokeredChild, promptTimeoutMs = DEFAULT_PROMPT_TIMEOUT_MS }) {
     if (!resolver || typeof resolver.resolve !== "function") throw new Error("BrokeredChildRunner requires a BrokeredLaunchResolver");
     if (!(semaphore instanceof Semaphore)) throw new Error("BrokeredChildRunner requires a Semaphore");
     if (typeof sessionsRoot !== "string") throw new Error("BrokeredChildRunner requires sessionsRoot");
     if (typeof delay !== "function") throw new Error("BrokeredChildRunner requires a delay function");
     if (typeof spawnChild !== "function") throw new Error("BrokeredChildRunner spawnChild must be a function");
+    if (!Number.isSafeInteger(promptTimeoutMs) || promptTimeoutMs < 1_000 || promptTimeoutMs > 3_600_000) {
+      throw new Error("BrokeredChildRunner promptTimeoutMs must be between 1000 and 3600000");
+    }
+    this.#promptTimeoutMs = promptTimeoutMs;
     this.#resolver = resolver;
     this.#semaphore = semaphore;
     this.#sessionsRoot = sessionsRoot;
@@ -194,7 +203,8 @@ export class BrokeredChildRunner {
       let worktree;
       let childSpec = {
         model: `${launchModel.provider}/${launchModel.modelId}`,
-        thinkingLevel: thinkingLevel ?? "off",
+        // The leased model, not the caller, decides whether "off" is even a legal mode.
+        thinkingLevel: effectiveThinkingLevel(launchModel, thinkingLevel ?? "off"),
         cwd,
         prompt,
         ...(tools ? { tools } : {}),
@@ -253,11 +263,33 @@ export class BrokeredChildRunner {
     }
   }
 
+  /**
+   * A provider can accept a prompt and never settle it. Recovery is the controller's job, so
+   * bound the wait here: the attempt fails with a route-specific reason and run() fails over.
+   */
+  async #promptWithDeadline(session, prompt) {
+    let timer;
+    try {
+      await Promise.race([
+        session.prompt(prompt),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`controller prompt deadline exceeded after ${this.#promptTimeoutMs}ms`)),
+            this.#promptTimeoutMs,
+          );
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   async #runAndClose(handle, spec) {
     const { session, policy, worktree } = handle;
     let result;
     try {
-      await session.prompt(spec.prompt ?? "");
+      await this.#promptWithDeadline(session, spec.prompt ?? "");
       const message = session.latestAssistantMessage;
       const usage = session.usage;
       if (message?.stopReason === "error") {

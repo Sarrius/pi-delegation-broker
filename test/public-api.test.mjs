@@ -63,6 +63,8 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "deriveAllowedTools",
     "deriveModelSupports",
     "deriveTaskRequirement",
+    "effectiveThinkingLevel",
+    "requiresReasoning",
     "fixtureCatalog",
     "isTerminalOutcome",
     "meetsQualityFloor",
