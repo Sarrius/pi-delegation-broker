@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { TaskOrchestrator } from "../src/task-orchestrator.mjs";
+import { TaskOrchestrator } from "../src/workflow-scheduler.mjs";
 
 test("orchestrator runs independent work in parallel and blocks dependents after failure", async () => {
   const root = mkdtempSync(join(tmpdir(), "orchestrator-"));

@@ -38,6 +38,7 @@ import {
   ControllerVerifiedRoutingBoard,
   ModelAffinityJournal,
   RoutingBoard,
+  TaskOrchestrator,
   SingleHostBrokerSupervisor,
   buildCurrencyMap,
   createSelectContract,
@@ -68,6 +69,18 @@ const REGISTRY_KEY_ID = "controller";
 const CURRENCY_REFRESH_MS = 15 * 60 * 1_000;
 
 const CAPABILITIES = ["text_generation", "code_reasoning", "large_context", "vision_input"] as const;
+
+const WORKFLOW_NODE = Type.Object({
+  id: Type.String({ description: "Stable workflow node id." }),
+  task: Type.String({ description: "Self-contained child instruction for this stage." }),
+  dependsOn: Type.Optional(Type.Array(Type.String(), { maxItems: 64 })),
+  capabilities: Type.Optional(Type.Array(StringEnum([...CAPABILITIES]))),
+  tier: Type.Optional(StringEnum(["cheap", "standard", "frontier"] as const)),
+});
+const WORKFLOW_PARAMS = Type.Object({
+  nodes: Type.Array(WORKFLOW_NODE, { minItems: 1, maxItems: 1000 }),
+  concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+});
 
 const DELEGATE_PARAMS = Type.Object({
   task: Type.String({
@@ -420,6 +433,32 @@ export default function piDelegationBroker(pi: any) {
         isError: true,
         details: { route },
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_workflow",
+    label: "Delegate workflow",
+    description: "Run a durable dependency graph of isolated brokered subtasks.",
+    parameters: WORKFLOW_PARAMS,
+    async execute(_id: string, params: { nodes: any[]; concurrency?: number }, _signal: AbortSignal, onUpdate: any, ctx: any) {
+      if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
+      const broker = await ensureBroker();
+      const workflowId = `workflow-${Date.now().toString(36)}-${++counter}`;
+      const orchestrator = new TaskOrchestrator({
+        path: join(STATE_DIR, "workflows", `${workflowId}.json`), concurrency: params.concurrency ?? 4,
+        run: async (node: any) => {
+          const task = node.task;
+          onUpdate?.({ content: [{ type: "text", text: `Running workflow stage ${node.id}…` }] });
+          return broker.runner.run({ childId: `${workflowId}-${node.id}`, prompt: task, cwd: ctx.cwd, thinkingLevel: "off",
+            promptDigest: createHash("sha256").update(task).digest("hex"),
+            capabilityRequest: { taskDescription: task, ...(node.capabilities?.length ? { requiredCapabilities: node.capabilities } : {}), ...(node.tier ? { modelTier: node.tier } : {}) } });
+        },
+      });
+      orchestrator.initialize(params.nodes);
+      const state = await orchestrator.execute();
+      const incomplete = state.nodes.filter((node: any) => node.state !== "completed");
+      return { content: [{ type: "text", text: incomplete.length ? `Workflow ${workflowId} has ${incomplete.length} failed/blocked stages.` : `Workflow ${workflowId} completed.` }], isError: incomplete.length > 0, details: state };
     },
   });
 }
