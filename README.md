@@ -8,7 +8,7 @@ A single-host Node.js reference implementation for capability-scoped Pi child de
 trusted controller → signed registry → SQLite lease broker → scoped Unix-socket capability → isolated child policy
 ```
 
-It is designed to fail closed when a provider transport is not explicitly supplied. The package ships no OAuth integration, credential store, account rotation, live model wiring, or automatic provider failover. It includes an unconfigured, separately tested raw Anthropic Messages transport primitive; it requires controller-injected exact endpoint and credential resolvers, has no ambient-auth fallback or retry loop, and is not wired to IPC or a real account.
+It is designed to fail closed when a provider transport is not explicitly supplied. The package ships no OAuth integration, credential store, account rotation, automatic provider failover, or live-provider approval path. It includes an unconfigured, separately tested raw Anthropic Messages transport primitive; the controller may inject it into IPC only with an exact endpoint resolver and credential resolver. It has no ambient-auth fallback or retry loop and has never been connected to a real account.
 
 ## Status
 
@@ -27,7 +27,7 @@ Validated locally on Node 26 with deterministic fake transport plus mocked raw-A
 - Persistent content-addressed, redacted controller evidence with command/file/test/URL semantic recapture comparators and explicit retention/pruning; self-reported evidence cannot satisfy acceptance.
 - SHA-256-hashed lease capabilities for owner-only Unix-socket IPC.
 - Signed Ed25519 capability-registry verification before supervisor startup.
-- Framed streaming IPC: children send bounded typed context via `providerStream`; the controller validates it through `captureLosslessJson`, creates an immutable `AttemptRouteSnapshot`, streams `ProviderStreamAssembler`-validated frames, and settles through `AttemptSettlement` with an `ArtifactPipeline` terminal durability barrier. A `streamProviderIpc` client reads NDJSON frames until the validated terminal. The legacy digest-only `providerAttempt` remains for backward compatibility. The shipped IPC path remains deterministic fake-only.
+- Framed streaming IPC: children send bounded typed context via `providerStream`; the controller validates it through `captureLosslessJson`, creates an immutable `AttemptRouteSnapshot`, streams `ProviderStreamAssembler`-validated frames, and settles through `AttemptSettlement` with an `ArtifactPipeline` terminal durability barrier. A `streamProviderIpc` client reads NDJSON frames until the validated terminal. The legacy digest-only `providerAttempt` remains for backward compatibility. IPC requires either the deterministic fake transport or an explicitly injected `providerTransport + routeResolver` pair, never both; neither credentials nor a live route are packaged.
 - An independently tested low-level `AnthropicMessagesTransport`: exact injected endpoint/credential resolution, one raw HTTPS dispatch, retry disabled by construction, explicit cache-retention snapshot policy, bounded strict SSE normalization, and no environment/keychain/OAuth fallback. It is not a live-provider integration or credential configuration.
 - Unified capability compiler: `createEffectiveChildCapability` + `compileEffectiveChildCapability` generate prompt-visible rules and executable authorization from one immutable source. `BrokeredLaunchResolver` compiles the capability at admission and includes both projections in the returned policy. `BehavioralRunMonitor` optionally enforces the authorization policy (tool-not-allowed and behavioral-enforcement-unavailable terminal denials).
 - Owner-only state directory, lock, socket, bounded shutdown and periodic TTL sweep.
@@ -37,7 +37,7 @@ Validated locally on Node 26 with deterministic fake transport plus mocked raw-A
 
 ## What it deliberately does **not** provide
 
-- A wired real provider proxy, controller credential configuration/vault, account discovery, or a live-provider approval path.
+- Controller credential configuration/vault, account discovery, automatic provider failover, or a live-provider approval path.
 - Multi-host coordination, automatic stale-lock recovery, production daemon/service management or dashboard.
 - A complete controller scheduler that turns every ready queued lease into a child launch. The reference exposes durable readiness; integration remains controller-owned.
 - Signing-key storage, rotation, revocation or registry distribution.

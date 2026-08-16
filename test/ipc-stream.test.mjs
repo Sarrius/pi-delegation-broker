@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { SqliteLeaseBroker, fixtureContract, fixtureRegistry } from "../src/broker.mjs";
 import { BrokerIpcServer, requestBrokerIpc, streamProviderIpc } from "../src/ipc.mjs";
 import { ScriptedFakeProvider } from "../src/fake-provider.mjs";
+import { ANTHROPIC_MESSAGES_ADAPTER_ID, AnthropicMessagesTransport } from "../src/anthropic-messages-transport.mjs";
 
 function createServer() {
   const directory = mkdtempSync(join(tmpdir(), "delegation-broker-stream-"));
@@ -38,6 +39,19 @@ async function reserveCapability(server, taskId, maxOutputTokens = 100, contract
   return issued.capability;
 }
 
+function realContext(overrides = {}) {
+  return {
+    systemPrompt: "You are a careful code reviewer.",
+    messages: [{ role: "user", content: "Review src/window.mjs for off-by-one errors." }],
+    tools: [{
+      name: "read",
+      description: "Read one bounded file",
+      inputSchema: { type: "object", additionalProperties: false, properties: { path: { type: "string" } }, required: ["path"] },
+    }],
+    ...overrides,
+  };
+}
+
 function fakeContext(overrides = {}) {
   return {
     systemPrompt: "You are a careful code reviewer.",
@@ -46,6 +60,39 @@ function fakeContext(overrides = {}) {
     options: {},
     ...overrides,
   };
+}
+
+function anthropicSse(events) {
+  const body = events.map(({ event, data }) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join("");
+  return new Response(body, { status: 200, headers: { "content-type": "text/event-stream", "request-id": "req-ipc-1" } });
+}
+
+function realRoute() {
+  return {
+    registryFingerprint: "a".repeat(64),
+    registryVersion: 1,
+    accountAlias: "anthropic-a1",
+    provider: "anthropic",
+    model: "claude-test",
+    reasoningEffort: null,
+    apiDialect: "anthropic-messages",
+    endpointId: "anthropic-primary",
+    adapterId: ANTHROPIC_MESSAGES_ADAPTER_ID,
+    credentialRefFingerprint: "b".repeat(64),
+    cacheRetention: "long",
+  };
+}
+
+function createRealServer({ fetchImpl, routeResolver = async () => realRoute() } = {}) {
+  const directory = mkdtempSync(join(tmpdir(), "delegation-broker-real-stream-"));
+  const broker = new SqliteLeaseBroker({ path: join(directory, "broker.sqlite"), registry: fixtureRegistry() });
+  const providerTransport = new AnthropicMessagesTransport({
+    credentialResolver: async () => ({ apiKey: "exact-test-key" }),
+    endpointResolver: async () => "https://gateway.example/v1/messages",
+    fetchImpl,
+  });
+  const server = new BrokerIpcServer({ broker, socketPath: join(directory, "broker.sock"), providerTransport, routeResolver });
+  return { directory, broker, server };
 }
 
 test("streaming happy path delivers validated frames and a succeeded terminal", async () => {
@@ -265,6 +312,112 @@ test("streaming cancellation aborts before any frame is written", async () => {
     const promise = streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: fakeContext(), signal: controller.signal });
     setTimeout(() => controller.abort(), 50);
     await assert.rejects(promise, /aborted/);
+  } finally {
+    await server.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("real controller transport path streams one exact route through the same framed IPC boundary", async () => {
+  let dispatches = 0;
+  let observedRequest;
+  const { directory, server } = createRealServer({
+    fetchImpl: async (url, options) => {
+      dispatches += 1;
+      observedRequest = { url, options, body: JSON.parse(options.body) };
+      return anthropicSse([
+        { event: "message_start", data: { message: { usage: { input_tokens: 8, cache_read_input_tokens: 5, cache_creation_input_tokens: 2 } } } },
+        { event: "content_block_start", data: { index: 0, content_block: { type: "text", text: "" } } },
+        { event: "content_block_delta", data: { index: 0, delta: { type: "text_delta", text: "review complete" } } },
+        { event: "content_block_stop", data: { index: 0 } },
+        { event: "message_delta", data: { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 4 } } },
+        { event: "message_stop", data: {} },
+      ]);
+    },
+  });
+  await server.start();
+  try {
+    const capability = await reserveCapability(server, "real-stream-happy");
+    const { frames, terminal } = await streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: realContext() });
+    assert.equal(dispatches, 1);
+    assert.equal(observedRequest.url, "https://gateway.example/v1/messages");
+    assert.equal(observedRequest.options.headers["x-api-key"], "exact-test-key");
+    assert.equal(observedRequest.body.system[0].cache_control.ttl, "1h");
+    assert.deepEqual(frames.map((frame) => frame.type), ["attempt_accepted", "provider_send_started", "block_start", "text_delta", "block_end", "usage", "terminal"]);
+    assert.equal(frames[5].payload.cacheRead, 5);
+    assert.equal(frames[5].payload.cacheWrite, 2);
+    assert.equal(terminal.payload.outcome, "succeeded_terminal");
+  } finally {
+    await server.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("real transport 429 is the only mocked provider result that cools the capacity group", async () => {
+  let dispatches = 0;
+  const { directory, broker, server } = createRealServer({
+    fetchImpl: async () => {
+      dispatches += 1;
+      return new Response(JSON.stringify({ error: { type: "rate_limit_error", message: "slow down" } }), {
+        status: 429,
+        headers: { "retry-after": "3", "request-id": "req-ipc-429" },
+      });
+    },
+  });
+  await server.start();
+  try {
+    const capability = await reserveCapability(server, "real-stream-429");
+    const { frames, terminal } = await streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: realContext() });
+    assert.equal(dispatches, 1);
+    assert.deepEqual(frames.map((frame) => frame.type), ["attempt_accepted", "provider_send_started", "terminal"]);
+    assert.equal(terminal.payload.outcome, "rate_limited");
+    assert.equal(terminal.payload.retryAfterMs, 3_000);
+    assert.ok(broker.events().some((event) => event.type === "CapacityGroupCooldown" && event.payload.source === "retry_after"));
+  } finally {
+    await server.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("real transport route failure and malformed context make no provider dispatch", async () => {
+  let dispatches = 0;
+  const { directory, broker, server } = createRealServer({
+    fetchImpl: async () => { dispatches += 1; return anthropicSse([]); },
+    routeResolver: async () => ({ ...realRoute(), unexpected: true }),
+  });
+  await server.start();
+  try {
+    const capability = await reserveCapability(server, "real-stream-route-fail");
+    await assert.rejects(
+      () => streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: realContext() }),
+      /route_resolver_returned_invalid_route/,
+    );
+    assert.equal(dispatches, 0);
+    assert.equal(broker.leases().length, 0);
+  } finally {
+    await server.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("real transport rejects malformed canonical context without provider health mutation or dispatch", async () => {
+  let dispatches = 0;
+  const { directory, broker, server } = createRealServer({
+    fetchImpl: async () => { dispatches += 1; return anthropicSse([]); },
+  });
+  await server.start();
+  try {
+    const capability = await reserveCapability(server, "real-stream-context-fail");
+    const { frames, terminal } = await streamProviderIpc({
+      socketPath: server.socketPath,
+      authorization: capability,
+      context: realContext({ unexpected: true }),
+    });
+    assert.equal(dispatches, 0);
+    assert.deepEqual(frames.map((frame) => frame.type), ["attempt_accepted", "terminal"]);
+    assert.equal(terminal.payload.outcome, "controller_failure");
+    assert.equal(broker.leases().length, 0);
+    assert.equal(broker.events().some((event) => event.type === "ProviderEvent"), false);
   } finally {
     await server.stop();
     rmSync(directory, { recursive: true, force: true });

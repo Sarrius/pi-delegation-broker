@@ -314,6 +314,18 @@ test("settlement enforces phase/outcome consistency and exactly-once CAS", () =>
   assert.throws(() => settlement.markPersisted(), /requires terminal_validated/);
 });
 
+test("terminal eligibility preview is side-effect free and rejects impossible phase/outcome pairs", () => {
+  const settlement = new AttemptSettlement(createAttemptRouteSnapshot(snapshotInput()));
+  settlement.transition("admitted");
+  assert.deepEqual(settlement.canSettleTerminal("cancelled_before_send", { observedAt: 10 }), { status: "eligible", outcome: "cancelled_before_send" });
+  assert.equal(settlement.phase, "admitted");
+  assert.equal(settlement.settled, false);
+  assert.throws(() => settlement.canSettleTerminal("succeeded_terminal", { observedAt: 10 }), /phase_invalid/);
+  assert.equal(settlement.phase, "admitted");
+  settlement.settleTerminal("cancelled_before_send", { observedAt: 10 });
+  assert.equal(settlement.phase, "terminal_validated");
+});
+
 test("before-send and after-send cancellation settle in their own phases", () => {
   const before = new AttemptSettlement(createAttemptRouteSnapshot(snapshotInput()));
   before.transition("admitted");

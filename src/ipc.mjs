@@ -4,7 +4,7 @@ import { createConnection, createServer } from "node:net";
 import { dirname } from "node:path";
 import { captureLosslessJson } from "./lossless-json.mjs";
 import { ArtifactPipeline } from "./artifact-pipeline.mjs";
-import { AttemptSettlement, ProviderStreamAssembler, createAttemptRouteSnapshot } from "./provider-protocol.mjs";
+import { AttemptSettlement, ProviderStreamAssembler, createAttemptRouteSnapshot, outcomeProperties } from "./provider-protocol.mjs";
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const CHILD_METHODS = new Set(["heartbeat", "release", "providerAttempt", "providerStream"]);
 const CONTROLLER_METHODS = new Set([
@@ -44,16 +44,26 @@ export class BrokerIpcServer {
   #socketPath;
   #controllerToken;
   #fakeProvider;
+  #providerTransport;
+  #routeResolver;
   #server;
   #connections = new Set();
   #controllerEpoch = randomUUID();
 
-  constructor({ broker, socketPath, controllerToken = randomBytes(32).toString("base64url"), fakeProvider }) {
+  constructor({ broker, socketPath, controllerToken = randomBytes(32).toString("base64url"), fakeProvider, providerTransport, routeResolver }) {
     if (!broker || !socketPath) throw new Error("Broker IPC server needs broker and socketPath");
+    if ((providerTransport && !routeResolver) || (!providerTransport && routeResolver)) {
+      throw new Error("real provider transport requires both providerTransport and routeResolver");
+    }
+    if (providerTransport && fakeProvider) throw new Error("choose either fakeProvider or real providerTransport, never both");
+    if (providerTransport && typeof providerTransport.stream !== "function") throw new Error("providerTransport requires a stream method");
+    if (routeResolver && typeof routeResolver !== "function") throw new Error("routeResolver must be a function");
     this.#broker = broker;
     this.#socketPath = socketPath;
     this.#controllerToken = controllerToken;
     this.#fakeProvider = fakeProvider;
+    this.#providerTransport = providerTransport;
+    this.#routeResolver = routeResolver;
     this.#server = createServer((socket) => {
       this.#connections.add(socket);
       socket.once("close", () => this.#connections.delete(socket));
@@ -195,6 +205,11 @@ export class BrokerIpcServer {
   }
 
   async #providerStream(lease, params, signal, socket, requestId) {
+    if (this.#providerTransport) return this.#realProviderStream(lease, params, signal, socket, requestId);
+    return this.#fakeProviderStream(lease, params, signal, socket, requestId);
+  }
+
+  async #fakeProviderStream(lease, params, signal, socket, requestId) {
     if (!this.#fakeProvider || typeof this.#fakeProvider.routeForLease !== "function") throw new Error("provider_transport_unavailable");
     const context = params?.context;
     if (!context || typeof context !== "object") throw new Error("stream requires typed context");
@@ -265,8 +280,9 @@ export class BrokerIpcServer {
     // Phase 4: generate + validate + write frames
     let seq = 0;
     const emit = (type, payload = {}) => {
-      const frame = { protocolVersion: 1, ...identity, seq: seq++, type, payload };
+      const frame = { protocolVersion: 1, ...identity, seq, type, payload };
       const validated = assembler.accept(frame);
+      seq += 1;
       this.#writeLine(socket, { id: requestId, ok: true, frame });
       return validated;
     };
@@ -325,6 +341,206 @@ export class BrokerIpcServer {
     }
     socket.end();
     return undefined; // streaming handled: #writeLine + end already done
+  }
+
+  /**
+   * Controller-owned real transport path. The injected transport has no
+   * controller token, lease capability, broker handle, or child socket; it can
+   * only resolve the exact immutable snapshot passed here. Its normalized
+   * events still cross the same assembler + settlement boundary as fake events.
+   */
+  async #realProviderStream(lease, params, signal, socket, requestId) {
+    const context = params?.context;
+    if (!context || typeof context !== "object") throw new Error("stream requires typed context");
+    const captured = captureLosslessJson(context, { maxBytes: 512 * 1024, maxNodes: 100_000, maxDepth: 32 });
+    const inputDigest = createHash("sha256").update(captured.canonical).digest("hex");
+    if (typeof captured.value.systemPrompt !== "string") throw new Error("context requires string systemPrompt");
+    if (!Array.isArray(captured.value.messages)) throw new Error("context requires array messages");
+    if (!Array.isArray(captured.value.tools)) throw new Error("context requires array tools");
+
+    // Resolve a controller-owned route before admitting the stream. Route
+    // selection failure is a controller admission failure, never an ambient
+    // provider fallback and never a child-visible partial attempt. Unlike a
+    // child context error, it cannot be corrected by the child, so release the
+    // lease rather than leaving capacity stranded until TTL expiry.
+    const releaseRouteFailure = () => this.#broker.release(lease.leaseId, lease.fencingToken, "controller route resolution failure", Date.now());
+    let route;
+    try {
+      route = await this.#routeResolver(lease);
+    } catch (error) {
+      releaseRouteFailure();
+      throw error;
+    }
+    const routeFields = [
+      "registryFingerprint", "registryVersion", "accountAlias", "provider", "model", "reasoningEffort",
+      "apiDialect", "endpointId", "adapterId", "credentialRefFingerprint", "cacheRetention",
+    ];
+    if (!route || typeof route !== "object" || Array.isArray(route)
+      || Object.keys(route).length !== routeFields.length || routeFields.some((key) => !Object.hasOwn(route, key))) {
+      releaseRouteFailure();
+      throw new Error("route_resolver_returned_invalid_route");
+    }
+    const attemptId = randomUUID();
+    const streamId = randomUUID();
+    let snapshot;
+    try {
+      snapshot = createAttemptRouteSnapshot({
+      schemaVersion: 1,
+      controllerEpoch: this.#controllerEpoch,
+      attemptId,
+      streamId,
+      taskId: lease.taskId,
+      leaseId: lease.leaseId,
+      fencingToken: lease.fencingToken,
+      registryFingerprint: route.registryFingerprint,
+      registryVersion: route.registryVersion,
+      resourceId: lease.resourceId,
+      capacityGroup: lease.capacityGroup,
+      accountAlias: route.accountAlias,
+      provider: route.provider,
+      model: route.model,
+      reasoningEffort: route.reasoningEffort,
+      apiDialect: route.apiDialect,
+      endpointId: route.endpointId,
+      adapterId: route.adapterId,
+      credentialRefFingerprint: route.credentialRefFingerprint,
+      cacheRetention: route.cacheRetention,
+      retryOwner: "broker",
+      sdkMaxRetries: 0,
+      deadlineAt: lease.expiresAt,
+      maxInputBytes: 512 * 1024,
+      maxOutputBytes: 1_000_000,
+      maxOutputTokens: lease.maxOutputTokens ?? 8_000,
+      maxCostMicros: lease.maxCostMicros ?? 500_000,
+      });
+    } catch (error) {
+      releaseRouteFailure();
+      throw error;
+    }
+    const identity = Object.freeze({
+      controllerEpoch: snapshot.controllerEpoch,
+      attemptId: snapshot.attemptId,
+      streamId: snapshot.streamId,
+      leaseId: snapshot.leaseId,
+      fencingToken: snapshot.fencingToken,
+    });
+    const assembler = new ProviderStreamAssembler(identity, {
+      maxBlocks: 64,
+      maxBlockBytes: 256 * 1024,
+      maxTotalOutputBytes: snapshot.maxOutputBytes,
+    });
+    const settlement = new AttemptSettlement(snapshot);
+    const pipeline = new ArtifactPipeline({ maxPending: 256, maxTotalBytes: 64 * 1024 * 1024 });
+    let seq = 0;
+    let sendStarted = false;
+    let headersSeen = false;
+    let streaming = false;
+    let terminalSeen = false;
+    const emit = (type, payload = {}) => {
+      const frame = { protocolVersion: 1, ...identity, seq, type, payload };
+      const validated = assembler.accept(frame);
+      seq += 1;
+      this.#writeLine(socket, { id: requestId, ok: true, frame });
+      return validated;
+    };
+    const onSendStarted = () => {
+      if (sendStarted) throw new Error("provider transport invoked send acknowledgement more than once");
+      sendStarted = true;
+      settlement.transition("provider_send_started");
+      emit("provider_send_started");
+    };
+    const transitionStreaming = () => {
+      if (!streaming) {
+        if (!headersSeen) throw new Error("provider event arrived before response headers");
+        settlement.transition("streaming_tentative");
+        streaming = true;
+      }
+    };
+    const settleAndApply = (event) => {
+      if (terminalSeen) throw new Error("provider transport emitted duplicate terminal");
+      const observedAt = Date.now();
+      let outcome = event.outcome;
+      let payload = event.payload ?? {};
+      const usage = payload.usage;
+      if (outcome === "succeeded_terminal" && lease.enforcement.output === "hard" && lease.maxOutputTokens !== undefined && usage?.output > lease.maxOutputTokens) {
+        outcome = "budget_exceeded";
+        payload = { usage };
+      }
+      const terminalPayload = { outcome, ...payload };
+      const terminalFacts = { inputDigest, terminal: terminalPayload };
+      // Establish phase eligibility first, then validate the exact child frame,
+      // then commit the same facts. This keeps an invalid provider terminal
+      // from becoming a child-visible success before the settlement rejects it.
+      settlement.canSettleTerminal(outcome, { facts: terminalFacts, observedAt });
+      const frame = { protocolVersion: 1, ...identity, seq, type: "terminal", payload: terminalPayload };
+      assembler.accept(frame);
+      settlement.settleTerminal(outcome, { facts: terminalFacts, observedAt });
+      seq += 1;
+      this.#writeLine(socket, { id: requestId, ok: true, frame });
+      terminalSeen = true;
+      const properties = outcomeProperties(outcome);
+      if (properties.providerOwned) {
+        const telemetry = this.#broker.recordProviderEvent(lease.leaseId, lease.fencingToken, inputDigest, {
+          type: "provider_terminal",
+          outcome,
+          ...(payload.httpStatus !== undefined ? { httpStatus: payload.httpStatus } : {}),
+          ...(payload.retryAfterMs !== undefined ? { retryAfterMs: payload.retryAfterMs } : {}),
+        }, observedAt);
+        if (telemetry.status !== "recorded") throw new Error("lease no longer active");
+      }
+      if (outcome === "succeeded_terminal") {
+        const success = this.#broker.markProviderSucceeded(lease.leaseId, lease.fencingToken, observedAt);
+        if (success.status !== "observed") throw new Error("lease no longer active");
+      } else if (outcome === "rate_limited") {
+        this.#broker.markRateLimited(lease.resourceId, payload.retryAfterMs, observedAt);
+        this.#broker.release(lease.leaseId, lease.fencingToken, "provider rate limited", observedAt);
+      } else if (outcome === "auth_fatal" || outcome === "quota_fatal") {
+        this.#broker.markUnknown(lease.resourceId, observedAt, `provider ${outcome}`);
+        this.#broker.release(lease.leaseId, lease.fencingToken, `provider ${outcome}`, observedAt);
+      } else if (outcome !== "succeeded_terminal") {
+        this.#broker.release(lease.leaseId, lease.fencingToken, `provider terminal ${outcome}`, observedAt);
+      }
+    };
+
+    settlement.transition("admitted");
+    emit("attempt_accepted");
+    try {
+      for await (const event of this.#providerTransport.stream(snapshot, captured.value, { signal, onSendStarted })) {
+        if (!event || typeof event.type !== "string" || (event.payload !== undefined && typeof event.payload !== "object")) {
+          throw new Error("provider transport emitted malformed normalized event");
+        }
+        if (event.type === "headers") {
+          if (!sendStarted || headersSeen) throw new Error("provider headers violate attempt lifecycle");
+          settlement.transition("headers_seen");
+          headersSeen = true;
+          continue;
+        }
+        if (["block_start", "text_delta", "reasoning_delta", "tool_call_delta", "block_end", "usage"].includes(event.type)) {
+          transitionStreaming();
+          emit(event.type, event.payload ?? {});
+          continue;
+        }
+        if (event.type === "terminal") {
+          settleAndApply(event);
+          break;
+        }
+        throw new Error("provider transport emitted unknown normalized event");
+      }
+    } catch (error) {
+      if (!terminalSeen) settleAndApply({ type: "terminal", outcome: "controller_failure", payload: {} });
+    }
+    if (!terminalSeen) {
+      settleAndApply({ type: "terminal", outcome: sendStarted ? "stream_truncated" : "controller_failure", payload: {} });
+    }
+    try {
+      pipeline.barrier();
+      settlement.markPersisted();
+    } catch {
+      // Preserve terminal_unpersisted crash repair state; no provider health
+      // mutation follows from evidence/persistence failure.
+    }
+    socket.end();
+    return undefined;
   }
 
   async #providerAttempt(lease, inputDigest, signal) {

@@ -484,7 +484,7 @@ const PHASE_OUTCOMES = Object.freeze({
     "transport_before_headers", "cancelled_after_send", "deadline_exceeded_after_send", "budget_exceeded", "controller_failure",
   ])),
   headers_seen: Object.freeze(new Set([
-    "succeeded_terminal", "empty_response", "stream_truncated", "malformed_provider_frame", "unknown_finish",
+    "rejected_before_send", "succeeded_terminal", "empty_response", "stream_truncated", "malformed_provider_frame", "unknown_finish",
     "rate_limited", "quota_fatal", "auth_fatal", "context_window_exceeded",
     "cancelled_after_send", "deadline_exceeded_after_send", "budget_exceeded", "controller_failure",
   ])),
@@ -540,7 +540,7 @@ export class AttemptSettlement {
     return Object.freeze({ status: "transitioned", phase: target });
   }
 
-  settleTerminal(outcome, { facts = {}, observedAt } = {}) {
+  #validateTerminal(outcome, { facts = {}, observedAt } = {}) {
     if (this.#terminal) fail("duplicate_terminal", "terminal settlement is exactly-once");
     if (!isTerminalOutcome(outcome)) fail("outcome_unknown", "terminal outcome is outside the closed vocabulary");
     if (!Number.isSafeInteger(observedAt) || observedAt < 0) fail("frame_payload_invalid", "observedAt must be a non-negative safe integer");
@@ -548,11 +548,23 @@ export class AttemptSettlement {
     if (!allowed || !allowed.has(outcome)) {
       fail("phase_invalid", `outcome ${outcome} is not reachable from phase ${this.#phase}`);
     }
-    const captured = captureLosslessJson(facts, { maxBytes: 16 * 1024, maxNodes: 2_000, maxDepth: 16 });
+    return captureLosslessJson(facts, { maxBytes: 16 * 1024, maxNodes: 2_000, maxDepth: 16 });
+  }
+
+  /** Validate a proposed terminal without changing durable lifecycle state.
+   * A controller uses this before accepting the matching child-visible frame,
+   * so an impossible phase/outcome cannot be emitted then discovered later. */
+  canSettleTerminal(outcome, options = {}) {
+    this.#validateTerminal(outcome, options);
+    return Object.freeze({ status: "eligible", outcome });
+  }
+
+  settleTerminal(outcome, options = {}) {
+    const captured = this.#validateTerminal(outcome, options);
     this.#terminal = Object.freeze({
       outcome,
       facts: captured.value,
-      observedAt,
+      observedAt: options.observedAt,
       snapshotFingerprint: this.#snapshot.snapshotFingerprint,
     });
     this.#phase = "terminal_validated";
