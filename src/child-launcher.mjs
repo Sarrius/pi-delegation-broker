@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { accessSync, constants, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,20 +18,25 @@ const IMMEDIATE_COMPLETION_POLL_MS = 60;
 const IMMEDIATE_COMPLETION_MAX_POLLS = 40;
 
 function resolveChildPiEntry() {
+  // We are already running inside Pi. The global pi binary is the correct
+  // child entry — children should match the parent's pi version.
+  try {
+    const which = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
+    if (which) return realpathSync(which);
+  } catch { /* pi not on PATH */ }
   const invoked = process.argv[1];
   if (invoked) {
     try {
       const real = realpathSync(invoked);
-      if (/[\\/]cli\.js$/.test(real)) return real;
+      if (/cli\.js$/.test(real)) return real;
     } catch { /* fall through */ }
   }
   try {
     const resolved = import.meta.resolve("@earendil-works/pi-coding-agent");
     const index = resolved.startsWith("file:") ? fileURLToPath(resolved) : resolved;
     return join(dirname(index), "cli.js");
-  } catch {
-    throw new Error("Cannot find pi-coding-agent entry: install @earendil-works/pi-coding-agent or set childPiEntry explicitly");
-  }
+  } catch { /* not installed as a package */ }
+  throw new Error("Cannot find pi CLI entry: install pi or set childPiEntry explicitly");
 }
 
 function buildChildArgs(config) {
