@@ -57,7 +57,7 @@ test("broker registry from catalog can reserve and lease", () => {
     const reservation = broker.reserve(fixtureContract({
       taskId: "catalog-task",
       capability: { minimumProfile: profile, required: ["code_reasoning"], downgradePolicy: "forbid" },
-      budget: { maxInputTokens: 1_000, maxOutputTokens: 100, enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" } },
+      budget: { maxInputTokens: 1_000, maxOutputTokens: 100, enforcement: { input: "hard", output: "hard" } },
     }), Date.now());
     assert.equal(reservation.status, "leased");
     assert.equal(reservation.lease.resourceId, "fake-anthropic/claude-fake-1");

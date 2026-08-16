@@ -466,33 +466,35 @@ test("effect-capable contracts fail closed until the launch path asserts a block
 });
 
 test("high-risk work is denied before lease when a requested budget dimension is not hard", () => withBroker((broker) => {
-  const result = broker.reserve(fixtureContract({ operationClass: "external_write" }), 1_000);
+  const result = broker.reserve(fixtureContract({
+    operationClass: "external_write",
+    budget: { maxInputTokens: 100, maxOutputTokens: 10, enforcement: { input: "hard", output: "metered_best_effort" } },
+  }), 1_000);
   assert.equal(result.status, "denied_policy");
-  assert.match(result.reasons[0], /hard budget enforcement/);
+  assert.match(result.reasons[0], /hard token budget enforcement/);
   assert.equal(broker.leases().length, 0);
 }, fixtureRegistry(), { behavioralEnforcement: "blocking_monitor" }));
 
-test("high-risk work cannot omit a hard budget dimension", () => withBroker((broker) => {
+test("high-risk work cannot omit a hard token budget dimension", () => withBroker((broker) => {
   const result = broker.reserve(fixtureContract({
     operationClass: "external_write",
-    budget: { maxInputTokens: 100, maxOutputTokens: 10, enforcement: { input: "hard", output: "hard" } },
+    budget: { maxInputTokens: 100, enforcement: { input: "hard", output: "hard" } },
   }), 1_000);
   assert.equal(result.status, "denied_policy");
-  assert.match(result.reasons[0], /input, output, and cost/);
+  assert.match(result.reasons[0], /hard output enforcement/);
   assert.equal(broker.leases().length, 0);
 }, fixtureRegistry(), { behavioralEnforcement: "blocking_monitor" }));
 
 test("typed effect receipts are approval-bound and idempotent", () => {
   const registry = fixtureRegistry();
-  for (const resource of Object.values(registry.resources)) resource.enforcement.cost = "hard";
   withBroker((broker) => {
     const lease = leased(broker, fixtureContract({
       operationClass: "apply",
-      budget: { maxInputTokens: 100, maxOutputTokens: 10, maxCostMicros: 1_000, enforcement: { input: "hard", output: "hard", cost: "hard" } },
+      budget: { maxInputTokens: 100, maxOutputTokens: 10, enforcement: { input: "hard", output: "hard" } },
     }));
     assert.equal(lease.maxInputTokens, 100);
     assert.equal(lease.maxOutputTokens, 10);
-    assert.equal(lease.maxCostMicros, 1_000);
+    assert.equal(lease.maxCostMicros, undefined);
     const intent = {
       taskId: lease.taskId,
       leaseId: lease.leaseId,
@@ -585,7 +587,7 @@ test("transactional registry reload replaces registry when no active leases or t
     const newRegistry = fixtureRegistry();
     newRegistry.resources = {
       ...fixtureRegistry().resources,
-      R4: { capacityGroup: "G-cheap", profile: "audit-low/v1", confidence: "measured", enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" } },
+      R4: { capacityGroup: "G-cheap", profile: "audit-low/v1", confidence: "measured", enforcement: { input: "hard", output: "hard" } },
     };
     const result = broker.reloadRegistry(newRegistry, Date.now());
     assert.equal(result.status, "reloaded");
@@ -641,7 +643,7 @@ test("registry reload with invalid candidate rolls back to previous registry", (
     const broker = new SqliteLeaseBroker({ path: join(dir, "b.sqlite"), registry: fixtureRegistry() });
     const badRegistry = fixtureRegistry();
     badRegistry.resources = {
-      R4: { capacityGroup: "G-nonexistent", profile: "audit-low/v1", confidence: "measured", enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" } },
+      R4: { capacityGroup: "G-nonexistent", profile: "audit-low/v1", confidence: "measured", enforcement: { input: "hard", output: "hard" } },
     };
     assert.throws(() => broker.reloadRegistry(badRegistry, Date.now()), /Invalid resource policy/);
     // The old registry should still work

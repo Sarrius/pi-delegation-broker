@@ -20,8 +20,7 @@ function capabilityInput(overrides = {}) {
     budget: {
       maxOutputTokens: 100,
       maxInputTokens: 1_000,
-      maxCostMicros: 500,
-      enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" },
+      enforcement: { input: "hard", output: "hard" },
     },
     latencyBudgetMs: 120_000,
     leaseTtlMs: 30_000,
@@ -37,7 +36,8 @@ test("effective child capability is immutable, fingerprinted, and rejects unknow
   assert.match(cap.capabilityFingerprint, /^[a-f0-9]{64}$/);
   assert.throws(() => { cap.operationClass = "apply"; }, TypeError);
   assert.throws(() => createEffectiveChildCapability({ ...capabilityInput(), surprise: true }), /unknown capability field/);
-  const reordered = createEffectiveChildCapability({ ...capabilityInput(), budget: { enforcement: { output: "hard", input: "hard", cost: "metered_best_effort" }, maxCostMicros: 500, maxInputTokens: 1_000, maxOutputTokens: 100 } });
+  assert.throws(() => createEffectiveChildCapability(capabilityInput({ budget: { maxInputTokens: 1_000, maxOutputTokens: 100, maxCostMicros: 50, enforcement: { input: "hard", output: "hard" } } })), /unknown budget field/);
+  const reordered = createEffectiveChildCapability({ ...capabilityInput(), budget: { enforcement: { output: "hard", input: "hard" }, maxInputTokens: 1_000, maxOutputTokens: 100 } });
   assert.equal(reordered.capabilityFingerprint, cap.capabilityFingerprint);
   const different = createEffectiveChildCapability(capabilityInput({ operationClass: "propose_patch" }));
   assert.notEqual(different.capabilityFingerprint, cap.capabilityFingerprint);

@@ -81,7 +81,6 @@ function asLease(row) {
     probe: row.is_probe === 1,
     ...(row.max_input_tokens === null || row.max_input_tokens === undefined ? {} : { maxInputTokens: row.max_input_tokens }),
     ...(row.max_output_tokens === null || row.max_output_tokens === undefined ? {} : { maxOutputTokens: row.max_output_tokens }),
-    ...(row.max_cost_micros === null || row.max_cost_micros === undefined ? {} : { maxCostMicros: row.max_cost_micros }),
   };
 }
 
@@ -519,8 +518,7 @@ export class SqliteLeaseBroker {
         || normalized.behavioralEnforcement !== lease.behavioral_enforcement
         || JSON.stringify(normalized.budget.enforcement ?? {}) !== JSON.stringify(parseJson(lease.enforcement))
         || normalized.budget.maxInputTokens !== (lease.max_input_tokens ?? undefined)
-        || normalized.budget.maxOutputTokens !== (lease.max_output_tokens ?? undefined)
-        || normalized.budget.maxCostMicros !== (lease.max_cost_micros ?? undefined)) {
+        || normalized.budget.maxOutputTokens !== (lease.max_output_tokens ?? undefined)) {
         throw new Error("Effective child capability does not match its lease");
       }
       const encoded = JSON.stringify(normalized);
@@ -1348,7 +1346,6 @@ export class SqliteLeaseBroker {
         probe,
         ...(Number.isInteger(contract.budget?.maxInputTokens) ? { maxInputTokens: contract.budget.maxInputTokens } : {}),
         ...(Number.isInteger(contract.budget?.maxOutputTokens) ? { maxOutputTokens: contract.budget.maxOutputTokens } : {}),
-        ...(Number.isInteger(contract.budget?.maxCostMicros) ? { maxCostMicros: contract.budget.maxCostMicros } : {}),
       };
       this.#db.prepare(`
         INSERT INTO leases (
@@ -1358,7 +1355,9 @@ export class SqliteLeaseBroker {
       `).run(
         lease.leaseId, lease.taskId, lease.resourceId, lease.capacityGroup, lease.profile,
         lease.fencingToken, lease.issuedAt, lease.expiresAt, JSON.stringify(lease.enforcement),
-        lease.maxInputTokens ?? null, lease.maxOutputTokens ?? null, lease.maxCostMicros ?? null,
+        // `max_cost_micros` remains in older SQLite files for migration compatibility but is
+        // intentionally always NULL: spend is not a broker policy or metric.
+        lease.maxInputTokens ?? null, lease.maxOutputTokens ?? null, null,
         lease.admissionClass, lease.behavioralEnforcement, lease.probe ? 1 : 0,
       );
       if (probe) this.#db.prepare("UPDATE capacity_groups SET probe_lease_id = ? WHERE id = ?").run(lease.leaseId, lease.capacityGroup);
@@ -1430,10 +1429,12 @@ export class SqliteLeaseBroker {
     if (!this.#profile(contract.capability.minimumProfile)) return "unknown or unapproved minimum profile";
     const requirements = contract.budget?.enforcement ?? {};
     if (Object.values(requirements).some((value) => !Object.hasOwn(ENFORCEMENT, value))) return "unknown budget enforcement class";
+    if (Object.hasOwn(contract.budget ?? {}, "maxCostMicros") || Object.hasOwn(requirements, "cost")) {
+      return "money budgets are not supported; use token caps and verified efficiency observations";
+    }
     const hardCaps = {
       input: contract.budget?.maxInputTokens,
       output: contract.budget?.maxOutputTokens,
-      cost: contract.budget?.maxCostMicros,
     };
     for (const [dimension, enforcement] of Object.entries(requirements)) {
       if (enforcement === "hard" && (!Number.isSafeInteger(hardCaps[dimension]) || hardCaps[dimension] <= 0)) {
@@ -1441,8 +1442,8 @@ export class SqliteLeaseBroker {
       }
     }
     if (contract.operationClass === "apply" || contract.operationClass === "external_write") {
-      if (["input", "output", "cost"].some((dimension) => requirements[dimension] !== "hard")) {
-        return "high-risk task requires hard budget enforcement for input, output, and cost";
+      if (["input", "output"].some((dimension) => requirements[dimension] !== "hard")) {
+        return "high-risk task requires hard token budget enforcement for input and output";
       }
     }
     return undefined;
@@ -1497,10 +1498,10 @@ export function fixtureRegistry() {
       },
     },
     resources: {
-      R1: { capacityGroup: "G-shared", profile: "reasoning-high/v1", confidence: "observed", enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" } },
-      R1_ALIAS: { capacityGroup: "G-shared", profile: "reasoning-high/v1", confidence: "observed", enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" } },
-      R2: { capacityGroup: "G-independent", profile: "reasoning-high/v1", confidence: "observed", enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" } },
-      R3: { capacityGroup: "G-cheap", profile: "audit-low/v1", confidence: "measured", enforcement: { input: "unavailable", output: "unavailable", cost: "unavailable" } },
+      R1: { capacityGroup: "G-shared", profile: "reasoning-high/v1", confidence: "observed", enforcement: { input: "hard", output: "hard" } },
+      R1_ALIAS: { capacityGroup: "G-shared", profile: "reasoning-high/v1", confidence: "observed", enforcement: { input: "hard", output: "hard" } },
+      R2: { capacityGroup: "G-independent", profile: "reasoning-high/v1", confidence: "observed", enforcement: { input: "hard", output: "hard" } },
+      R3: { capacityGroup: "G-cheap", profile: "audit-low/v1", confidence: "measured", enforcement: { input: "unavailable", output: "unavailable" } },
     },
   };
 }
@@ -1514,7 +1515,7 @@ export function fixtureContract(overrides = {}) {
     doneWhen: ["Return the requested repository finding with controller-verifiable evidence references"],
     latencyBudgetMs: 120_000,
     capability: { minimumProfile: "reasoning-high/v1", required: ["code_reasoning", "repo_navigation"], downgradePolicy: "forbid" },
-    budget: { maxInputTokens: 1_000, maxOutputTokens: 100, enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" } },
+    budget: { maxInputTokens: 1_000, maxOutputTokens: 100, enforcement: { input: "hard", output: "hard" } },
     leaseTtlMs: 30_000,
     recovery: { owner: "controller", deadlineAt: 4_000_000_000_000 },
     ...overrides,

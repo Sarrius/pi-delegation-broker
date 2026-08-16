@@ -298,7 +298,7 @@ function usageFrom(value) {
   // child-facing frame until that schema is widened deliberately.
   const cacheRead = nonNegativeInteger(value.cache_read_input_tokens ?? 0, "usage.cache_read_input_tokens");
   const cacheWrite = nonNegativeInteger(value.cache_creation_input_tokens ?? 0, "usage.cache_creation_input_tokens");
-  return { input, output, cacheRead, cacheWrite, costMicros: 0 };
+  return { input, output, cacheRead, cacheWrite };
 }
 
 function mergeUsage(previous, next) {
@@ -308,7 +308,6 @@ function mergeUsage(previous, next) {
     output: Math.max(previous.output, next.output),
     cacheRead: Math.max(previous.cacheRead, next.cacheRead),
     cacheWrite: Math.max(previous.cacheWrite, next.cacheWrite),
-    costMicros: 0,
   };
 }
 
@@ -502,7 +501,7 @@ export class AnthropicMessagesTransport {
       yield { type: "terminal", outcome: "stream_truncated", payload: headerPayload };
       return;
     }
-    const finalUsage = usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costMicros: 0 };
+    const finalUsage = usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
     yield { type: "usage", payload: finalUsage };
     if (stopReason === "max_tokens") {
       yield { type: "terminal", outcome: "unknown_finish", payload: { ...headerPayload, finishReason: stopReason, usage: finalUsage } };

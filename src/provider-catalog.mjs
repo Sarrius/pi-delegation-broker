@@ -36,7 +36,6 @@ const MAX_MODELS_PER_PROVIDER = 4_096;
  *     maxTokens: number,
  *     reasoning: boolean,
  *     input: string[],          // ["text"] or ["text", "image"]
- *     cost: { input, output, cacheRead, cacheWrite },
  *     thinkingLevelMap?: object,
  *   }]
  * }
@@ -82,7 +81,6 @@ function validateCatalogProvider(entry, index) {
       maxTokens: model.maxTokens,
       reasoning: model.reasoning !== false,
       input: Array.isArray(model.input) ? Object.freeze([...model.input]) : Object.freeze(["text"]),
-      cost: model.cost && typeof model.cost === "object" ? Object.freeze({ ...model.cost }) : Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }),
       ...(model.thinkingLevelMap && typeof model.thinkingLevelMap === "object" ? { thinkingLevelMap: Object.freeze({ ...model.thinkingLevelMap }) } : {}),
     })),
   };
@@ -114,13 +112,6 @@ export function deriveModelSupports(model) {
  */
 export function capabilityTierId(supports) {
   return `caps/${[...supports].sort().join(".")}/v1`;
-}
-
-/** Scalar ranking hint; the catalog's per-dimension rates are not comparable as-is. */
-function costHint(cost) {
-  const input = Number.isFinite(cost?.input) ? cost.input : 0;
-  const output = Number.isFinite(cost?.output) ? cost.output : 0;
-  return input + output;
 }
 
 /**
@@ -185,13 +176,12 @@ export function catalogToBrokerRegistry(catalog, options = {}) {
         capacityGroup: groupId,
         profile: profileId,
         confidence,
-        enforcement: Object.freeze({ input: "hard", output: "hard", cost: "metered_best_effort" }),
+        enforcement: Object.freeze({ input: "hard", output: "hard" }),
         model: Object.freeze({ provider: entry.provider, modelId: model.id }),
         catalog: Object.freeze({
           name: model.name,
           contextWindow: model.contextWindow,
           maxTokens: model.maxTokens,
-          costHint: costHint(model.cost),
         }),
       });
     }
@@ -220,7 +210,6 @@ export function fixtureCatalog(entries = [
       maxTokens: 32_000,
       reasoning: true,
       input: ["text", "image"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     }],
   },
   {
@@ -234,7 +223,6 @@ export function fixtureCatalog(entries = [
       maxTokens: 128_000,
       reasoning: true,
       input: ["text"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     }],
   },
 ]) {

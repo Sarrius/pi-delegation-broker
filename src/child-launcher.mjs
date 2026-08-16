@@ -105,7 +105,9 @@ class RpcChildSession {
   #rpc;
   #listeners = new Set();
   #latestAssistant;
-  #usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+  // Controller-owned efficiency observes consumable tokens/latency/attempts, never provider
+  // price estimates: subscription routes have no truthful per-turn monetary value.
+  #usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0 };
   #sessionFile;
   #turn;
   #exitError;
@@ -230,12 +232,10 @@ class RpcChildSession {
         this.#latestAssistant = event.message;
         if (event.type === "message_end") {
           const u = isRecord(event.message.usage) ? event.message.usage : {};
-          const c = isRecord(u.cost) ? u.cost : {};
           if (typeof u.input === "number") this.#usage.input += u.input;
           if (typeof u.output === "number") this.#usage.output += u.output;
           if (typeof u.cacheRead === "number") this.#usage.cacheRead += u.cacheRead;
           if (typeof u.cacheWrite === "number") this.#usage.cacheWrite += u.cacheWrite;
-          if (typeof c.total === "number") this.#usage.cost += c.total;
           this.#usage.turns += 1;
         }
       }

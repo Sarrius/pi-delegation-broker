@@ -91,7 +91,7 @@ export function createEffectiveChildCapability(input) {
 function validateBudget(budget) {
   if (!budget || typeof budget !== "object") throw new Error("budget must be an object");
   for (const key of Object.keys(budget)) {
-    if (!["maxOutputTokens", "maxInputTokens", "maxCostMicros", "enforcement"].includes(key)) {
+    if (!["maxOutputTokens", "maxInputTokens", "enforcement"].includes(key)) {
       throw new Error(`unknown budget field: ${key}`);
     }
   }
@@ -104,19 +104,14 @@ function validateBudget(budget) {
     if (!Number.isSafeInteger(budget.maxInputTokens) || budget.maxInputTokens < 1) throw new Error("maxInputTokens must be a positive safe integer");
     result.maxInputTokens = budget.maxInputTokens;
   }
-  if (budget.maxCostMicros !== undefined) {
-    if (!Number.isSafeInteger(budget.maxCostMicros) || budget.maxCostMicros < 0) throw new Error("maxCostMicros must be a non-negative safe integer");
-    result.maxCostMicros = budget.maxCostMicros;
-  }
   if (budget.enforcement !== undefined) {
     if (!budget.enforcement || typeof budget.enforcement !== "object") throw new Error("enforcement must be an object");
     for (const key of Object.keys(budget.enforcement)) {
-      if (!["input", "output", "cost"].includes(key)) throw new Error(`unknown enforcement field: ${key}`);
+      if (!["input", "output"].includes(key)) throw new Error(`unknown enforcement field: ${key}`);
     }
     result.enforcement = Object.freeze({
       input: budget.enforcement.input,
       output: budget.enforcement.output,
-      cost: budget.enforcement.cost,
     });
   }
   return Object.freeze(result);
@@ -148,9 +143,8 @@ export function compileEffectiveChildCapability(cap) {
   ];
   if (cap.budget.maxOutputTokens !== undefined) lines.push(`max_output_tokens: ${cap.budget.maxOutputTokens}`);
   if (cap.budget.maxInputTokens !== undefined) lines.push(`max_input_tokens: ${cap.budget.maxInputTokens}`);
-  if (cap.budget.maxCostMicros !== undefined) lines.push(`max_cost_micros: ${cap.budget.maxCostMicros}`);
   if (cap.budget.enforcement) {
-    lines.push(`budget_enforcement: input=${cap.budget.enforcement.input} output=${cap.budget.enforcement.output} cost=${cap.budget.enforcement.cost}`);
+    lines.push(`budget_enforcement: input=${cap.budget.enforcement.input} output=${cap.budget.enforcement.output}`);
   }
   if (effectCapable) {
     lines.push(`behavioral_enforcement: ${cap.behavioralEnforcement}`);

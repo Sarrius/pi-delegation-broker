@@ -25,7 +25,7 @@ async function reserveCapability(server, taskId, maxOutputTokens = 100, contract
         budget: {
           maxInputTokens: 1_000,
           maxOutputTokens,
-          enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" },
+          enforcement: { input: "hard", output: "hard" },
         },
         ...contractOverrides,
       }),
@@ -122,7 +122,7 @@ test("scripted fake provider reports only classified outcomes and enforces a har
       socketPath: server.socketPath,
       authorization: server.controllerToken,
       method: "configureFakeProvider",
-      params: { taskId: "success", events: [{ type: "succeeded", resultRef: "result-1", usage: { input: 3, output: 7, costMicros: 2 } }] },
+      params: { taskId: "success", events: [{ type: "succeeded", resultRef: "result-1", usage: { input: 3, output: 7 } }] },
     });
     const success = await reserveCapability(server, "success", 10);
     const completed = await requestBrokerIpc({
@@ -131,14 +131,14 @@ test("scripted fake provider reports only classified outcomes and enforces a har
       method: "providerAttempt",
       params: { inputDigest: digest },
     });
-    assert.deepEqual(completed, { status: "succeeded", resultRef: "result-1", usage: { input: 3, output: 7, costMicros: 2 } });
+    assert.deepEqual(completed, { status: "succeeded", resultRef: "result-1", usage: { input: 3, output: 7 } });
     await requestBrokerIpc({ socketPath: server.socketPath, authorization: success.issued.capability, method: "release" });
 
     await requestBrokerIpc({
       socketPath: server.socketPath,
       authorization: server.controllerToken,
       method: "configureFakeProvider",
-      params: { taskId: "over-cap", events: [{ type: "succeeded", resultRef: "result-2", usage: { input: 1, output: 11, costMicros: 0 } }] },
+      params: { taskId: "over-cap", events: [{ type: "succeeded", resultRef: "result-2", usage: { input: 1, output: 11 } }] },
     });
     const overCap = await reserveCapability(server, "over-cap", 10);
     const stopped = await requestBrokerIpc({
@@ -173,7 +173,7 @@ test("aborting a delayed fake IPC attempt consumes no outcome or telemetry", asy
       method: "configureFakeProvider",
       params: {
         taskId: "abort-before-effect",
-        events: [{ type: "succeeded", resultRef: "still-pending", delayMs: 500, usage: { input: 1, output: 1, costMicros: 0 } }],
+        events: [{ type: "succeeded", resultRef: "still-pending", delayMs: 500, usage: { input: 1, output: 1 } }],
       },
     });
     const { issued } = await reserveCapability(server, "abort-before-effect");
@@ -217,7 +217,7 @@ test("a fake result arriving after lease TTL is not recorded or returned", async
       method: "configureFakeProvider",
       params: {
         taskId: "expire-during-attempt",
-        events: [{ type: "succeeded", resultRef: "late-must-not-return", delayMs: 350, usage: { input: 1, output: 1, costMicros: 0 } }],
+        events: [{ type: "succeeded", resultRef: "late-must-not-return", delayMs: 350, usage: { input: 1, output: 1 } }],
       },
     });
     const { issued } = await reserveCapability(server, "expire-during-attempt", 100, { leaseTtlMs: 200 });

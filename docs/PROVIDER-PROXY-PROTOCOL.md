@@ -47,12 +47,11 @@ Before any provider I/O the controller creates and retains an `AttemptRouteSnaps
   "deadlineAt": 0,
   "maxInputBytes": 0,
   "maxOutputBytes": 0,
-  "maxOutputTokens": 0,
-  "maxCostMicros": 0
+  "maxOutputTokens": 0
 }
 ```
 
-All route facts and the credential are resolved from one generation. `ControllerCredentialStore` resolves one opaque credential reference only when its snapshot fingerprint matches; `ControllerRouteTable` resolves one credential-free HTTPS endpoint only when every snapshot route fact matches. Configuration reload affects only later attempts. A named credential miss fails before send; the adapter may not fall through to ambient environment, keychain, OAuth account, or provider-native discovery. `ControllerLiveProviderApproval` is consumed before credential lookup/send and is bounded by route-table generation, expiry and request count. Cache retention is a route fact, not an ambient `PI_CACHE_RETENTION` setting: `none`, `short`, and `long` are frozen into the attempt snapshot so a concurrent setting change cannot alter its context-cost semantics.
+All route facts and the credential are resolved from one generation. `ControllerCredentialStore` resolves one opaque credential reference only when its snapshot fingerprint matches; `ControllerRouteTable` resolves one credential-free HTTPS endpoint only when every snapshot route fact matches. Configuration reload affects only later attempts. A named credential miss fails before send; the adapter may not fall through to ambient environment, keychain, OAuth account, or provider-native discovery. `ControllerLiveProviderApproval` is consumed before credential lookup/send and is bounded by route-table generation, expiry and request count. Cache retention is a route fact, not an ambient `PI_CACHE_RETENTION` setting: `none`, `short`, and `long` are frozen into the attempt snapshot so a concurrent setting change cannot alter its context-retention semantics.
 
 The attempt handle is one-shot. Once admitted into controller middleware it cannot be dispatched again. Recovery creates a new `attemptId`; it never reuses a capability whose send status became ambiguous.
 
@@ -189,7 +188,7 @@ Two clocks are mandatory:
 - idle/no-activity watchdog;
 - immutable absolute lease/deadline/latency budget.
 
-Provider keepalive comments may pulse idle time but never extend the absolute deadline, lease TTL, token/cost cap, or controller cancellation.
+Provider keepalive comments may pulse idle time but never extend the absolute deadline, lease TTL, token cap, or controller cancellation.
 
 ## Backpressure and evidence
 
@@ -202,7 +201,7 @@ Bound independently:
 - open block count and tool-argument bytes;
 - socket pending-write bytes;
 - pending artifact/ledger side work;
-- output tokens and cost.
+- output tokens.
 
 Keep four forms separate: canonical provider value, bounded child/model projection, redacted ledger projection, and retained full artifact. Framing/locator bytes count inside caps. Required evidence work reaches quiescence before `terminal_persisted`; under a hard cap, spill/projection failure fails closed rather than returning the oversized original.
 
@@ -226,7 +225,7 @@ SDK retries are pinned to zero and verified at the physical transport mock. Pi, 
 10. child disconnect before send and after send;
 11. lease expiry during credential resolution, middleware, headers, and stream;
 12. idle timeout versus keepalive under a shorter absolute deadline;
-13. output/token/cost crossing before and at terminal;
+13. output/token crossing before and at terminal;
 14. bounded slow consumer and bounded slow artifact store;
 15. evidence failure after provider success without false provider-health mutation;
 16. 429 with valid/invalid/past/oversized `Retry-After`;

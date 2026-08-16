@@ -69,22 +69,20 @@ test("an effect-capable task never lands on the weakest class and is budgeted in
   assert.ok(selected.contract.capability.required.includes("code_reasoning"), "effect work reasons about what it changes");
   // Consumption is hard because the controller can actually enforce it. There is no money
   // dimension at all: the broker never observes spend, so it does not pretend to bound it.
-  assert.deepEqual(selected.contract.budget.enforcement, { input: "hard", output: "hard", cost: "metered_best_effort" });
+  assert.deepEqual(selected.contract.budget.enforcement, { input: "hard", output: "hard" });
   assert.equal(selected.contract.budget.maxCostMicros, undefined);
 });
 
-test("a caller that genuinely needs a hard money cap still gets one", () => {
+test("a monetary cap is rejected rather than becoming a fictional controller guarantee", () => {
   const registry = registryOf([account("solo")]);
-  const selected = selectModelForTask({
+  assert.throws(() => selectModelForTask({
     taskDescription: "apply the patch to the repository",
     registry,
     constraints: baseConstraints({
       operationClass: "apply",
-      budget: { maxInputTokens: 1_000, maxOutputTokens: 100, maxCostMicros: 5_000, enforcement: { input: "hard", output: "hard", cost: "hard" } },
+      budget: { maxInputTokens: 1_000, maxOutputTokens: 100, maxCostMicros: 5_000, enforcement: { input: "hard", output: "hard" } },
     }),
-  });
-  assert.equal(selected.action, "allow");
-  assert.equal(selected.contract.budget.enforcement.cost, "hard");
+  }), /money budgets are not supported/);
 });
 
 test("explicit controller capabilities override anything derived from the description", () => {
@@ -93,10 +91,10 @@ test("explicit controller capabilities override anything derived from the descri
 });
 
 // ---------------------------------------------------------------------------
-// Stage 4: cheapest sufficient, and the escalation that overrides it
+// Stage 4: closest sufficient quality class, and the escalation that overrides it
 // ---------------------------------------------------------------------------
 
-test("with eight accounts alive a simple task takes the cheapest class, not the strongest", () => {
+test("with eight accounts alive a simple task takes the closest sufficient class, not the strongest", () => {
   const registry = registryOf(Array.from({ length: 8 }, (_, index) => account(`acct-${index}`)));
   const selected = selectModelForTask({
     taskDescription: "read this file and tell me what it says",
@@ -163,7 +161,7 @@ test("hard-budget work refuses assumed inventory the way the broker does", () =>
 // Stage 4: choosing among equals
 // ---------------------------------------------------------------------------
 
-test("a measured account outranks a cheaper assumed one", () => {
+test("a measured account outranks an otherwise equivalent observed one", () => {
   const registry = {
     profiles: { "caps/text_generation/v1": { status: "approved", supports: ["text_generation"] } },
     capacityGroups: {
@@ -171,17 +169,16 @@ test("a measured account outranks a cheaper assumed one", () => {
       "G-known": { maxConcurrent: 2, admission: { controlReserve: 1, verifyReserve: 0 }, cooldown: { defaultMs: 1_000, probeIntervalMs: 100 }, confidence: "measured" },
     },
     resources: {
-      "cheap/m": { capacityGroup: "G-cheap", profile: "caps/text_generation/v1", confidence: "observed", enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" }, model: { provider: "cheap", modelId: "m" }, catalog: { costHint: 1 } },
-      "known/m": { capacityGroup: "G-known", profile: "caps/text_generation/v1", confidence: "measured", enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" }, model: { provider: "known", modelId: "m" }, catalog: { costHint: 50 } },
+      "cheap/m": { capacityGroup: "G-cheap", profile: "caps/text_generation/v1", confidence: "observed", enforcement: { input: "hard", output: "hard" }, model: { provider: "cheap", modelId: "m" } },
+      "known/m": { capacityGroup: "G-known", profile: "caps/text_generation/v1", confidence: "measured", enforcement: { input: "hard", output: "hard" }, model: { provider: "known", modelId: "m" } },
     },
   };
   const selected = selectModelForTask({ taskDescription: "read a file", registry, constraints: baseConstraints() });
-  assert.equal(selected.selection.resourceId, "known/m", "an unmet cap costs more than the saving");
+  assert.equal(selected.selection.resourceId, "known/m", "measured availability is stronger evidence than an unobserved peer");
 });
 
-test("among equally known accounts the cheaper model wins", () => {
+test("among equally known accounts cold start is deterministic without a price table", () => {
   const registry = registryOf([account("a", { mid: false, strong: false }), account("b", { mid: false, strong: false })]);
-  registry.resources["b/weak"].catalog.costHint; // both derive from cost, a is cheaper by id tiebreak
   const selected = selectModelForTask({ taskDescription: "read a file", registry, constraints: baseConstraints() });
   assert.equal(selected.selection.resourceId, "a/weak");
 });

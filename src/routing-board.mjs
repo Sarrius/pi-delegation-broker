@@ -51,7 +51,7 @@ function boardKey(resourceId, capability) {
  * outcomes per (resource, capability) pair and derives routing scores.
  */
 export class RoutingBoard {
-  #observations = new Map(); // boardKey → { accepted, rejected, error, latencies, costs, rolling: [], allTime: {n, accepted} }
+  #observations = new Map(); // boardKey → { accepted, rejected, error, latencies, rolling: [], allTime: {n, accepted} }
   #config;
 
   constructor({
@@ -102,16 +102,13 @@ export class RoutingBoard {
    * evidenceKind are counted toward routing. All timestamps must be
    * non-decreasing (monotonic clock).
    */
-  record({ resourceId, capability, taskClass, outcome, evidenceKind, latencyMs, costMicros, timestamp }) {
+  record({ resourceId, capability, taskClass, outcome, evidenceKind, latencyMs, timestamp }) {
     if (typeof resourceId !== "string" || !resourceId) throw new Error("board record requires resourceId");
     if (typeof capability !== "string" || !capability) throw new Error("board record requires capability");
     if (!OUTCOMES.has(outcome)) throw new Error(`board record outcome must be one of: ${[...OUTCOMES].join(", ")}`);
     if (!EVIDENCE_KINDS.has(evidenceKind)) throw new Error(`board record evidenceKind must be machine-verifiable: ${[...EVIDENCE_KINDS].join(", ")}`);
     if (!Number.isSafeInteger(latencyMs) || latencyMs < 0) throw new Error("board record latencyMs must be a non-negative integer");
     if (!Number.isSafeInteger(timestamp) || timestamp < 0) throw new Error("board record timestamp must be a non-negative integer");
-    if (costMicros !== undefined && (!Number.isSafeInteger(costMicros) || costMicros < 0)) {
-      throw new Error("board record costMicros must be a non-negative integer or undefined");
-    }
 
     const key = boardKey(resourceId, capability);
     let entry = this.#observations.get(key);
@@ -125,7 +122,6 @@ export class RoutingBoard {
         allTime: { n: 0, accepted: 0, rejected: 0, error: 0 },
         rolling: [],
         latencies: [],
-        costs: [],
         consecutiveFailures: 0,
         lastObservedAt: 0,
       };
@@ -144,7 +140,6 @@ export class RoutingBoard {
       entry.consecutiveFailures += 1;
     }
     entry.latencies.push(latencyMs);
-    if (costMicros !== undefined) entry.costs.push(costMicros);
     entry.rolling.push({ outcome, timestamp });
     if (entry.rolling.length > this.#config.rollingWindowSize) {
       entry.rolling.shift();
@@ -220,9 +215,6 @@ export class RoutingBoard {
       recencyFactor,
       p50LatencyMs: percentile(entry.latencies, 0.5),
       p95LatencyMs: percentile(entry.latencies, 0.95),
-      avgCostMicros: entry.costs.length > 0
-        ? Math.round(entry.costs.reduce((a, b) => a + b, 0) / entry.costs.length)
-        : null,
       lastObservedAt: entry.lastObservedAt,
     });
   }
@@ -278,7 +270,6 @@ export class RoutingBoard {
         allTime: { ...entry.allTime },
         rolling: [...entry.rolling],
         latencies: [...entry.latencies],
-        costs: [...entry.costs],
         consecutiveFailures: entry.consecutiveFailures,
         lastObservedAt: entry.lastObservedAt,
       };
@@ -308,7 +299,6 @@ export class RoutingBoard {
           allTime: { ...entry.allTime },
           rolling: [...entry.rolling],
           latencies: [...entry.latencies],
-          costs: [...entry.costs],
           consecutiveFailures: entry.consecutiveFailures ?? 0,
           lastObservedAt: entry.lastObservedAt ?? 0,
         });

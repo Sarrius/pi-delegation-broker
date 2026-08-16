@@ -31,6 +31,7 @@ import { fileURLToPath } from "node:url";
 import {
   BrokeredChildRunner,
   BrokeredLaunchResolver,
+  addModelPreference,
   ControllerAcceptanceVerifier,
   ControllerEvidenceStore,
   ControllerQueuedTaskVerifier,
@@ -45,12 +46,14 @@ import {
   createControllerVerifierRunId,
   DEFAULT_MODEL_PREFERENCES,
   loadModelPreferences,
+  qualityForModel,
   parseResourceModel,
   probeProviderModels,
   readProviderRegistry,
   writeModelPreferences,
   signedRegistryMessage,
   requestBrokerIpc,
+  removeModelPreference,
   verifyProposedPatch,
   writeScopedChildAuth,
   // @ts-expect-error — resolved relative to this file's real location
@@ -110,6 +113,64 @@ interface BrokerRuntime {
   runner: any;
   acceptancePlans: Map<string, Array<{ id: string; claim: string; argv: string[]; timeoutMs: number }>>;
   stopCurrencyRefresh: () => void;
+  lastRoute?: { summary: string; at: number };
+}
+
+function formatPreferences(tier: string) {
+  const preferences = loadModelPreferences(PREFERENCES_PATH);
+  const entries = preferences.tiers[tier as "frontier" | "standard" | "cheap"];
+  return entries.length
+    ? entries.map((entry) => `${entry.model} via ${entry.via.join(", ")}`).join("\n")
+    : `(no explicit ${tier} preferences; controller auto-selection applies)`;
+}
+
+function explainRoute(result: any) {
+  const selection = result?.selection ?? {};
+  const spent = result?.resource?.id ?? (result?.resolved?.provider && result?.resolved?.modelId ? `${result.resolved.provider}/${result.resolved.modelId}` : "unknown");
+  const hops = Array.isArray(result?.route) ? result.route : [];
+  const prior = hops.slice(0, -1).map((hop: any) => `${hop.resourceId ?? "unknown"}:${hop.outcome}`).join(", ");
+  const fields = [
+    `tier=${selection.modelTier ?? "unknown"}`,
+    `source=${selection.preferenceSource ?? "unknown"}`,
+    `leased=${spent}`,
+    `candidates=${selection.candidateCount ?? "unknown"}`,
+  ];
+  if (selection.legacyExcluded === true) fields.push("legacy=current policy excluded legacy candidates");
+  if (selection.legacyFallback === true) fields.push("legacy=emergency fallback");
+  if (prior) fields.push(`failover=${prior}`);
+  return fields.join("; ");
+}
+
+function formatModels(registry: any, inventory: any[] | undefined, providerFilter?: string) {
+  const health = new Map((inventory ?? []).map((row: any) => [row.resourceId, row]));
+  const resources = Object.entries(registry?.resources ?? {}).map(([resourceId, resource]: [string, any]) => {
+    const model = resource?.model ?? parseResourceModel(resourceId);
+    const live = health.get(resourceId);
+    return { resourceId, model, live };
+  }).filter((entry) => !providerFilter || entry.model?.provider === providerFilter);
+  if (providerFilter) {
+    const lines = resources.slice(0, 80).map(({ resourceId, model, live }) => {
+      const quality = model ? qualityForModel(model) ?? "unrated" : "unknown";
+      const state = live ? `${live.state}/${live.breakerState}${live.groupCooldownUntil > Date.now() ? " cooldown" : ""}` : "catalog-only";
+      return `${resourceId} | ${quality} | ${state} | ${live ? `${live.activeLeases}/${live.maxConcurrent}` : "-"}`;
+    });
+    return lines.length ? `${providerFilter}:\n${lines.join("\n")}${resources.length > lines.length ? `\n… ${resources.length - lines.length} more` : ""}` : `No catalog resources for provider ${providerFilter}.`;
+  }
+  const summary = new Map<string, { total: number; healthy: number; cooling: number; quality: Record<string, number> }>();
+  for (const { model, live } of resources) {
+    const provider = model?.provider ?? "unknown";
+    const entry = summary.get(provider) ?? { total: 0, healthy: 0, cooling: 0, quality: {} };
+    entry.total += 1;
+    if (live?.state === "healthy" && live?.breakerState === "healthy") entry.healthy += 1;
+    if (live?.breakerState === "cooling_down" || live?.state !== "healthy") entry.cooling += 1;
+    const quality = model ? qualityForModel(model) ?? "unrated" : "unknown";
+    entry.quality[quality] = (entry.quality[quality] ?? 0) + 1;
+    summary.set(provider, entry);
+  }
+  return [...summary.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([provider, entry]) => {
+    const qualities = Object.entries(entry.quality).sort(([left], [right]) => left.localeCompare(right)).map(([quality, count]) => `${quality}:${count}`).join(", ");
+    return `${provider}: ${entry.total} models; healthy ${entry.healthy}; cooling/unavailable ${entry.cooling}; ${qualities}`;
+  }).join("\n") || "No catalog resources available.";
 }
 
 function runControllerArgv(argv: string[], cwd: string, signal: AbortSignal): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -239,7 +300,9 @@ async function startBroker(): Promise<BrokerRuntime> {
       if (!routingObservation) return { status: "not_recorded" };
       return verifiedRouting.recordFinalized({ taskId, leaseId, fencingToken, verification, outcome,
         resourceId: routingObservation.resourceId, capabilities: routingObservation.capabilities,
-        latencyMs: routingObservation.latencyMs });
+        latencyMs: routingObservation.latencyMs,
+        ...(routingObservation.tokens === undefined ? {} : { tokens: routingObservation.tokens }),
+        ...(routingObservation.attempts === undefined ? {} : { attempts: routingObservation.attempts }) });
     },
   });
 
@@ -319,6 +382,7 @@ async function startBroker(): Promise<BrokerRuntime> {
     runner,
     acceptancePlans,
     stopCurrencyRefresh: () => clearInterval(currencyTimer),
+    lastRoute: undefined,
   };
 }
 
@@ -351,9 +415,10 @@ export default function piDelegationBroker(pi: any) {
   });
 
   pi.registerCommand("delegation-broker", {
-    description: "Control the delegation broker: /delegation-broker start|stop|status",
+    description: "Control delegation: start|stop|status|models [provider]|tier <frontier|standard|cheap> <list|add|remove>",
     handler: async (args: string, ctx: any) => {
-      const action = args.trim().toLowerCase();
+      const tokens = args.trim().split(/\s+/).filter(Boolean);
+      const action = (tokens[0] ?? "").toLowerCase();
       if (action === "start") {
         enabled = true;
         writeEnabled(true);
@@ -370,10 +435,55 @@ export default function piDelegationBroker(pi: any) {
       if (action === "status") {
         const preferences = loadModelPreferences(PREFERENCES_PATH);
         const state = runtime ? runtime.supervisor.status().state : "not_started";
-        ctx.ui.notify(`Delegation broker: ${enabled ? "enabled" : "stopped"}; runtime: ${state}; frontier preferences: ${preferences.tiers.frontier.length}; standard: ${preferences.tiers.standard.length}; cheap: ${preferences.tiers.cheap.length}`, "info");
+        const last = runtime?.lastRoute ? ` Last route: ${runtime.lastRoute.summary}` : "";
+        ctx.ui.notify(`Delegation broker: ${enabled ? "enabled" : "stopped"}; runtime: ${state}; frontier preferences: ${preferences.tiers.frontier.length}; standard: ${preferences.tiers.standard.length}; cheap: ${preferences.tiers.cheap.length}.${last} Use /delegation-broker models [provider] or tier <tier> <list|add|remove>.`, "info");
         return;
       }
-      ctx.ui.notify("Usage: /delegation-broker start|stop|status", "warning");
+      if (action === "models") {
+        const provider = tokens[1];
+        const active = runtime;
+        const catalog = active?.supervisor.providerWatcher?.currentRegistry?.() ?? readProviderRegistry(PARENT_AGENT_DIR);
+        const inventory = active ? active.supervisor.inventory() : undefined;
+        const prefix = active ? "Live broker inventory" : "Catalog only (broker is not running)";
+        ctx.ui.notify(`${prefix}:\n${formatModels(catalog, inventory, provider)}`, "info");
+        return;
+      }
+      if (action === "tier") {
+        const tier = tokens[1];
+        const verb = tokens[2]?.toLowerCase();
+        if (!tier || !verb || !["frontier", "standard", "cheap"].includes(tier)) {
+          ctx.ui.notify("Usage: /delegation-broker tier <frontier|standard|cheap> <list|add|remove> [model] [provider ...]", "warning");
+          return;
+        }
+        if (verb === "list") {
+          ctx.ui.notify(`${tier} preferences:\n${formatPreferences(tier)}`, "info");
+          return;
+        }
+        const model = tokens[3];
+        const via = tokens.slice(4);
+        try {
+          if (verb === "add") {
+            if (!model || via.length === 0) throw new Error("add requires a model and at least one provider pattern");
+            const updated = addModelPreference(loadModelPreferences(PREFERENCES_PATH), { tier, model, via });
+            writeModelPreferences(PREFERENCES_PATH, updated);
+            ctx.ui.notify(`Saved ${tier} preference: ${model} via ${via.join(", ")}.`, "info");
+            return;
+          }
+          if (verb === "remove") {
+            if (!model) throw new Error("remove requires a model; omit providers to remove the model completely");
+            const updated = removeModelPreference(loadModelPreferences(PREFERENCES_PATH), { tier, model, ...(via.length ? { via } : {}) });
+            writeModelPreferences(PREFERENCES_PATH, updated);
+            ctx.ui.notify(`Updated ${tier} preferences: removed ${model}${via.length ? ` via ${via.join(", ")}` : ""}.`, "info");
+            return;
+          }
+        } catch (error) {
+          ctx.ui.notify(`Preference update rejected: ${(error as Error).message}`, "error");
+          return;
+        }
+        ctx.ui.notify("Usage: /delegation-broker tier <tier> list | add <model> <provider...> | remove <model> [provider...]", "warning");
+        return;
+      }
+      ctx.ui.notify("Usage: /delegation-broker start|stop|status|models [provider]|tier <tier> <list|add|remove>", "warning");
     },
   });
 
@@ -382,7 +492,7 @@ export default function piDelegationBroker(pi: any) {
     label: "Delegate subtask",
     description:
       "Delegate a self-contained subtask to an isolated brokered child agent. "
-      + "The broker selects the cheapest sufficient model/account, spawns an isolated Pi child with only that account's credential, "
+      + "The broker selects a current, quality-sufficient model/account and learns efficiency only from controller-verified outcomes, then spawns an isolated Pi child with only that account's credential, "
       + "and retries on another account if the provider throttles mid-task. Returns the child's final answer.",
     promptSnippet: "Delegate a self-contained subtask to an isolated brokered child agent",
     promptGuidelines: [
@@ -441,6 +551,8 @@ export default function piDelegationBroker(pi: any) {
       const route = (result.route ?? [])
         .map((hop: any) => `${hop.outcome}${hop.resourceId ? ` ${hop.resourceId}` : ""}`)
         .join(" → ");
+      const routeExplanation = explainRoute(result);
+      broker.lastRoute = { summary: routeExplanation, at: Date.now() };
 
       if (result.status === "completed" && params.proposeChangesIn) {
         onUpdate?.({ content: [{ type: "text", text: "Verifying the proposed patch in a controller-owned scratch tree…" }] });
@@ -454,18 +566,18 @@ export default function piDelegationBroker(pi: any) {
         const summary = receipt.checks.map((entry: any) => `${entry.ok ? "pass" : `fail(${entry.exitCode})`} ${entry.id}`).join(", ");
         if (!receipt.verified) {
           return {
-            content: [{ type: "text", text: `Proposed change rejected by controller verification (${receipt.reason}).${summary ? `\nChecks: ${summary}` : ""}\nRoute: ${route}` }],
+            content: [{ type: "text", text: `Proposed change rejected by controller verification (${receipt.reason}).${summary ? `\nChecks: ${summary}` : ""}\nRoute: ${route}\nSelection: ${routeExplanation}` }],
             isError: true,
-            details: { route, receipt },
+            details: { route, routeExplanation, receipt },
           };
         }
         return {
           content: [{
             type: "text",
             text: `Controller-verified patch against ${receipt.baseCommit.slice(0, 12)} — NOT applied to ${params.proposeChangesIn}.\n`
-              + `Files: ${receipt.changed.join(", ")}\nChecks: ${summary}\nRoute: ${route}\n\n${result.patch}`,
+              + `Files: ${receipt.changed.join(", ")}\nChecks: ${summary}\nRoute: ${route}\nSelection: ${routeExplanation}\n\n${result.patch}`,
           }],
-          details: { route, receipt, patch: result.patch, applied: false },
+          details: { route, routeExplanation, receipt, patch: result.patch, applied: false },
         };
       }
 
@@ -473,16 +585,16 @@ export default function piDelegationBroker(pi: any) {
         const usage = result.usage ? ` (${result.usage.input} in / ${result.usage.output} out)` : "";
         return {
           content: [{ type: "text", text: result.text }],
-          details: { route, usage: result.usage, note: `Completed via ${route}${usage}` },
+          details: { route, routeExplanation, usage: result.usage, note: `Completed via ${route}${usage}; ${routeExplanation}` },
         };
       }
       return {
         content: [{
           type: "text",
-          text: `Delegation failed after ${(result.route ?? []).length} attempt(s): ${result.error ?? "unknown error"}${route ? `\nRoute: ${route}` : ""}`,
+          text: `Delegation failed after ${(result.route ?? []).length} attempt(s): ${result.error ?? "unknown error"}${route ? `\nRoute: ${route}` : ""}\nSelection: ${routeExplanation}`,
         }],
         isError: true,
-        details: { route },
+        details: { route, routeExplanation },
       };
     },
   });

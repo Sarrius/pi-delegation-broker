@@ -35,7 +35,6 @@ async function issueBoundCapability(server, taskId) {
     budget: {
       maxInputTokens: lease.maxInputTokens,
       maxOutputTokens: lease.maxOutputTokens,
-      ...(lease.maxCostMicros === undefined ? {} : { maxCostMicros: lease.maxCostMicros }),
       enforcement: lease.enforcement,
     },
     latencyBudgetMs: contract.latencyBudgetMs,

@@ -37,9 +37,11 @@ test("a verified routing bridge writes an affinity only after receipt/outcome va
     const bridge = new ControllerVerifiedRoutingBoard({ routingBoard: board, verificationAuthority: authority, affinityJournal: setup.journal, now: () => 3000 });
     assert.throws(() => bridge.recordFinalized({ taskId: "task-a", leaseId: "lease-a", fencingToken: 1, verification: { status: "accepted", token: "forged" }, outcome: { status: "completed" }, resourceId: "zai/glm-5.3", capabilities: CAPS, latencyMs: 10 }), /authentic/);
     assert.deepEqual(setup.journal.snapshot().observations, {}, "forged receipt changes nothing");
-    bridge.recordFinalized({ taskId: "task-a", leaseId: "lease-a", fencingToken: 1, verification: { status: "accepted", token: "valid" }, outcome: { status: "completed" }, resourceId: "zai/glm-5.3", capabilities: CAPS, latencyMs: 10 });
+    bridge.recordFinalized({ taskId: "task-a", leaseId: "lease-a", fencingToken: 1, verification: { status: "accepted", token: "valid" }, outcome: { status: "completed" }, resourceId: "zai/glm-5.3", capabilities: CAPS, latencyMs: 10, tokens: 321, attempts: 2 });
     assert.equal(records.length, CAPS.length, "the existing verified board also receives the observation");
-    assert.equal(Object.keys(setup.journal.snapshot().observations).length, 1);
+    const entry = Object.values(setup.journal.snapshot().observations)[0];
+    assert.equal(entry.tokenTotal, 321, "controller-observed token use reaches the learned efficiency journal");
+    assert.equal(entry.attemptTotal, 2, "the journal retains failover effort, not only final success");
   } finally { rmSync(setup.root, { recursive: true, force: true }); }
 });
 test("between equally reliable routes the more efficient one is preferred", () => {

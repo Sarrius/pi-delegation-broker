@@ -7,9 +7,11 @@ import { catalogToBrokerRegistry } from "../src/provider-catalog.mjs";
 import { selectModelForTask } from "../src/model-selector.mjs";
 import {
   DEFAULT_MODEL_PREFERENCES,
+  addModelPreference,
   loadModelPreferences,
   normalizeModelPreferences,
   preferenceMatches,
+  removeModelPreference,
   taskModelTier,
   writeModelPreferences,
 } from "../src/model-preferences.mjs";
@@ -58,6 +60,18 @@ test("task levels default from capability but caller may override", () => {
   assert.equal(taskModelTier({ effectCapable: false, capabilities: ["text_generation", "code_reasoning"] }), "standard");
   assert.equal(taskModelTier({ effectCapable: false, capabilities: ["text_generation", "large_context"] }), "frontier");
   assert.equal(taskModelTier({ effectCapable: false, capabilities: ["text_generation"] }, "frontier"), "frontier");
+});
+
+test("policy mutations merge provider routes and remove only what the user names", () => {
+  const seeded = normalizeModelPreferences({ schemaVersion: 1, tiers: { frontier: [], standard: [], cheap: [] } });
+  const withRoutes = addModelPreference(seeded, { tier: "standard", model: "glm-5.3", via: ["zai"] });
+  const merged = addModelPreference(withRoutes, { tier: "standard", model: "glm-5.3", via: ["opencode-go-api", "zai"] });
+  assert.deepEqual(merged.tiers.standard, [{ model: "glm-5.3", via: ["zai", "opencode-go-api"] }]);
+  const partial = removeModelPreference(merged, { tier: "standard", model: "glm-5.3", via: ["zai"] });
+  assert.deepEqual(partial.tiers.standard, [{ model: "glm-5.3", via: ["opencode-go-api"] }]);
+  const removed = removeModelPreference(partial, { tier: "standard", model: "glm-5.3" });
+  assert.deepEqual(removed.tiers.standard, []);
+  assert.throws(() => addModelPreference(seeded, { tier: "not-a-tier", model: "glm-5.3", via: ["zai"] }), /tier/);
 });
 
 test("preferences persist owner-side and reject invalid provider routes", () => {

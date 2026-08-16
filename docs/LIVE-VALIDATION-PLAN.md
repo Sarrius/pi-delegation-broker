@@ -30,9 +30,9 @@ For every case retain redacted controller evidence of route snapshot fingerprint
 
 ## Paired Pi utility experiment
 
-Only after the valid controller-owned arm above completes, pre-register a paired Pi experiment. Each pair uses the same read-only task, model/reasoning setting, fixed acceptance verifier, token/cost/latency budget and one physical attempt per arm:
+Only after the valid controller-owned arm above completes, pre-register a paired Pi experiment. Each pair uses the same read-only task, model/reasoning setting, fixed acceptance verifier, input/output-token and latency budget, and one physical attempt per arm:
 
 - **A:** isolated Pi child through the approved controller route.
 - **B:** baseline Pi configuration, with the same model/task and independently retained acceptance evidence.
 
-Report accepted outcomes, dispatch count, wall time, usage/cost, terminal taxonomy and confidence intervals; do not claim a rate from one pair. A Claude Code arm is outside this plan and remains deferred until A is a valid executable live arm.
+Report accepted outcomes, dispatch count, wall time, token usage, terminal taxonomy and confidence intervals; do not claim a rate from one pair. A Claude Code arm is outside this plan and remains deferred until A is a valid executable live arm.

@@ -12,9 +12,9 @@
  * - **Downward substitution is forbidden.** A class weaker than the task requires is never
  *   selected, even when it is the only thing left. A silently degraded result is worse than an
  *   honest denial.
- * - **Upward substitution is required.** When the cheapest sufficient class has no usable
- *   resource right now, the selector escalates to a stronger one rather than denying. Saving
- *   money is a preference; finishing the delegated work is the requirement.
+ * - **Upward substitution is required.** When the closest sufficient class has no usable
+ *   resource right now, the selector escalates to a stronger one rather than denying. A
+ *   verified result is the requirement; efficiency is learned from observed consumption.
  *
  * The selector is controller-only. It reads a registry snapshot and an optional live
  * availability snapshot; it never mutates either, never calls a provider, and never reaches a
@@ -150,9 +150,8 @@ function qualityFit(resource, id, modelTier) {
 }
 
 /**
- * Rank the usable resources of one capability class. Cheapest is not the first axis: a resource
- * whose behaviour has actually been measured beats a cheaper one that is only assumed, because
- * an unmet budget cap costs more than the saving.
+ * Rank the usable resources of one capability class. Observed availability precedes cold-start
+ * quality fit; once controller receipts exist, measured efficiency supplies the final ordering.
  */
 /**
  * Normalize the optional currency map (see provider-probe#buildCurrencyMap) into a lookup.
@@ -206,21 +205,22 @@ function candidateProfiles(registry, required) {
   return candidates.sort((left, right) => (left.extra - right.extra) || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
 }
 
-function buildBudget(constraints, effectCapable) {
+function buildBudget(constraints) {
   const budget = { ...DEFAULT_BUDGET, ...(constraints.budget ?? {}) };
   // Token consumption is enforceable: the controller caps input and clamps the child's output
   // request. Money is not — no provider exposes a synchronous spend ledger, and subscription
-  // accounts have no per-request price at all. Demanding hard cost for every effect-capable task
-  // asked resources for a guarantee none can honestly declare, which left the effect path
-  // unroutable on the real fleet. What actually protects an effect is the blocking behavioral
-  // monitor, pinned extension attestation, and controller verification of the result — all
-  // enforced elsewhere. A caller who genuinely needs a hard money cap still asks for one, and
-  // then only resources that truly declare hard cost enforcement match.
-  const enforcement = constraints.budget?.enforcement ?? { input: "hard", output: "hard", cost: "metered_best_effort" };
+  // accounts have no per-request price at all. The prior money cap asked resources for a
+  // guarantee none could honestly declare, which left the effect path unroutable on the real
+  // fleet. What protects an effect is the blocking behavioral monitor, pinned extension
+  // attestation, and controller verification of the result; efficiency is measured afterward
+  // from verified tokens, latency, and attempts.
+  if (Object.hasOwn(budget, "maxCostMicros") || Object.hasOwn(constraints.budget?.enforcement ?? {}, "cost")) {
+    throw new Error("money budgets are not supported; constrain input/output tokens and learn efficiency from verified outcomes");
+  }
+  const enforcement = constraints.budget?.enforcement ?? { input: "hard", output: "hard" };
   return Object.freeze({
     ...(Number.isSafeInteger(budget.maxInputTokens) ? { maxInputTokens: budget.maxInputTokens } : {}),
     ...(Number.isSafeInteger(budget.maxOutputTokens) ? { maxOutputTokens: budget.maxOutputTokens } : {}),
-    ...(Number.isSafeInteger(budget.maxCostMicros) ? { maxCostMicros: budget.maxCostMicros } : {}),
     enforcement: Object.freeze({ ...enforcement }),
   });
 }
@@ -230,7 +230,7 @@ function requiresHardBudget(budget) {
 }
 
 /**
- * Select the cheapest sufficient contract for a task.
+ * Select the closest sufficient quality contract for a task, then learn measured efficiency.
  *
  * Returns `{action:"allow", contract, expectedModel, selection, alternatives}` or
  * `{action:"deny", reason}`. `alternatives` lists the remaining ranked classes so a caller that
@@ -243,7 +243,7 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
   }
 
   const requirement = deriveTaskRequirement(taskDescription, constraints);
-  const budget = buildBudget(constraints, requirement.effectCapable);
+  const budget = buildBudget(constraints);
   const hardBudget = requiresHardBudget(budget);
   const live = availabilityIndex(availability);
   const currencyLookup = currencyIndex(currency);
@@ -269,7 +269,7 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         const identity = resource.model ?? parseResourceModel(id);
         if (userOnly && (!identity || !preferenceMatches(preferenceEntries, identity))) continue;
         // Empty user tiers mean controller auto mode, not "any model the aggregator happens
-        // to list". Require the researched quality floor before cost/ranking can participate.
+        // to list". Require the researched quality floor before efficiency ranking can participate.
         if (enforceQuality && !userOnly && (!identity || !meetsQualityFloor(identity, modelTier))) continue;
         const fact = currencyLookup.get(id);
         if (fact?.legacy === true) {
@@ -356,13 +356,16 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
       capacityGroup: preferred.capacityGroup,
       confidence: preferred.confidence,
       capabilities: requirement.capabilities,
-      // True whenever a stronger class was taken because the cheapest sufficient one had
+      // True whenever a stronger class was taken because the closest sufficient one had
       // nothing alive. Worth logging: it is the visible symptom of a shrinking provider set.
       escalated: chosen.supports.length > requirement.capabilities.length,
       candidateCount: chosen.resources.length,
       capacityGroupCount: chosen.capacityGroups.length,
       modelTier,
       preferenceSource,
+      // Inform the controller that at least one otherwise compatible route was deliberately
+      // excluded for currency. This is diagnostic provenance, never a reason to revive it.
+      ...(sawLegacy ? { legacyExcluded: true } : {}),
       ...(legacyFallback ? { legacyFallback: true } : {}),
     }),
     alternatives: Object.freeze(tiers.slice(1)),
@@ -409,7 +412,7 @@ function buildContract({ requirement, budget, profile, constraints, allowedResou
   // The broker enforces this too, but failing here names the missing cap instead of returning
   // a generic policy denial after a round trip.
   for (const [dimension, enforcement] of Object.entries(budget.enforcement ?? {})) {
-    const cap = { input: budget.maxInputTokens, output: budget.maxOutputTokens, cost: budget.maxCostMicros }[dimension];
+    const cap = { input: budget.maxInputTokens, output: budget.maxOutputTokens }[dimension];
     if (enforcement === "hard" && (!Number.isSafeInteger(cap) || cap <= 0)) return `hard ${dimension} enforcement requires a positive declared cap`;
   }
 

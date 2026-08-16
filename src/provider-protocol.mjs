@@ -108,7 +108,7 @@ const SNAPSHOT_FIELDS = [
   "fencingToken", "registryFingerprint", "registryVersion", "resourceId", "capacityGroup",
   "accountAlias", "provider", "model", "reasoningEffort", "apiDialect", "endpointId",
   "adapterId", "credentialRefFingerprint", "cacheRetention", "retryOwner", "sdkMaxRetries", "deadlineAt",
-  "maxInputBytes", "maxOutputBytes", "maxOutputTokens", "maxCostMicros",
+  "maxInputBytes", "maxOutputBytes", "maxOutputTokens",
 ];
 
 /**
@@ -150,7 +150,6 @@ export function createAttemptRouteSnapshot(input) {
     maxInputBytes: positiveSafeInteger(input.maxInputBytes, "maxInputBytes"),
     maxOutputBytes: positiveSafeInteger(input.maxOutputBytes, "maxOutputBytes"),
     maxOutputTokens: positiveSafeInteger(input.maxOutputTokens, "maxOutputTokens"),
-    maxCostMicros: positiveSafeInteger(input.maxCostMicros, "maxCostMicros"),
   };
   if (!["none", "short", "long"].includes(snapshot.cacheRetention)) fail("snapshot_invalid", "cacheRetention must be none, short, or long");
   if (snapshot.retryOwner !== "broker") fail("snapshot_invalid", "retryOwner must be broker");
@@ -185,14 +184,13 @@ function usageValue(value, name) {
 function validateUsage(payload, limits) {
   if (!payload || typeof payload !== "object") fail("frame_payload_invalid", "usage payload must be an object");
   for (const key of Object.keys(payload)) {
-    if (!["input", "output", "cacheRead", "cacheWrite", "costMicros"].includes(key)) fail("frame_payload_invalid", `unknown usage field ${key}`);
+    if (!["input", "output", "cacheRead", "cacheWrite"].includes(key)) fail("frame_payload_invalid", `unknown usage field ${key}`);
   }
   const usage = {
     input: usageValue(payload.input ?? 0, "usage.input"),
     output: usageValue(payload.output ?? 0, "usage.output"),
     cacheRead: usageValue(payload.cacheRead ?? 0, "usage.cacheRead"),
     cacheWrite: usageValue(payload.cacheWrite ?? 0, "usage.cacheWrite"),
-    costMicros: usageValue(payload.costMicros ?? 0, "usage.costMicros"),
   };
   for (const [key, value] of Object.entries(usage)) {
     if (value > limits.maxUsageValue) fail("cap_exceeded", `usage.${key} exceeds the configured cap`);
@@ -202,7 +200,7 @@ function validateUsage(payload, limits) {
 
 function checkUsageMonotonic(previous, next) {
   if (!previous) return;
-  for (const key of ["input", "output", "cacheRead", "cacheWrite", "costMicros"]) {
+  for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
     if (next[key] < previous[key]) fail("usage_regression", `usage.${key} decreased`);
   }
 }

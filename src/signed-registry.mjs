@@ -133,9 +133,14 @@ function normalizedBrokerRegistry(registry) {
       }
       model = { provider: resource.model.provider, modelId: resource.model.modelId };
     }
-    ownKeysExactly(resource.enforcement, ["input", "output", "cost"], `resource ${id} enforcement`);
+    // Cost was a historic policy field. Accept an old signed input shape only to migrate it,
+    // then strip it before signing/persisting: spend is not synchronously observable and is no
+    // longer a broker metric. New registries carry input/output only.
+    const enforcementKeys = Object.keys(resource.enforcement).sort();
+    const supported = enforcementKeys.join(",") === "input,output" || enforcementKeys.join(",") === "cost,input,output";
+    if (!supported) throw new Error(`resource ${id} enforcement must contain input and output only`);
     const enforcement = {};
-    for (const dimension of ["input", "output", "cost"]) {
+    for (const dimension of ["input", "output"]) {
       const value = resource.enforcement[dimension];
       if (typeof value !== "string" || !ENFORCEMENT.has(value)) throw new Error(`resource ${id} has invalid ${dimension} enforcement`);
       enforcement[dimension] = value;
@@ -164,7 +169,7 @@ export function signedRegistryMessage({ schemaVersion, keyId, registry }) {
   if (schemaVersion !== 2) throw new Error("Signed registry schemaVersion must equal 2");
   requireIdentifier(keyId, "keyId");
   // Sign the normalized broker shape, not controller-only catalog metadata. The latter may
-  // carry descriptive floating-point costs and is deliberately neither persisted nor routed by
+  // carry descriptive provider metadata and is deliberately neither persisted nor routed by
   // the broker; signing the raw object made any real catalog impossible to sign.
   const normalized = normalizedBrokerRegistry(registry);
   const signedRegistry = {

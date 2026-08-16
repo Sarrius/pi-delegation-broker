@@ -322,7 +322,6 @@ export class BrokerIpcServer {
       maxInputBytes: 1_000_000,
       maxOutputBytes: 1_000_000,
       maxOutputTokens: lease.maxOutputTokens ?? 8_000,
-      maxCostMicros: lease.maxCostMicros ?? 500_000,
     });
 
     const identity = Object.freeze({
@@ -369,7 +368,7 @@ export class BrokerIpcServer {
       emit("block_start", { index: 0, blockType: "text" });
       emit("text_delta", { index: 0, delta: text });
       emit("block_end", { index: 0, value: text });
-      emit("usage", { input: event.usage.input, output: event.usage.output, costMicros: event.usage.costMicros });
+      emit("usage", { input: event.usage.input, output: event.usage.output });
       if (lease.enforcement.output === "hard" && lease.maxOutputTokens !== undefined && event.usage.output > lease.maxOutputTokens) {
         this.#broker.release(lease.leaseId, lease.fencingToken, "hard output budget exceeded", observedAt);
         emit("terminal", { outcome: "budget_exceeded", usage: event.usage });
@@ -478,7 +477,6 @@ export class BrokerIpcServer {
       maxInputBytes: 512 * 1024,
       maxOutputBytes: 1_000_000,
       maxOutputTokens: lease.maxOutputTokens ?? 8_000,
-      maxCostMicros: lease.maxCostMicros ?? 500_000,
       });
     } catch (error) {
       releaseRouteFailure();

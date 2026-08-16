@@ -191,7 +191,6 @@ export class BrokeredLaunchResolver {
         budget: {
           ...(lease.maxOutputTokens !== undefined ? { maxOutputTokens: lease.maxOutputTokens } : {}),
           ...(lease.maxInputTokens !== undefined ? { maxInputTokens: lease.maxInputTokens } : {}),
-          ...(lease.maxCostMicros !== undefined ? { maxCostMicros: lease.maxCostMicros } : {}),
           enforcement: lease.enforcement,
         },
         latencyBudgetMs: selection.contract.latencyBudgetMs,
@@ -233,6 +232,9 @@ export class BrokeredLaunchResolver {
       return {
         action: "allow",
         resource: Object.freeze({ id: lease.resourceId, profile: lease.profile, capacityGroup: lease.capacityGroup }),
+        // Selector provenance is controller-only, prompt-free metadata. Carry it to the parent
+        // result so "why this route?" never has to reconstruct a decision from opaque logs.
+        ...(selection.selection && typeof selection.selection === "object" ? { selection: selection.selection } : {}),
         ...(resolvedModel?.provider && resolvedModel?.modelId
           ? { resolvedModel: Object.freeze({ provider: resolvedModel.provider, modelId: resolvedModel.modelId }) }
           : {}),
@@ -328,6 +330,7 @@ export class BrokeredLaunchResolver {
         // What this route consumed to reach a verifiable result. Absent when the transport
         // reported no usage; the journal then records reliability without an efficiency sample.
         ...(tokensOf(result?.usage) === undefined ? {} : { tokens: tokensOf(result.usage) }),
+        ...(Number.isSafeInteger(result?.attempts) && result.attempts >= 1 ? { attempts: result.attempts } : {}),
       }),
     });
     return Object.freeze({ ...released, verification });

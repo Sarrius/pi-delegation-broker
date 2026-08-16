@@ -23,7 +23,7 @@ async function reserveCapability(server, taskId, maxOutputTokens = 100, contract
     params: {
       contract: fixtureContract({
         taskId,
-        budget: { maxInputTokens: 1_000, maxOutputTokens, enforcement: { input: "hard", output: "hard", cost: "metered_best_effort" } },
+        budget: { maxInputTokens: 1_000, maxOutputTokens, enforcement: { input: "hard", output: "hard" } },
         ...contractOverrides,
       }),
     },
@@ -103,7 +103,7 @@ test("streaming happy path delivers validated frames and a succeeded terminal", 
       socketPath: server.socketPath,
       authorization: server.controllerToken,
       method: "configureFakeProvider",
-      params: { taskId: "stream-happy", events: [{ type: "succeeded", resultRef: "finding-42", usage: { input: 10, output: 5, costMicros: 200 } }] },
+      params: { taskId: "stream-happy", events: [{ type: "succeeded", resultRef: "finding-42", usage: { input: 10, output: 5 } }] },
     });
 
     const { frames, terminal } = await streamProviderIpc({
@@ -215,7 +215,7 @@ test("streaming budget exceeded when output exceeds hard cap", async () => {
       socketPath: server.socketPath,
       authorization: server.controllerToken,
       method: "configureFakeProvider",
-      params: { taskId: "stream-budget", events: [{ type: "succeeded", resultRef: "big-output", usage: { input: 10, output: 99, costMicros: 0 } }] },
+      params: { taskId: "stream-budget", events: [{ type: "succeeded", resultRef: "big-output", usage: { input: 10, output: 99 } }] },
     });
 
     const { terminal } = await streamProviderIpc({
@@ -304,7 +304,7 @@ test("streaming cancellation aborts before any frame is written", async () => {
       socketPath: server.socketPath,
       authorization: server.controllerToken,
       method: "configureFakeProvider",
-      params: { taskId: "stream-cancel", events: [{ type: "succeeded", resultRef: "late", usage: { input: 1, output: 1, costMicros: 0 }, delayMs: 2_000 }] },
+      params: { taskId: "stream-cancel", events: [{ type: "succeeded", resultRef: "late", usage: { input: 1, output: 1 }, delayMs: 2_000 }] },
     });
 
     const controller = new AbortController();
@@ -446,7 +446,7 @@ test("legacy providerAttempt still works alongside streaming", async () => {
       socketPath: server.socketPath,
       authorization: server.controllerToken,
       method: "configureFakeProvider",
-      params: { taskId: "stream-legacy", events: [{ type: "succeeded", resultRef: "legacy-ok", usage: { input: 3, output: 2, costMicros: 100 } }] },
+      params: { taskId: "stream-legacy", events: [{ type: "succeeded", resultRef: "legacy-ok", usage: { input: 3, output: 2 } }] },
     });
 
     const result = await requestBrokerIpc({

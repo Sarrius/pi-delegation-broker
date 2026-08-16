@@ -185,7 +185,7 @@ test("bounded supervisor shutdown aborts a delayed fake attempt instead of waiti
       method: "configureFakeProvider",
       params: {
         taskId: "stop-delayed",
-        events: [{ type: "succeeded", resultRef: "must-not-return", delayMs: 5_000, usage: { input: 1, output: 1, costMicros: 0 } }],
+        events: [{ type: "succeeded", resultRef: "must-not-return", delayMs: 5_000, usage: { input: 1, output: 1 } }],
       },
     });
     const reservation = await reserve(supervisor, "stop-delayed");

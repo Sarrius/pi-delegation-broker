@@ -40,7 +40,6 @@ function snapshot(overrides = {}) {
     maxInputBytes: 512 * 1024,
     maxOutputBytes: 128 * 1024,
     maxOutputTokens: 1024,
-    maxCostMicros: 500_000,
     ...overrides,
   });
 }
@@ -136,7 +135,7 @@ test("transport resolves exactly one named credential and makes exactly one raw 
   assert.deepEqual(events.map((event) => event.type), ["headers", "block_start", "text_delta", "block_end", "usage", "terminal"]);
   assert.equal(events.at(-1).outcome, "succeeded_terminal");
   assert.deepEqual(events.find((event) => event.type === "usage").payload, {
-    input: 11, output: 3, cacheRead: 7, cacheWrite: 2, costMicros: 0,
+    input: 11, output: 3, cacheRead: 7, cacheWrite: 2,
   });
 });
 

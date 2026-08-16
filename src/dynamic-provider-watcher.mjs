@@ -44,7 +44,6 @@ function readPiCatalog(agentDir) {
         contextWindow: m.contextWindow ?? 200_000, maxTokens: m.maxTokens ?? 8_000,
         reasoning: m.reasoning !== false,
         input: Array.isArray(m.input) ? m.input : ["text"],
-        cost: m.cost && typeof m.cost === "object" ? m.cost : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       })),
     });
   }
@@ -70,7 +69,6 @@ function readPiCatalog(agentDir) {
           contextWindow: m.contextWindow ?? 200_000, maxTokens: m.maxTokens ?? 8_000,
           reasoning: m.reasoning !== false,
           input: Array.isArray(m.input) ? m.input : ["text"],
-          cost: m.cost && typeof m.cost === "object" ? m.cost : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         })),
       });
     } else if (cfg.baseUrl) {
@@ -82,7 +80,6 @@ function readPiCatalog(agentDir) {
         models: [{
           id: "default", name: provider, contextWindow: 200_000, maxTokens: 8_000,
           reasoning: false, input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         }],
       });
     }

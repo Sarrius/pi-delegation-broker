@@ -92,7 +92,7 @@ test("controller credential store and route table resolve one exact credential-f
     schemaVersion: 1, controllerEpoch: "epoch-1", attemptId: "attempt-1", streamId: "stream-1",
     taskId: "task-1", leaseId: "lease-1", fencingToken: 1, resourceId: "R1", capacityGroup: "G-shared",
     ...route, retryOwner: "broker", sdkMaxRetries: 0, deadlineAt: 2_000,
-    maxInputBytes: 1024, maxOutputBytes: 1024, maxOutputTokens: 100, maxCostMicros: 100,
+    maxInputBytes: 1024, maxOutputBytes: 1024, maxOutputTokens: 100,
   });
   const events = await Array.fromAsync(approved.providerTransport.stream(snapshot, context(), { onSendStarted() {} }));
   assert.equal(events.at(-1).outcome, "succeeded_terminal");

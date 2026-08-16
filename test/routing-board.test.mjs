@@ -168,7 +168,6 @@ test("one-provider degenerate case: board serves as monitoring dashboard", () =>
       outcome: i < 45 ? "accepted" : "rejected",
       evidenceKind: "test_pass",
       latencyMs: 200,
-      costMicros: 500,
       timestamp: 1_000 + i,
     });
   }
@@ -176,7 +175,6 @@ test("one-provider degenerate case: board serves as monitoring dashboard", () =>
   assert.equal(s.n, 50);
   assert.ok(s.acceptedRate > 0.85);
   assert.ok(s.p50LatencyMs > 0);
-  assert.ok(s.avgCostMicros > 0);
-  // The same numbers that drive routing also drive monitoring
+  // The same verified outcome and latency facts that drive routing also drive monitoring
   assert.ok(s.lowerBound > 0.5); // within quality band
 });

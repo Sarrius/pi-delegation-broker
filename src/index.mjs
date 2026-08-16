@@ -54,9 +54,12 @@ export { ModelAffinityJournal } from "./model-affinity-journal.mjs";
 export { TaskOrchestrator } from "./workflow-scheduler.mjs";
 export {
   DEFAULT_MODEL_PREFERENCES,
+  MODEL_PREFERENCE_TIERS,
+  addModelPreference,
   loadModelPreferences,
   normalizeModelPreferences,
   preferenceMatches,
+  removeModelPreference,
   taskModelTier,
   writeModelPreferences,
 } from "./model-preferences.mjs";

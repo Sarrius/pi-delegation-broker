@@ -23,7 +23,6 @@ function normalizeEvent(event) {
       usage: {
         input: nonNegativeInteger(event.usage?.input ?? 0, "usage.input"),
         output: nonNegativeInteger(event.usage?.output ?? 0, "usage.output"),
-        costMicros: nonNegativeInteger(event.usage?.costMicros ?? 0, "usage.costMicros"),
       },
       delayMs,
     };

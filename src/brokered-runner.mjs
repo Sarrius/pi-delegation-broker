@@ -120,7 +120,7 @@ export class BrokeredChildRunner {
 
       let handle;
       try {
-        handle = await this.spawn({ ...spec, childId: attemptId, capabilityRequest });
+        handle = await this.spawn({ ...spec, childId: attemptId, capabilityRequest, attempts: attempt });
       } catch (error) {
         // A denial is the broker refusing every live resource for this contract; retrying the
         // same contract cannot change that, so surface it rather than burning attempts.
@@ -175,8 +175,9 @@ export class BrokeredChildRunner {
    * allow/deny before any process starts. Returns a handle whose `result`
    * promise resolves to the child's terminal result (not task acceptance).
    */
-  async spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest }) {
+  async spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, attempts = 1 }) {
     if (this.#handles.has(childId)) throw new Error(`Duplicate child id: ${childId}`);
+    if (!Number.isSafeInteger(attempts) || attempts < 1) throw new Error("brokered child attempt count must be a positive safe integer");
 
     const admission = new AbortController();
     const release = await this.#semaphore.acquire(admission.signal);
@@ -261,6 +262,8 @@ export class BrokeredChildRunner {
         // Which account this attempt actually spent from — the runner needs it to report health
         // and to exclude the resource on the next pass.
         resource: decision.resource,
+        selection: decision.selection,
+        attempts,
         model: Object.freeze({ ...launchModel }),
         result: null,
       };
@@ -313,6 +316,8 @@ export class BrokeredChildRunner {
           error: message.errorMessage ?? "Child model request failed",
           usage,
           resolved: handle.resolved,
+          resource: handle.resource,
+          ...(handle.selection ? { selection: handle.selection } : {}),
         };
       } else {
         result = {
@@ -321,6 +326,8 @@ export class BrokeredChildRunner {
           text: assistantText(message),
           usage,
           resolved: handle.resolved,
+          resource: handle.resource,
+          ...(handle.selection ? { selection: handle.selection } : {}),
           ...(worktree ? await this.#collectWorktree(worktree) : {}),
         };
       }
@@ -332,6 +339,8 @@ export class BrokeredChildRunner {
         error: error.message,
         usage: session.usage,
         resolved: handle.resolved,
+        resource: handle.resource,
+        ...(handle.selection ? { selection: handle.selection } : {}),
       };
     } finally {
       handle.release();
@@ -342,6 +351,7 @@ export class BrokeredChildRunner {
         status: result.status,
         ...(result.error ? { error: result.error } : {}),
         ...(result.usage ? { usage: result.usage } : {}),
+        attempts: handle.attempts,
       });
       if (worktree) {
         try { await cleanupWorktree(worktree.sourceCwd, worktree.tree.path); }

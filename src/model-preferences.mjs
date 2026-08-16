@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 const TIERS = new Set(["frontier", "standard", "cheap"]);
+export const MODEL_PREFERENCE_TIERS = Object.freeze([...TIERS]);
 const MODEL_ID = /^[A-Za-z0-9~][A-Za-z0-9._/:~-]{0,159}$/;
 const PROVIDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\*?$/;
 
@@ -59,6 +60,47 @@ export function writeModelPreferences(path, preferences) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   writeFileSync(path, `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
   return normalized;
+}
+
+function requireTier(tier) {
+  if (!TIERS.has(tier)) throw new Error("model preference tier must be cheap, standard, or frontier");
+  return tier;
+}
+
+/** Add routes to one user-owned model preference, merging rather than duplicating it. */
+export function addModelPreference(preferences, { tier, model, via } = {}) {
+  const current = normalizeModelPreferences(preferences);
+  const checkedTier = requireTier(tier);
+  const added = normalizeEntry({ model, via }, `model preference ${checkedTier} addition`);
+  const entries = current.tiers[checkedTier].map((entry) => ({ model: entry.model, via: [...entry.via] }));
+  const existing = entries.find((entry) => entry.model === added.model);
+  if (existing) existing.via = [...new Set([...existing.via, ...added.via])];
+  else entries.push({ model: added.model, via: [...added.via] });
+  return normalizeModelPreferences({
+    schemaVersion: 1,
+    tiers: { ...current.tiers, [checkedTier]: entries },
+  });
+}
+
+/** Remove a model entirely, or only selected provider patterns when `via` is non-empty. */
+export function removeModelPreference(preferences, { tier, model, via } = {}) {
+  const current = normalizeModelPreferences(preferences);
+  const checkedTier = requireTier(tier);
+  if (typeof model !== "string" || !MODEL_ID.test(model)) throw new Error("model preference removal has invalid model");
+  if (via !== undefined && (!Array.isArray(via) || via.some((provider) => typeof provider !== "string" || !PROVIDER_PATTERN.test(provider)))) {
+    throw new Error("model preference removal via must contain valid provider patterns");
+  }
+  const removeRoutes = new Set(via ?? []);
+  const entries = current.tiers[checkedTier].flatMap((entry) => {
+    if (entry.model !== model) return [{ model: entry.model, via: [...entry.via] }];
+    if (removeRoutes.size === 0) return [];
+    const retained = entry.via.filter((provider) => !removeRoutes.has(provider));
+    return retained.length ? [{ model: entry.model, via: retained }] : [];
+  });
+  return normalizeModelPreferences({
+    schemaVersion: 1,
+    tiers: { ...current.tiers, [checkedTier]: entries },
+  });
 }
 
 /** Cheap/standard/frontier default follows the task requirement; caller may explicitly override. */

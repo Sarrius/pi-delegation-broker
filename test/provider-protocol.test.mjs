@@ -41,7 +41,6 @@ function snapshotInput(overrides = {}) {
     maxInputBytes: 1_000_000,
     maxOutputBytes: 1_000_000,
     maxOutputTokens: 8_000,
-    maxCostMicros: 500_000,
     ...overrides,
   };
 }
