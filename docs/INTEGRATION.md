@@ -17,7 +17,28 @@ A compatible launcher must enforce all of the following before a brokered child 
 
 The [source-repository-only reference patch](https://github.com/Sarrius/pi-delegation-broker/blob/main/patches/pi-subagent-workflow-trusted-launcher-seam.patch) demonstrates such a seam against `pi-subagent-workflow` commit `0c28ce87bc45f4c3d66e0100b58ae13cf345978c`, including pinned extension rehash/order and startup-tool attestation. It is an unaccepted local patch and is not part of the npm tarball. Applying it, accepting it upstream, or replacing it with an equivalent stable API remains a human release decision.
 
-`pi-multi-account` must be absent from brokered children until it has a reviewed brokered report-only mode. A brokered child must not invoke `pi.setModel()` or auto-continue on its own. `ControllerAccountInventory` can consume a controller-injected registry snapshot only as `observed` inventory; it contains no credential and still requires signed-registry policy before admission.
+### Account aliases and fresh Pi processes
+
+`pi-multi-account` must be absent from brokered children until it has a reviewed brokered report-only mode. Its `*-account-N` names are **controller inventory identities**, not standalone providers a fresh `pi --no-extensions` process can resolve. The launcher therefore has a binding canonicalization rule:
+
+1. The broker keeps the leased alias (for example `anthropic-account-2`) in the resource id, lease, health/cooldown accounting and audit trail.
+2. `writeScopedChildAuth` reads precisely that alias credential but writes it as its base id (`anthropic`) into the child-only `auth.json`, catalog and endpoint config.
+3. `resolveChildLaunchModel` launches `--provider anthropic --model claude-opus-5`. Since that agent directory contains exactly one credential, the canonical id cannot accidentally select the parent's base account or any other alias.
+
+Do not pass `*-account-N/model` to a fresh isolated Pi child and do not solve this by loading the parent's entire multi-account extension: either choice breaks the scoped-credential boundary. Regression coverage lives in `test/scoped-child-auth.test.mjs` and `test/child-launcher.test.mjs`.
+
+Hermes is a distinct integration: its review subprocess intentionally runs against the parent agent directory, but it too uses `--no-extensions`. If Hermes follows the active chat model and that model is an account alias, configure its **single trusted provider extension** explicitly:
+
+```json
+{
+  "reviewTransport": "direct",
+  "childExtensionPaths": [
+    "/absolute/path/to/.pi/agent/git/github.com/Sarrius/pi-multi-account/index.ts"
+  ]
+}
+```
+
+Use an absolute path — Hermes normalizes with `resolve()` and does not expand a literal `~`. This lets the subprocess resolve the active alias and lets the multi-account extension perform its normal account-level failover. Do not set `llmModelOverride` to a stale route merely to conceal alias failures. A brokered child must not invoke `pi.setModel()` or auto-continue on its own. `ControllerAccountInventory` can consume a controller-injected registry snapshot only as `observed` inventory; it contains no credential and still requires signed-registry policy before admission.
 
 ## Controller provider route gate
 

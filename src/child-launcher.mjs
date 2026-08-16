@@ -251,6 +251,19 @@ class RpcChildSession {
  * Returns { session, resolved } or throws before any child side-effect if
  * validation fails. The broker resolver decides allow/deny before this call.
  */
+/**
+ * Turn a controller resource identity into the provider/model tuple understood by a fresh,
+ * extension-isolated Pi process. Account suffixes are controller inventory identities, not
+ * standalone Pi providers; the exact account credential is separately scoped under `provider`.
+ */
+export function resolveChildLaunchModel(model) {
+  if (typeof model !== "string") throw new Error(`Model must be "provider/model-id", got ${JSON.stringify(model)}`);
+  const slash = model.indexOf("/");
+  if (slash < 1 || slash === model.length - 1) throw new Error(`Model must be "provider/model-id", got ${JSON.stringify(model)}`);
+  const leasedProvider = model.slice(0, slash);
+  return Object.freeze({ leasedProvider, provider: baseProviderFor(leasedProvider), modelId: model.slice(slash + 1) });
+}
+
 export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPiEntry, shimPath, launchPolicy, forkSessionFile, spawnRpc = spawnChildRpc }) {
   const cwd = spec.cwd ?? parentCwd;
   let isDir;
@@ -264,15 +277,11 @@ export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPi
   if (forkSessionFile) validateFile(forkSessionFile, "Fork session file");
 
   const model = spec.model ?? "broker-fake/lease-fake";
-  const slash = model.indexOf("/");
-  if (slash < 1) throw new Error(`Model must be "provider/model-id", got ${JSON.stringify(model)}`);
-  const leasedProvider = model.slice(0, slash);
   // Account aliases are registered by the parent's interactive multi-account extension, but
   // children run with extension discovery disabled. Their scoped auth dir contains exactly the
   // leased credential under this canonical name, so Pi can resolve the model without loading
   // an account-management extension or gaining the parent's other credentials.
-  const provider = baseProviderFor(leasedProvider);
-  const modelId = model.slice(slash + 1);
+  const { provider, modelId } = resolveChildLaunchModel(model);
 
   const args = buildChildArgs({
     provider, modelId,
