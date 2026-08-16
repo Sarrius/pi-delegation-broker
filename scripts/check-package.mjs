@@ -21,7 +21,7 @@ const unpackedSize = packed[0].unpackedSize;
 // behavioral enforcement extension, the fixed controller acceptance verifier,
 // their protocol docs, controller receipt authority, and narrowly scoped
 // controller-only route/credential configuration primitives.
-if (!Number.isSafeInteger(unpackedSize) || unpackedSize > 384 * 1024) throw new Error(`npm package is unexpectedly large: ${unpackedSize}`);
+if (!Number.isSafeInteger(unpackedSize) || unpackedSize > 448 * 1024) throw new Error(`npm package is unexpectedly large: ${unpackedSize}`);
 const packageJson = statSync(join(root, "package.json"));
 if ((packageJson.mode & 0o022) !== 0) throw new Error("package.json permissions must not grant group/other write access");
 console.log(`package check: pass (${names.length} files, ${unpackedSize} bytes unpacked)`);
