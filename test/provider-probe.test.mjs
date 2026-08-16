@@ -33,6 +33,7 @@ function choose(registry, currency, allowedProviders) {
     taskDescription: "read a file and summarize it",
     registry,
     currency,
+    enforceQuality: true,
     constraints: {
       taskId: "currency-test",
       promptDigest: "a".repeat(64),
@@ -108,21 +109,17 @@ test("date catches an old alias even when its parsed generation is the same", ()
   assert.equal(choose(registry, currency, ["openai"]).expectedModel.modelId, "gpt-5.6-luna");
 });
 
-test("legacy is only an explicit emergency fallback when no current resource exists", () => {
+test("legacy-only fleet is denied rather than silently routing work to an obsolete model", () => {
   const registry = registryFor([{ provider: "zai", models: [model("glm-4.7", "zai")] }]);
   const currency = buildCurrencyMap({
     resources: resourcesFor(registry),
-    // The provider's live listing knows about the current release even though this user's
-    // local cache/resource set is stale and contains only glm-4.7.
     liveListings: new Map([["zai", new Map([
       ["glm-4.7", 1_650_000_000_000],
       ["glm-5.3", 1_780_000_000_000],
     ])]]),
   });
   const selected = choose(registry, currency, ["zai"]);
-  assert.equal(selected.action, "allow");
-  assert.equal(selected.expectedModel.modelId, "glm-4.7");
-  assert.equal(selected.selection.legacyFallback, true, "use of legacy cannot be silent");
+  assert.equal(selected.action, "deny");
 });
 
 test("live probes preserve upstream creation dates without exposing credentials", async () => {

@@ -193,6 +193,7 @@ async function startBroker(): Promise<BrokerRuntime> {
       availability: () => supervisor.inventory(),
       currency,
       preferences: () => loadModelPreferences(PREFERENCES_PATH),
+      enforceQuality: true,
     }),
     resolveModelForResource: parseResourceModel,
     provisionChildAuth: ({ agentDir, model }: { agentDir: string; model?: { provider: string; modelId: string } }) => {

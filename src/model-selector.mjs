@@ -22,6 +22,7 @@
  */
 
 import { preferenceMatches, taskModelTier } from "./model-preferences.mjs";
+import { meetsQualityFloor } from "./model-quality-catalog.mjs";
 
 const CONFIDENCE_RANK = Object.freeze({ measured: 0, observed: 1, assumed: 2 });
 const OPERATION_CLASSES = Object.freeze(new Set(["observe", "propose_patch", "apply", "external_write"]));
@@ -219,7 +220,7 @@ function requiresHardBudget(budget) {
  * `{action:"deny", reason}`. `alternatives` lists the remaining ranked classes so a caller that
  * hits `denied_capacity` can retry one tier up without re-deriving the requirement.
  */
-export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, currency, preferences, learnedRanker, now } = {}) {
+export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, currency, preferences, learnedRanker, enforceQuality = false, now } = {}) {
   if (!registry?.profiles || !registry?.resources) throw new Error("selectModelForTask requires a broker registry");
   if (constraints !== undefined && (typeof constraints !== "object" || constraints === null || Array.isArray(constraints))) {
     throw new Error("selectModelForTask constraints must be an object");
@@ -251,6 +252,9 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         if (allowedProviders && !allowedProviders.has(resource.model?.provider ?? id)) continue;
         const identity = resource.model ?? parseResourceModel(id);
         if (userOnly && (!identity || !preferenceMatches(preferenceEntries, identity))) continue;
+        // Empty user tiers mean controller auto mode, not "any model the aggregator happens
+        // to list". Require the researched quality floor before cost/ranking can participate.
+        if (enforceQuality && !userOnly && (!identity || !meetsQualityFloor(identity, modelTier))) continue;
         const fact = currencyLookup.get(id);
         if (fact?.legacy === true) {
           if (!includeLegacy) { sawLegacy = true; continue; }
@@ -418,7 +422,7 @@ function defaultDoneWhen(operationClass) {
  * The callback reads only `request.capabilityRequest`, never a prompt: the resolver contract is
  * that a launch request carries no raw task text.
  */
-export function createSelectContract({ registry, availability, currency, preferences, learnedRanker, constraints = {}, now = () => Date.now() } = {}) {
+export function createSelectContract({ registry, availability, currency, preferences, learnedRanker, enforceQuality = false, constraints = {}, now = () => Date.now() } = {}) {
   if (registry === undefined) throw new Error("createSelectContract requires a registry or a registry provider");
   const readRegistry = typeof registry === "function" ? registry : () => registry;
   const readAvailability = typeof availability === "function" ? availability : () => availability;
@@ -441,6 +445,7 @@ export function createSelectContract({ registry, availability, currency, prefere
       currency: readCurrency(),
       preferences: readPreferences(),
       learnedRanker,
+      enforceQuality,
       constraints: merged,
       now: now(),
     });

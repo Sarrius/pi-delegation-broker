@@ -181,7 +181,7 @@ export class DynamicProviderWatcher {
     this.#refreshAsync().catch(() => undefined);
     try {
       this.#watcher = watch(this.#agentDir, { persistent: false }, (eventType, filename) => {
-        if (filename !== "auth.json" && filename !== "models-store.json") return;
+        if (filename !== "auth.json" && filename !== "models-store.json" && filename !== "models.json") return;
         if (this.#debounceTimer) clearTimeout(this.#debounceTimer);
         this.#debounceTimer = setTimeout(() => {
           this.#debounceTimer = undefined;
