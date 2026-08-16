@@ -218,6 +218,7 @@ export class BrokeredLaunchResolver {
         lease,
         agentDir,
         capability: issued.capability,
+        contract: selection.contract,
         phase: "pending_handoff",
         ...(queuedTaskId === undefined ? {} : {
           queuedTaskId,
@@ -263,6 +264,10 @@ export class BrokeredLaunchResolver {
           },
           onBeforeChildAbandoned: async () => this.releaseUnhanded(request.childId),
           onChildSessionOpened: async () => this.markChildHanded(request.childId),
+          // The runner calls this only after its final successful route is known. Tracking an
+          // earlier failover attempt would let a verifier accept stale work or lose the final
+          // route's efficiency observation.
+          trackForVerification: async () => this.trackHandedChildForVerification(request.childId),
           onChildSessionClosed: async (result) => this.finalizeHandedChild(request.childId, result),
         },
       };
@@ -308,6 +313,29 @@ export class BrokeredLaunchResolver {
     if (!admission) return { status: "already_released" };
     if (admission.phase === "pending_handoff") admission.phase = "handed";
     return { status: admission.phase };
+  }
+
+  /**
+   * Convert a handed final child into a durably tracked task immediately before controller
+   * verification. Earlier failed attempts deliberately never enter the pending-task ledger.
+   */
+  async trackHandedChildForVerification(childId) {
+    const admission = this.#admissions.get(childId);
+    if (!admission || admission.phase !== "handed") return { status: "denied_policy" };
+    if (admission.queuedTaskId) return { status: "tracked" };
+    const tracked = await this.#controller("trackLeasedTask", {
+      contract: admission.contract,
+      leaseId: admission.lease.leaseId,
+      fencingToken: admission.lease.fencingToken,
+    });
+    if (tracked?.status !== "tracked") return tracked ?? { status: "denied_policy" };
+    admission.queuedTaskId = admission.contract.taskId;
+    admission.routingObservation = Object.freeze({
+      resourceId: admission.lease.resourceId,
+      capabilities: Object.freeze([...admission.contract.capability.required]),
+      issuedAt: admission.lease.issuedAt,
+    });
+    return Object.freeze({ status: "tracked" });
   }
 
   /**

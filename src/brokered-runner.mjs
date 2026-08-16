@@ -101,9 +101,10 @@ export class BrokeredChildRunner {
    *
    * Returns the terminal child result, plus a `route` trail of every attempt made.
    */
-  async run({ childId, maxAttempts = MAX_ROUTE_ATTEMPTS, ...spec }) {
+  async run({ childId, maxAttempts = MAX_ROUTE_ATTEMPTS, trackForVerification = false, ...spec }) {
     if (!CHILD_ID.test(childId ?? "")) throw new Error("BrokeredChildRunner requires a valid childId");
     if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) throw new Error("maxAttempts must be a positive safe integer");
+    if (typeof trackForVerification !== "boolean") throw new Error("trackForVerification must be boolean");
 
     const excludeResources = [...(spec.capabilityRequest?.excludeResources ?? [])];
     const route = [];
@@ -120,7 +121,7 @@ export class BrokeredChildRunner {
 
       let handle;
       try {
-        handle = await this.spawn({ ...spec, childId: attemptId, capabilityRequest, attempts: attempt });
+        handle = await this.spawn({ ...spec, childId: attemptId, capabilityRequest, attempts: attempt, deferClosePolicy: true });
       } catch (error) {
         // A denial is the broker refusing every live resource for this contract; retrying the
         // same contract cannot change that, so surface it rather than burning attempts.
@@ -130,9 +131,21 @@ export class BrokeredChildRunner {
 
       const resourceId = handle.resource?.id;
       lastResult = await handle.result;
+      let closure;
+      try {
+        closure = await this.#closeAttempt(handle, lastResult, trackForVerification && lastResult.status === "completed");
+      } catch (error) {
+        route.push({ attempt, childId: attemptId, resourceId, outcome: "controller_close_failed", error: error.message });
+        return Object.freeze({ ...lastResult, id: childId, status: "failed", error: `controller close failed: ${error.message}`, route: Object.freeze(route) });
+      }
       if (lastResult.status === "completed") {
+        const verification = closure?.verification;
+        if (verification?.outcome?.status && verification.outcome.status !== "completed") {
+          route.push({ attempt, childId: attemptId, resourceId, outcome: "verification_rejected" });
+          return Object.freeze({ ...lastResult, id: childId, status: "failed", error: "controller acceptance verification rejected the completed child result", verification, route: Object.freeze(route) });
+        }
         route.push({ attempt, childId: attemptId, resourceId, outcome: "completed" });
-        return Object.freeze({ ...lastResult, id: childId, route: Object.freeze(route) });
+        return Object.freeze({ ...lastResult, id: childId, ...(verification ? { verification } : {}), route: Object.freeze(route) });
       }
 
       const kind = lastResult.status === "aborted" ? "fatal" : classifyChildFailure(lastResult.error ?? lastResult.text);
@@ -175,9 +188,32 @@ export class BrokeredChildRunner {
    * allow/deny before any process starts. Returns a handle whose `result`
    * promise resolves to the child's terminal result (not task acceptance).
    */
-  async spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, attempts = 1 }) {
+  async #closeAttempt(handle, result, trackForVerification) {
+    let trackingError;
+    if (trackForVerification) {
+      try {
+        const tracked = await handle.policy.trackForVerification?.();
+        if (tracked?.status !== "tracked") throw new Error("controller could not durably track final child result");
+      } catch (error) {
+        trackingError = error instanceof Error ? error : new Error(String(error));
+      }
+    }
+    // Always close the resolver admission, even if tracking failed, so a failed bookkeeping
+    // write cannot strand a lease. A tracked final result enters controller verification here.
+    const closed = await handle.policy.onChildSessionClosed?.({
+      status: result.status,
+      ...(result.error ? { error: result.error } : {}),
+      ...(result.usage ? { usage: result.usage } : {}),
+      attempts: handle.attempts,
+    });
+    if (trackingError) throw trackingError;
+    return closed;
+  }
+
+  async spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, attempts = 1, deferClosePolicy = false }) {
     if (this.#handles.has(childId)) throw new Error(`Duplicate child id: ${childId}`);
     if (!Number.isSafeInteger(attempts) || attempts < 1) throw new Error("brokered child attempt count must be a positive safe integer");
+    if (typeof deferClosePolicy !== "boolean") throw new Error("deferClosePolicy must be boolean");
 
     const admission = new AbortController();
     const release = await this.#semaphore.acquire(admission.signal);
@@ -264,6 +300,7 @@ export class BrokeredChildRunner {
         resource: decision.resource,
         selection: decision.selection,
         attempts,
+        deferClosePolicy,
         model: Object.freeze({ ...launchModel }),
         result: null,
       };
@@ -347,12 +384,14 @@ export class BrokeredChildRunner {
       await session.dispose().catch(() => undefined);
       // Consumption is the measure the controller can actually observe, so it travels with the
       // close event: the verifier turns it into a routing observation once a receipt exists.
-      await policy.onChildSessionClosed?.({
-        status: result.status,
-        ...(result.error ? { error: result.error } : {}),
-        ...(result.usage ? { usage: result.usage } : {}),
-        attempts: handle.attempts,
-      });
+      if (!handle.deferClosePolicy) {
+        await policy.onChildSessionClosed?.({
+          status: result.status,
+          ...(result.error ? { error: result.error } : {}),
+          ...(result.usage ? { usage: result.usage } : {}),
+          attempts: handle.attempts,
+        });
+      }
       if (worktree) {
         try { await cleanupWorktree(worktree.sourceCwd, worktree.tree.path); }
         catch { /* worktree retained; child work still on disk */ }

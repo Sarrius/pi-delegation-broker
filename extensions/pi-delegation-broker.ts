@@ -384,12 +384,11 @@ async function startBroker(): Promise<BrokerRuntime> {
         .map((path) => createHash("sha256").update(readFileSync(path)).digest("hex")),
     },
     offline: false,
-    selectContract: (request: any) => {
-      const selected = baseSelectContract(request);
-      return acceptancePlans.has(request.childId) ? { ...selected, trackImmediateTask: true } : selected;
-    },
+    // Tracking happens only after the runner knows which failover attempt actually completed.
+    // Marking the first attempt here could verify stale work before a later route succeeds.
+    selectContract: (request: any) => baseSelectContract(request),
     queuedTaskVerifier,
-    trackImmediateTasks: true,
+    trackImmediateTasks: false,
     resolveModelForResource: parseResourceModel,
     provisionChildAuth: ({ agentDir, model }: { agentDir: string; model?: { provider: string; modelId: string } }) => {
       if (!model?.provider) throw new Error("broker leased a resource with no resolvable model");
@@ -562,11 +561,15 @@ export default function piDelegationBroker(pi: any) {
         result = await broker.runner.run({
           childId,
           promptDigest,
+          // Preserve one logical controller task id across provider failover. The resolver
+          // tracks only the terminal successful attempt under this id, which finds this plan.
+          trackForVerification: Boolean(params.acceptance?.length && !params.proposeChangesIn),
           cwd: params.proposeChangesIn ?? ctx.cwd,
           ...(params.proposeChangesIn ? { isolation: "worktree" as const } : {}),
           thinkingLevel: "off",
           prompt: params.task,
           capabilityRequest: {
+            taskId: childId,
             taskDescription: params.task,
             ...(params.proposeChangesIn ? { operationClass: "propose_patch" } : {}),
             ...(params.capabilities?.length ? { requiredCapabilities: params.capabilities } : {}),

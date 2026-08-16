@@ -246,6 +246,48 @@ test("controller resolver claims an exact ready task, requeues pre-handoff failu
   }
 });
 
+test("resolver tracks only a terminal successful handoff before verifier finalization", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-terminal-track-"));
+  const evidenceStore = new ControllerEvidenceStore({ root: join(root, "evidence") });
+  const authority = new ControllerVerificationAuthority({ evidenceStore });
+  let supervisor;
+  let observed;
+  const queuedTaskVerifier = new ControllerQueuedTaskVerifier({
+    authority,
+    createVerifier: async () => ({
+      verify: async () => {
+        const evidence = evidenceStore.captureObservation({ kind: "command", claim: "terminal check", observation: { exitCode: 0, stdout: "ok", stderr: "" } });
+        return { runId: "terminal-track", status: "accepted", validation: { status: "accepted" }, checks: [{ status: "passed" }], result: { evidence: [evidence] } };
+      },
+    }),
+    finalize: ({ taskId, leaseId, fencingToken, verification }) => requestBrokerIpc({
+      socketPath: supervisor.socketPath, authorization: supervisor.controllerToken,
+      method: "finalizeVerifiedTask", params: { taskId, leaseId, fencingToken, verification },
+    }),
+    onFinalized: (input) => { observed = input.routingObservation; return { status: "recorded" }; },
+  });
+  supervisor = signedSupervisor(root, fixtureRegistry(), (receipt, binding) => authority.verify(receipt, binding));
+  try {
+    await supervisor.start();
+    const contract = fixtureContract({ taskId: "terminal-logical-task" });
+    const resolver = resolverFor(supervisor, root, () => ({ expectedModel: MODEL, contract }), undefined, undefined, queuedTaskVerifier);
+    const decision = await resolver.resolve(request("terminal-child"));
+    assert.equal(decision.action, "allow");
+    await decision.policy.onChildSessionOpened();
+    assert.deepEqual(supervisor.auditSnapshot().pendingTasks, [], "failed/unfinished attempts never pre-track themselves");
+    assert.deepEqual(await decision.policy.trackForVerification(), { status: "tracked" });
+    assert.deepEqual(supervisor.auditSnapshot().pendingTasks.map((task) => task.state), ["claimed"]);
+    const closed = await decision.policy.onChildSessionClosed({ status: "completed", usage: { input: 8, output: 5 }, attempts: 2 });
+    assert.deepEqual(closed.verification.outcome, { status: "completed" });
+    assert.equal(observed.tokens, 13);
+    assert.equal(observed.attempts, 2);
+    assert.deepEqual(supervisor.auditSnapshot().pendingTasks.map((task) => task.state), ["completed"]);
+  } finally {
+    await supervisor?.stop().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("controller resolver denies a child prompt not bound to the selected contract", async () => {
   const root = mkdtempSync(join(tmpdir(), "br-prompt-"));
   const supervisor = signedSupervisor(root);
