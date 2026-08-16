@@ -111,7 +111,7 @@ export class BrokeredChildRunner {
 
       await policy.onChildSessionOpened?.();
 
-      const handle = Object.freeze({
+      const handle = {
         id: childId,
         session: child.session,
         resolved: child.resolved,
@@ -119,7 +119,7 @@ export class BrokeredChildRunner {
         release,
         worktree,
         result: null,
-      });
+      };
 
       this.#handles.set(childId, handle);
 
@@ -157,7 +157,7 @@ export class BrokeredChildRunner {
         resolved: handle.resolved,
       };
     } finally {
-      release: handle.release();
+      handle.release();
       await session.dispose().catch(() => undefined);
       await policy.onChildSessionClosed?.({ status: result.status, ...(result.error ? { error: result.error } : {}) });
       if (worktree) {
@@ -188,8 +188,14 @@ export class BrokeredChildRunner {
   }
 
   async dispose() {
-    for (const handle of this.#handles.values()) {
+    const handles = [...this.#handles.values()];
+    for (const handle of handles) {
       await handle.session.abort().catch(() => undefined);
+    }
+    // Wait for #runAndClose to finish — it calls onChildSessionClosed
+    // which releases the broker lease.
+    await Promise.allSettled(handles.map((h) => h.result));
+    for (const handle of handles) {
       await handle.session.dispose().catch(() => undefined);
     }
     this.#handles.clear();
