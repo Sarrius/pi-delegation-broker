@@ -35,6 +35,9 @@ import {
   ControllerEvidenceStore,
   ControllerQueuedTaskVerifier,
   ControllerVerificationAuthority,
+  ControllerVerifiedRoutingBoard,
+  ModelAffinityJournal,
+  RoutingBoard,
   SingleHostBrokerSupervisor,
   buildCurrencyMap,
   createSelectContract,
@@ -188,6 +191,10 @@ async function startBroker(): Promise<BrokerRuntime> {
   const acceptancePlans = new Map<string, Array<{ id: string; claim: string; argv: string[]; timeoutMs: number }>>();
   const evidenceStore = new ControllerEvidenceStore({ root: join(STATE_DIR, "verification-evidence") });
   const verificationAuthority = new ControllerVerificationAuthority({ evidenceStore });
+  const affinityJournal = new ModelAffinityJournal({ path: join(STATE_DIR, "model-affinity.json") });
+  const verifiedRouting = new ControllerVerifiedRoutingBoard({
+    routingBoard: new RoutingBoard(), verificationAuthority, affinityJournal,
+  });
   const queuedTaskVerifier = new ControllerQueuedTaskVerifier({
     authority: verificationAuthority,
     createVerifier: async ({ taskId }: { taskId: string }) => {
@@ -207,6 +214,12 @@ async function startBroker(): Promise<BrokerRuntime> {
       socketPath: supervisor.socketPath, authorization: supervisor.controllerToken,
       method: "finalizeVerifiedTask", params: { taskId, leaseId, fencingToken, verification },
     }),
+    onFinalized: ({ taskId, leaseId, fencingToken, verification, outcome, routingObservation }: any) => {
+      if (!routingObservation) return { status: "not_recorded" };
+      return verifiedRouting.recordFinalized({ taskId, leaseId, fencingToken, verification, outcome,
+        resourceId: routingObservation.resourceId, capabilities: routingObservation.capabilities,
+        latencyMs: routingObservation.latencyMs });
+    },
   });
 
   // The catalog says what Pi knows; the probe says what providers still offer and when each
@@ -235,6 +248,7 @@ async function startBroker(): Promise<BrokerRuntime> {
     availability: () => supervisor.inventory(),
     currency,
     preferences: () => loadModelPreferences(PREFERENCES_PATH),
+    learnedRanker: (input: any) => affinityJournal.rank(input),
     enforceQuality: true,
   });
   const resolver = new BrokeredLaunchResolver({
