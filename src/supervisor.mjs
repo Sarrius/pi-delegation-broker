@@ -67,8 +67,9 @@ function deepFreeze(value) {
  * It establishes one fail-closed owner-only state directory, a durable SQLite
  * ledger, a private Unix socket, periodic lease expiry and a bounded shutdown.
  * It intentionally is not a detached production daemon: the controller keeps
- * the object and its bootstrap token in-process. It has no provider client or
- * credential path.
+ * the object and its bootstrap token in-process. A provider transport may be
+ * injected only as an already-approved controller-owned route pair; it never
+ * reads credentials or ambient authentication itself.
  */
 export class SingleHostBrokerSupervisor {
   #stateDir;
@@ -76,6 +77,10 @@ export class SingleHostBrokerSupervisor {
   #registryStatus;
   #controllerToken;
   #fakeProvider;
+  #providerTransport;
+  #routeResolver;
+  #verificationReceiptVerifier;
+  #resourceRanker;
   #sweepIntervalMs;
   #shutdownDrainMs;
   #instanceId = randomUUID();
@@ -96,6 +101,10 @@ export class SingleHostBrokerSupervisor {
     allowUnsignedFixture = false,
     controllerToken = randomBytes(32).toString("base64url"),
     fakeProvider,
+    providerTransport,
+    routeResolver,
+    verificationReceiptVerifier,
+    resourceRanker,
     sweepIntervalMs = 1_000,
     shutdownDrainMs = 2_000,
   }) {
@@ -130,7 +139,23 @@ export class SingleHostBrokerSupervisor {
       throw new Error("Broker shutdownDrainMs must be an integer between 0 and 60000");
     }
     this.#controllerToken = validateControllerToken(controllerToken);
+    if ((providerTransport && !routeResolver) || (!providerTransport && routeResolver)) {
+      throw new Error("Broker supervisor real provider transport requires both providerTransport and routeResolver");
+    }
+    if (providerTransport && fakeProvider) throw new Error("Broker supervisor chooses either fakeProvider or real provider transport");
+    if (providerTransport && typeof providerTransport.stream !== "function") throw new Error("Broker supervisor providerTransport requires stream");
+    if (routeResolver && typeof routeResolver !== "function") throw new Error("Broker supervisor routeResolver must be a function");
+    if (verificationReceiptVerifier !== undefined && typeof verificationReceiptVerifier !== "function") {
+      throw new Error("Broker supervisor verificationReceiptVerifier must be a function");
+    }
+    if (resourceRanker !== undefined && typeof resourceRanker !== "function") {
+      throw new Error("Broker supervisor resourceRanker must be a function");
+    }
     this.#fakeProvider = fakeProvider;
+    this.#providerTransport = providerTransport;
+    this.#routeResolver = routeResolver;
+    this.#verificationReceiptVerifier = verificationReceiptVerifier;
+    this.#resourceRanker = resourceRanker;
     this.#sweepIntervalMs = sweepIntervalMs;
     this.#shutdownDrainMs = shutdownDrainMs;
   }
@@ -168,13 +193,19 @@ export class SingleHostBrokerSupervisor {
     try {
       this.#acquireLock();
       rejectUnsafeExistingFile(this.databasePath, "database");
-      this.#broker = new SqliteLeaseBroker({ path: this.databasePath, registry: this.#registry });
+      this.#broker = new SqliteLeaseBroker({
+        path: this.databasePath,
+        registry: this.#registry,
+        ...(this.#verificationReceiptVerifier === undefined ? {} : { verificationReceiptVerifier: this.#verificationReceiptVerifier }),
+        ...(this.#resourceRanker === undefined ? {} : { resourceRanker: this.#resourceRanker }),
+      });
       hardenFile(this.databasePath);
       this.#server = new BrokerIpcServer({
         broker: this.#broker,
         socketPath: this.socketPath,
         controllerToken: this.#controllerToken,
         ...(this.#fakeProvider === undefined ? {} : { fakeProvider: this.#fakeProvider }),
+        ...(this.#providerTransport === undefined ? {} : { providerTransport: this.#providerTransport, routeResolver: this.#routeResolver }),
       });
       await this.#server.start();
       // SQLite may create WAL/SHM beside the DB. The owner-only directory is

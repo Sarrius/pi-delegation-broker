@@ -39,6 +39,7 @@ export class BrokeredLaunchResolver {
   #offline;
   #selectContract;
   #launcherAttestationConfig;
+  #queuedTaskVerifier;
   #admissions = new Map();
 
   constructor({
@@ -49,6 +50,7 @@ export class BrokeredLaunchResolver {
     offline = false,
     selectContract,
     launcherAttestationConfig,
+    queuedTaskVerifier,
   }) {
     if (typeof socketPath !== "string" || !isAbsolute(socketPath)) throw new Error("Broker launch resolver needs an absolute socketPath");
     if (typeof controllerToken !== "string" || controllerToken.length < 32) throw new Error("Broker launch resolver needs a controller-only token");
@@ -57,6 +59,9 @@ export class BrokeredLaunchResolver {
     }
     if (typeof offline !== "boolean") throw new Error("Broker launch resolver offline must be boolean");
     if (typeof selectContract !== "function") throw new Error("Broker launch resolver needs a controller selectContract function");
+    if (queuedTaskVerifier !== undefined && typeof queuedTaskVerifier.verifyAndFinalize !== "function") {
+      throw new Error("Broker launch resolver queuedTaskVerifier must be a controller-owned verifier coordinator");
+    }
     if (launcherAttestationConfig !== undefined) {
       if (!launcherAttestationConfig || typeof launcherAttestationConfig !== "object" || Array.isArray(launcherAttestationConfig)
         || !Array.isArray(launcherAttestationConfig.trustedExtensionDigests)
@@ -75,6 +80,7 @@ export class BrokeredLaunchResolver {
       behavioralExtensionPath: launcherAttestationConfig.behavioralExtensionPath,
       trustedExtensionDigests: Object.freeze([...launcherAttestationConfig.trustedExtensionDigests]),
     });
+    this.#queuedTaskVerifier = queuedTaskVerifier;
   }
 
   /** Compatible with TrustedChildLaunchResolver; request has no raw prompt. */
@@ -158,7 +164,14 @@ export class BrokeredLaunchResolver {
         agentDir,
         capability: issued.capability,
         phase: "pending_handoff",
-        ...(queuedTaskId === undefined ? {} : { queuedTaskId }),
+        ...(queuedTaskId === undefined ? {} : {
+          queuedTaskId,
+          routingObservation: Object.freeze({
+            resourceId: lease.resourceId,
+            capabilities: Object.freeze([...selection.contract.capability.required]),
+            issuedAt: lease.issuedAt,
+          }),
+        }),
       };
       this.#admissions.set(request.childId, admission);
       return {
@@ -213,7 +226,21 @@ export class BrokeredLaunchResolver {
    * durable task waits for a separate controller verifier receipt.
    */
   async finalizeHandedChild(childId, _result) {
-    return this.#releaseAdmission(childId, "closed_release_pending");
+    // Do not let the caller's child result influence terminal acceptance.
+    const admission = this.#admissions.get(childId);
+    const released = await this.#releaseAdmission(childId, "closed_release_pending");
+    if (!admission?.queuedTaskId || released.status !== "awaiting_verification" || !this.#queuedTaskVerifier) return released;
+    const verification = await this.#queuedTaskVerifier.verifyAndFinalize({
+      taskId: admission.queuedTaskId,
+      leaseId: admission.lease.leaseId,
+      fencingToken: admission.lease.fencingToken,
+      routingObservation: Object.freeze({
+        resourceId: admission.routingObservation.resourceId,
+        capabilities: admission.routingObservation.capabilities,
+        latencyMs: Math.max(0, Date.now() - admission.routingObservation.issuedAt),
+      }),
+    });
+    return Object.freeze({ ...released, verification });
   }
 
   /** Retry only records explicitly known to be unhanded or session-closed. */

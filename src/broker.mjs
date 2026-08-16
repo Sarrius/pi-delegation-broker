@@ -39,7 +39,7 @@ function enforcementSatisfies(actual, required) {
 function normalizeVerificationReceipt(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("verification receipt must be an object");
   const keys = Object.keys(value).sort();
-  const expected = ["evidenceRefs", "status", "verifierRunId"];
+  const expected = ["evidenceRefs", "receiptRef", "status", "verifierRunId"];
   if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
     throw new Error("verification receipt has unsupported or missing fields");
   }
@@ -47,13 +47,21 @@ function normalizeVerificationReceipt(value) {
   if (typeof value.verifierRunId !== "string" || !IDENTIFIER.test(value.verifierRunId)) {
     throw new Error("verification receipt verifierRunId is invalid");
   }
+  if (typeof value.receiptRef !== "string" || !EVIDENCE_REF.test(value.receiptRef)) {
+    throw new Error("verification receipt receiptRef is invalid");
+  }
   if (!Array.isArray(value.evidenceRefs) || value.evidenceRefs.length > 20
     || value.evidenceRefs.some((ref) => typeof ref !== "string" || !EVIDENCE_REF.test(ref))
     || new Set(value.evidenceRefs).size !== value.evidenceRefs.length
     || (value.status === "accepted" && value.evidenceRefs.length < 1)) {
     throw new Error("verification receipt evidenceRefs are invalid");
   }
-  return Object.freeze({ status: value.status, verifierRunId: value.verifierRunId, evidenceRefs: Object.freeze([...value.evidenceRefs]) });
+  return Object.freeze({
+    status: value.status,
+    verifierRunId: value.verifierRunId,
+    evidenceRefs: Object.freeze([...value.evidenceRefs]),
+    receiptRef: value.receiptRef,
+  });
 }
 
 function asLease(row) {
@@ -88,8 +96,13 @@ export class SqliteLeaseBroker {
   #maxPendingTasks;
   #agingStepMs;
   #behavioralEnforcement;
+  #verificationReceiptVerifier;
+  #resourceRanker;
 
-  constructor({ path, registry, maxPendingTasks = 1_000, agingStepMs = 30_000, behavioralEnforcement = "unavailable" }) {
+  constructor({
+    path, registry, maxPendingTasks = 1_000, agingStepMs = 30_000,
+    behavioralEnforcement = "unavailable", verificationReceiptVerifier, resourceRanker,
+  }) {
     if (!path) throw new Error("SQLite broker needs a database path");
     if (!Number.isSafeInteger(maxPendingTasks) || maxPendingTasks < 1 || maxPendingTasks > 100_000) {
       throw new Error("maxPendingTasks must be an integer between 1 and 100000");
@@ -98,9 +111,17 @@ export class SqliteLeaseBroker {
       throw new Error("agingStepMs must be an integer between 1 and 86400000");
     }
     if (!BEHAVIORAL_ENFORCEMENT.has(behavioralEnforcement)) throw new Error("behavioralEnforcement must be unavailable or blocking_monitor");
+    if (verificationReceiptVerifier !== undefined && typeof verificationReceiptVerifier !== "function") {
+      throw new Error("verificationReceiptVerifier must be a controller-owned function");
+    }
+    if (resourceRanker !== undefined && typeof resourceRanker !== "function") {
+      throw new Error("resourceRanker must be a controller-owned function");
+    }
     this.#maxPendingTasks = maxPendingTasks;
     this.#agingStepMs = agingStepMs;
     this.#behavioralEnforcement = behavioralEnforcement;
+    this.#verificationReceiptVerifier = verificationReceiptVerifier;
+    this.#resourceRanker = resourceRanker;
     this.#db = new DatabaseSync(path);
     try {
       // Configure the connection wait before contending for the database-wide
@@ -349,6 +370,14 @@ export class SqliteLeaseBroker {
    */
   finalizeVerifiedTask(taskId, leaseId, fencingToken, verification, now) {
     const verdict = normalizeVerificationReceipt(verification);
+    // The controller IPC token is necessary but insufficient: the receipt
+    // must also be rooted in the controller's retained evidence authority.
+    // This callback is boot-injected, never serialized or child-configurable.
+    let receiptVerified = false;
+    try {
+      receiptVerified = this.#verificationReceiptVerifier?.(verdict, Object.freeze({ taskId, leaseId, fencingToken })) === true;
+    } catch { /* fail closed */ }
+    if (!receiptVerified) return { status: "denied_verification" };
     return this.#transaction(() => {
       const pending = this.#db.prepare("SELECT 1 FROM pending_tasks WHERE task_id = ? AND lease_id = ? AND state = 'awaiting_result'")
         .get(taskId, leaseId);
@@ -365,6 +394,7 @@ export class SqliteLeaseBroker {
         verifierRunId: verdict.verifierRunId,
         verificationStatus: verdict.status,
         evidenceRefs: verdict.evidenceRefs,
+        receiptRef: verdict.receiptRef,
       });
       return { status: terminalState };
     });
@@ -1005,7 +1035,7 @@ export class SqliteLeaseBroker {
     }
 
     const requestedProfile = this.#profile(contract.capability.minimumProfile);
-    const rows = this.#db.prepare(`
+    let rows = this.#db.prepare(`
       SELECT
         r.id, r.capacity_group, r.profile, r.state, r.enforcement,
         r.inventory_confidence AS resource_confidence,
@@ -1015,6 +1045,7 @@ export class SqliteLeaseBroker {
       FROM resources r JOIN capacity_groups g ON g.id = r.capacity_group
       ORDER BY r.id
     `).all();
+    rows = this.#rankResources(rows, contract, now);
     let earliestCompatibleAt;
     let assumedInventoryBlocked = false;
     for (const resource of rows) {
@@ -1100,6 +1131,21 @@ export class SqliteLeaseBroker {
     const result = { status: "denied_capacity", ...(earliestCompatibleAt === undefined ? {} : { earliestCompatibleAt }) };
     this.#record(now, "ReservationDenied", { taskId: contract.taskId, ...result });
     return result;
+  }
+
+  #rankResources(rows, contract, now) {
+    if (!this.#resourceRanker || rows.length < 2) return rows;
+    const resourceIds = Object.freeze(rows.map((row) => row.id));
+    const rankerContract = Object.freeze({ capability: Object.freeze({ required: Object.freeze([...contract.capability.required]) }) });
+    const ranking = this.#resourceRanker(Object.freeze({ contract: rankerContract, resourceIds, now }));
+    if (!Array.isArray(ranking) || ranking.length !== resourceIds.length
+      || ranking.some((resourceId) => typeof resourceId !== "string")
+      || new Set(ranking).size !== resourceIds.length
+      || ranking.some((resourceId) => !resourceIds.includes(resourceId))) {
+      throw new Error("resourceRanker must return an exact resource candidate permutation");
+    }
+    const order = new Map(ranking.map((resourceId, index) => [resourceId, index]));
+    return [...rows].sort((left, right) => order.get(left.id) - order.get(right.id));
   }
 
   #admissionHasCapacity(group, admissionClass, counts) {

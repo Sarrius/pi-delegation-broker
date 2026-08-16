@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { validateResultEvidence } from "./evidence.mjs";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
-const EVIDENCE_REF = /^controller:[0-9a-f-]{36}$/;
 const KINDS = new Set(["command", "test"]);
 
 function bounded(value, label, max = 500) {
@@ -58,31 +57,15 @@ function passed(kind, observation) {
  * read-only verifier work in its own isolated environment.
  */
 /**
- * Convert a locally produced verifier run into the only receipt accepted by
- * broker.finalizeVerifiedTask. Call this in controller code, never on a child
- * report: it validates the retained controller descriptors returned by verify.
+ * Retain a fixed-plan verifier outcome through a controller authority before
+ * passing it to broker.finalizeVerifiedTask. This intentionally cannot turn a
+ * merely shape-valid child report into a terminal receipt.
  */
-export function controllerVerificationReceipt(verification) {
-  if (!verification || (verification.status !== "accepted" && verification.status !== "rejected")
-    || typeof verification.runId !== "string" || !ID.test(verification.runId)
-    || !Array.isArray(verification.result?.evidence)
-    || (verification.status === "accepted" && verification.validation?.status !== "accepted")) {
-    throw new Error("controller verification run is malformed or not accepted");
+export function controllerVerificationReceipt(verification, authority, binding) {
+  if (!authority || typeof authority.attest !== "function") {
+    throw new Error("controller verification receipt requires a controller verification authority");
   }
-  const evidenceRefs = verification.result.evidence.map((descriptor) => {
-    if (descriptor?.source !== "controller" || typeof descriptor.ref !== "string" || !EVIDENCE_REF.test(descriptor.ref)) {
-      throw new Error("controller verification run has an invalid evidence descriptor");
-    }
-    return descriptor.ref;
-  });
-  if (new Set(evidenceRefs).size !== evidenceRefs.length || (verification.status === "accepted" && evidenceRefs.length < 1)) {
-    throw new Error("controller verification run has invalid evidence references");
-  }
-  return Object.freeze({
-    status: verification.status,
-    verifierRunId: verification.runId,
-    evidenceRefs: Object.freeze(evidenceRefs),
-  });
+  return authority.attest(verification, binding);
 }
 
 export class ControllerAcceptanceVerifier {

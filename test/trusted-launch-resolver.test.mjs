@@ -5,6 +5,8 @@ import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fixtureContract, fixtureRegistry } from "../src/broker.mjs";
+import { ControllerEvidenceStore } from "../src/evidence.mjs";
+import { ControllerQueuedTaskVerifier, ControllerVerificationAuthority } from "../src/verification-authority.mjs";
 import { requestBrokerIpc } from "../src/ipc.mjs";
 import { signedRegistryMessage } from "../src/signed-registry.mjs";
 import { SingleHostBrokerSupervisor } from "../src/supervisor.mjs";
@@ -15,7 +17,7 @@ const CONTROLLER_TOKEN = "r".repeat(48);
 const EXTENSION_PATH = new URL("./isolated-fake-provider.ts", import.meta.url).pathname;
 const BEHAVIORAL_EXTENSION_PATH = new URL("../extensions/pi-behavioral-enforcement.ts", import.meta.url).pathname;
 
-function signedSupervisor(root, registry = fixtureRegistry()) {
+function signedSupervisor(root, registry = fixtureRegistry(), verificationReceiptVerifier) {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const now = Date.now();
   const payload = { registryVersion: "resolver-v1", issuedAt: now - 1_000, expiresAt: now + 60_000, ...registry };
@@ -26,6 +28,7 @@ function signedSupervisor(root, registry = fixtureRegistry()) {
     trustedRegistryKeys: { "resolver-key": publicKey.export({ type: "spki", format: "pem" }) },
     controllerToken: CONTROLLER_TOKEN,
     sweepIntervalMs: 100,
+    ...(verificationReceiptVerifier === undefined ? {} : { verificationReceiptVerifier }),
   });
 }
 
@@ -40,7 +43,7 @@ function request(childId) {
   };
 }
 
-function resolverFor(supervisor, root, selectContract, launcherAttestationConfig, extensionPaths = [EXTENSION_PATH]) {
+function resolverFor(supervisor, root, selectContract, launcherAttestationConfig, extensionPaths = [EXTENSION_PATH], queuedTaskVerifier) {
   return new BrokeredLaunchResolver({
     socketPath: supervisor.socketPath,
     controllerToken: supervisor.controllerToken,
@@ -49,6 +52,7 @@ function resolverFor(supervisor, root, selectContract, launcherAttestationConfig
     offline: true,
     selectContract,
     ...(launcherAttestationConfig === undefined ? {} : { launcherAttestationConfig }),
+    ...(queuedTaskVerifier === undefined ? {} : { queuedTaskVerifier }),
   });
 }
 
@@ -135,12 +139,41 @@ test("controller resolver preserves and safely reconciles a release after contro
   }
 });
 
-test("controller resolver claims an exact ready task, requeues pre-handoff failure, and requires verifier completion", async () => {
+test("controller resolver claims an exact ready task, requeues pre-handoff failure, and runs controller verification before completion", async () => {
   const root = mkdtempSync(join(tmpdir(), "br-q-"));
   const registry = fixtureRegistry();
   delete registry.resources.R2;
   delete registry.resources.R3;
-  const supervisor = signedSupervisor(root, registry);
+  const evidenceStore = new ControllerEvidenceStore({ root: join(root, "evidence") });
+  const authority = new ControllerVerificationAuthority({ evidenceStore });
+  let supervisor;
+  let routingFinalization;
+  const queuedTaskVerifier = new ControllerQueuedTaskVerifier({
+    authority,
+    createVerifier: async ({ taskId }) => ({
+      verify: async () => {
+        const evidence = evidenceStore.captureObservation({
+          kind: "command", claim: "controller completion check",
+          observation: { exitCode: 0, stdout: `verified ${taskId}`, stderr: "" },
+        });
+        return {
+          runId: "resolver-queue-verifier", status: "accepted", validation: { status: "accepted" },
+          checks: [{ status: "passed" }], result: { evidence: [evidence] },
+        };
+      },
+    }),
+    finalize: ({ taskId, leaseId, fencingToken, verification }) => requestBrokerIpc({
+      socketPath: supervisor.socketPath,
+      authorization: supervisor.controllerToken,
+      method: "finalizeVerifiedTask",
+      params: { taskId, leaseId, fencingToken, verification },
+    }),
+    onFinalized: (input) => {
+      routingFinalization = input;
+      return { status: "recorded" };
+    },
+  });
+  supervisor = signedSupervisor(root, registry, (receipt, binding) => authority.verify(receipt, binding));
   try {
     await supervisor.start();
     const occupantContract = fixtureContract({ taskId: "resolver-queue-occupant" });
@@ -172,7 +205,7 @@ test("controller resolver claims an exact ready task, requeues pre-handoff failu
       expectedModel: MODEL,
       contract: queuedContract,
       readyTask: { taskId: queuedContract.taskId, leaseId: ready.lease.leaseId },
-    }));
+    }), undefined, undefined, queuedTaskVerifier);
 
     const abandoned = await resolver.resolve(request("queued_abandoned"));
     assert.equal(abandoned.action, "allow");
@@ -189,25 +222,17 @@ test("controller resolver claims an exact ready task, requeues pre-handoff failu
     const completed = await resolver.resolve(request("queued_completed"));
     assert.equal(completed.action, "allow");
     await completed.policy.onChildSessionOpened();
-    await completed.policy.onChildSessionClosed({ status: "completed" });
-    assert.deepEqual(supervisor.auditSnapshot().pendingTasks.map((task) => task.state), ["awaiting_result"], "child completion is not task acceptance");
+    const completion = await completed.policy.onChildSessionClosed({ status: "completed" });
+    assert.deepEqual(completion.verification.outcome, { status: "completed" });
+    assert.deepEqual(completion.verification.routing, { status: "recorded" });
+    assert.equal(routingFinalization.routingObservation.resourceId, "R1");
+    assert.deepEqual(routingFinalization.routingObservation.capabilities, queuedContract.capability.required);
+    assert.equal(authority.verify(completion.verification.verification, {
+      taskId: queuedContract.taskId,
+      leaseId: completed.policy.environment.PI_BROKER_LEASE_ID,
+      fencingToken: Number(completed.policy.environment.PI_BROKER_FENCING_TOKEN),
+    }), true);
     assert.equal(supervisor.auditSnapshot().leases.length, 0);
-    const verified = await requestBrokerIpc({
-      socketPath: supervisor.socketPath,
-      authorization: supervisor.controllerToken,
-      method: "finalizeVerifiedTask",
-      params: {
-        taskId: queuedContract.taskId,
-        leaseId: completed.policy.environment.PI_BROKER_LEASE_ID,
-        fencingToken: Number(completed.policy.environment.PI_BROKER_FENCING_TOKEN),
-        verification: {
-          status: "accepted",
-          verifierRunId: "resolver-queue-verifier",
-          evidenceRefs: ["controller:11111111-1111-4111-8111-111111111111"],
-        },
-      },
-    });
-    assert.deepEqual(verified, { status: "completed" });
     assert.deepEqual(supervisor.auditSnapshot().pendingTasks.map((task) => task.state), ["completed"]);
     assert.equal(resolver.admissions().length, 0);
   } finally {

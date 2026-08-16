@@ -6,6 +6,10 @@
 
 **Publication state:** public GitHub repository and prereleases created; `@sars267/pi-delegation-broker@0.1.0-alpha.0` and the OIDC-attested `0.1.0-alpha.1` are published on npm. No real provider request was made.
 
+## Current unreleased branch delta
+
+This record's historical published-artifact counts below do not describe the current uncommitted/unpublished branch. The current local branch adds task/lease/fence-bound controller verifier receipts, the close→verify→finalize coordinator, receipt-bound routing preference, controller-only in-memory credential/route/expiring approval primitives, and an owner-gated live validation plan. `npm run release:check` currently passes **176/176** deterministic tests and a **33-file / 375,969-byte** tarball check. These are mock/offline results only: no credential, live provider request, quota consumption, publish, or upstream patch application occurred.
+
 ## Passed local evidence
 
 - `npm run release:check` passed on Node `v26.7.0` / npm `11.19.0`.

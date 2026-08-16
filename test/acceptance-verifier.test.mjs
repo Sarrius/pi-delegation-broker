@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { ControllerAcceptanceVerifier, controllerVerificationReceipt } from "../src/acceptance-verifier.mjs";
 import { ControllerEvidenceStore } from "../src/evidence.mjs";
+import { ControllerVerificationAuthority } from "../src/verification-authority.mjs";
 
 async function withStore(run) {
   const root = mkdtempSync(join(tmpdir(), "acceptance-verifier-"));
@@ -38,9 +39,15 @@ test("controller verifier runs its complete fixed plan and produces retained con
     assert.deepEqual(verification.result.validationPerformed.map((item) => item.check), ["npm run check", "npm test"]);
     assert.equal(verification.result.evidence.every((descriptor) => descriptor.source === "controller" && store.verify(descriptor)), true);
     assert.equal(verification.checks.every((check) => check.status === "passed"), true);
-    const receipt = controllerVerificationReceipt(verification);
+    const authority = new ControllerVerificationAuthority({ evidenceStore: store });
+    const binding = { taskId: "task-1", leaseId: "lease-1", fencingToken: 1 };
+    const receipt = controllerVerificationReceipt(verification, authority, binding);
     assert.equal(receipt.status, "accepted");
     assert.deepEqual(receipt.evidenceRefs, verification.result.evidence.map((descriptor) => descriptor.ref));
+    assert.equal(authority.verify(receipt, binding), true);
+    assert.equal(authority.verify(receipt, { ...binding, taskId: "other-task" }), false);
+    assert.equal(authority.verify({ ...receipt, status: "rejected" }, binding), false);
+    assert.throws(() => controllerVerificationReceipt(verification), /authority/);
   });
 });
 
@@ -55,9 +62,15 @@ test("failed, malformed, or timed-out controller checks reject instead of accept
     assert.equal(failedResult.status, "rejected");
     assert.equal(failedResult.checks[0].status, "failed");
     assert.match(failedResult.validation.reasons.join("\n"), /acceptance lacks controller evidence/);
-    assert.deepEqual(controllerVerificationReceipt(failedResult), {
+    const authority = new ControllerVerificationAuthority({ evidenceStore: store });
+    const failedBinding = { taskId: "task-2", leaseId: "lease-2", fencingToken: 2 };
+    const receipt = controllerVerificationReceipt(failedResult, authority, failedBinding);
+    assert.deepEqual({
+      status: receipt.status, verifierRunId: receipt.verifierRunId, evidenceRefs: receipt.evidenceRefs,
+    }, {
       status: "rejected", verifierRunId: failedResult.runId, evidenceRefs: [failedResult.result.evidence[0].ref],
     });
+    assert.equal(authority.verify(receipt, failedBinding), true);
 
     const malformed = new ControllerAcceptanceVerifier({
       evidenceStore: store,

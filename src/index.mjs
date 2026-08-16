@@ -1,12 +1,13 @@
 /**
  * Public API for the non-production, single-host Pi delegation broker reference.
- * It intentionally contains no provider credential, HTTP client, or automatic
- * provider failover implementation.
+ * It contains only controller-injected credential/route primitives; it has no
+ * ambient authentication, account rotation, retry, or automatic failover.
  */
 export { BehavioralRunMonitor } from "./behavior-monitor.mjs";
 export { SqliteLeaseBroker } from "./broker.mjs";
 export { ControllerEvidenceStore, validateResultEvidence } from "./evidence.mjs";
 export { ControllerAcceptanceVerifier, controllerVerificationReceipt } from "./acceptance-verifier.mjs";
+export { ControllerQueuedTaskVerifier, ControllerVerificationAuthority, createControllerVerifierRunId } from "./verification-authority.mjs";
 export { BrokerIpcServer, requestBrokerIpc, streamProviderIpc } from "./ipc.mjs";
 export { provisionBrokeredAgentDir } from "./isolated-child-config.mjs";
 export {
@@ -22,6 +23,14 @@ export {
 } from "./provider-protocol.mjs";
 export { catalogToBrokerRegistry, fixtureCatalog } from "./provider-catalog.mjs";
 export {
+  ControllerAccountInventory,
+  ControllerCredentialStore,
+  ControllerLiveProviderApproval,
+  ControllerRouteTable,
+  createApprovedAnthropicProviderRoute,
+  loadControllerRouteConfiguration,
+} from "./controller-provider-config.mjs";
+export {
   ANTHROPIC_API_VERSION,
   ANTHROPIC_MESSAGES_ADAPTER_ID,
   AnthropicMessagesTransport,
@@ -29,6 +38,7 @@ export {
   buildAnthropicMessagesRequest,
 } from "./anthropic-messages-transport.mjs";
 export { RoutingBoard } from "./routing-board.mjs";
+export { ControllerVerifiedRoutingBoard } from "./verified-routing-board.mjs";
 export { captureProviderContext } from "./provider-context.mjs";
 export { compileEffectiveChildCapability, createEffectiveChildCapability, deriveAllowedTools } from "./capability-compiler.mjs";
 export { ArtifactPipeline } from "./artifact-pipeline.mjs";

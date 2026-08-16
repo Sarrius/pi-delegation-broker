@@ -3,7 +3,7 @@ import test from "node:test";
 import * as api from "../src/index.mjs";
 import * as testing from "../src/testing.mjs";
 
-test("public API excludes test fixtures while exposing only unconfigured transport primitives", () => {
+test("public API excludes test fixtures while exposing controller-gated transport primitives", () => {
   assert.deepEqual(Object.keys(api).sort(), [
     "ANTHROPIC_API_VERSION",
     "ANTHROPIC_MESSAGES_ADAPTER_ID",
@@ -15,7 +15,14 @@ test("public API excludes test fixtures while exposing only unconfigured transpo
     "BrokerIpcServer",
     "BrokeredLaunchResolver",
     "ControllerAcceptanceVerifier",
+    "ControllerAccountInventory",
+    "ControllerCredentialStore",
     "ControllerEvidenceStore",
+    "ControllerLiveProviderApproval",
+    "ControllerQueuedTaskVerifier",
+    "ControllerRouteTable",
+    "ControllerVerificationAuthority",
+    "ControllerVerifiedRoutingBoard",
     "OUTCOME_PROPERTIES",
     "PROVIDER_PROTOCOL_VERSION",
     "ProviderProtocolError",
@@ -29,11 +36,14 @@ test("public API excludes test fixtures while exposing only unconfigured transpo
     "catalogToBrokerRegistry",
     "compileEffectiveChildCapability",
     "controllerVerificationReceipt",
+    "createApprovedAnthropicProviderRoute",
     "createAttemptRouteSnapshot",
+    "createControllerVerifierRunId",
     "createEffectiveChildCapability",
     "deriveAllowedTools",
     "fixtureCatalog",
     "isTerminalOutcome",
+    "loadControllerRouteConfiguration",
     "outcomeProperties",
     "provisionBrokeredAgentDir",
     "requestBrokerIpc",

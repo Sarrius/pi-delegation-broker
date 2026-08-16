@@ -7,12 +7,36 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { SqliteLeaseBroker, fixtureContract, fixtureRegistry } from "../src/broker.mjs";
+import { ControllerEvidenceStore } from "../src/evidence.mjs";
+import { ControllerVerificationAuthority } from "../src/verification-authority.mjs";
 
 function withBroker(callback, registry = fixtureRegistry(), options = {}) {
   const directory = mkdtempSync(join(tmpdir(), "delegation-broker-mvp-"));
   const path = join(directory, "broker.sqlite");
   const broker = new SqliteLeaseBroker({ path, registry, ...options });
   try { return callback(broker, path, directory); } finally { broker.close(); rmSync(directory, { recursive: true, force: true }); }
+}
+
+function withVerifiedBroker(callback, registry = fixtureRegistry(), options = {}) {
+  const directory = mkdtempSync(join(tmpdir(), "delegation-broker-verified-"));
+  const store = new ControllerEvidenceStore({ root: join(directory, "evidence") });
+  const authority = new ControllerVerificationAuthority({ evidenceStore: store });
+  const broker = new SqliteLeaseBroker({
+    path: join(directory, "broker.sqlite"), registry,
+    verificationReceiptVerifier: (receipt, binding) => authority.verify(receipt, binding),
+    ...options,
+  });
+  try { return callback(broker, authority, store); } finally { broker.close(); rmSync(directory, { recursive: true, force: true }); }
+}
+
+function acceptedReceipt(authority, store, runId, binding) {
+  const evidence = store.captureObservation({
+    kind: "command", claim: "controller check", observation: { exitCode: 0, stdout: "ok", stderr: "" }, capturedAt: 1_005,
+  });
+  return authority.attest({
+    status: "accepted", runId, validation: { status: "accepted" },
+    checks: [{ status: "passed" }], result: { evidence: [evidence] },
+  }, binding);
 }
 
 function leased(broker, contract = fixtureContract(), now = 1_000) {
@@ -136,7 +160,7 @@ test("ready work is claimed against the exact contract and only a controller ver
   const registry = fixtureRegistry();
   delete registry.resources.R2;
   delete registry.resources.R3;
-  withBroker((broker) => {
+  withVerifiedBroker((broker, authority, store) => {
     const occupant = leased(broker, fixtureContract({ taskId: "claim-occupant" }), 1_000);
     const contract = fixtureContract({ taskId: "claim-task", recovery: { owner: "root-controller", deadlineAt: 60_000 } });
     assert.equal(broker.submit(contract, 1_001).status, "queued");
@@ -152,10 +176,16 @@ test("ready work is claimed against the exact contract and only a controller ver
     broker.release(claimed.lease.leaseId, claimed.lease.fencingToken, "child provider shutdown", 1_004);
     assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["awaiting_result"]);
     assert.equal(broker.finalizeVerifiedTask("claim-task", claimed.lease.leaseId, claimed.lease.fencingToken, {
-      status: "accepted",
-      verifierRunId: "verifier-claim-task",
+      status: "accepted", verifierRunId: "forged-controller-shape",
       evidenceRefs: ["controller:11111111-1111-4111-8111-111111111111"],
-    }, 1_005).status, "completed");
+      receiptRef: "controller:22222222-2222-4222-8222-222222222222",
+    }, 1_005).status, "denied_verification", "controller IPC shape alone cannot complete a task");
+    assert.equal(broker.finalizeVerifiedTask(
+      "claim-task", claimed.lease.leaseId, claimed.lease.fencingToken,
+      acceptedReceipt(authority, store, "verifier-claim-task", {
+        taskId: "claim-task", leaseId: claimed.lease.leaseId, fencingToken: claimed.lease.fencingToken,
+      }), 1_005,
+    ).status, "completed");
     assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["completed"]);
     assert.equal(broker.leases().length, 0);
   }, registry);

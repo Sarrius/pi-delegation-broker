@@ -12,6 +12,7 @@
     "src",
     "extensions",
     "docs/INTEGRATION.md",
+    "docs/LIVE-VALIDATION-PLAN.md",
     "docs/PROVIDER-PROXY-PROTOCOL.md",
     "README.md",
     "LICENSE",

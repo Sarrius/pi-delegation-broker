@@ -2,7 +2,7 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 const root = new URL("..", import.meta.url).pathname;
-const publicRoots = ["src", "docs/INTEGRATION.md", "README.md", "SECURITY.md", "CHANGELOG.md", "LICENSE", "package.json"];
+const publicRoots = ["src", "docs/INTEGRATION.md", "docs/LIVE-VALIDATION-PLAN.md", "README.md", "SECURITY.md", "CHANGELOG.md", "LICENSE", "package.json"];
 const secretPatterns = [
   /sk-[A-Za-z0-9_-]{8,}/,
   /gh[pousr]_[A-Za-z0-9_]{20,}/,
