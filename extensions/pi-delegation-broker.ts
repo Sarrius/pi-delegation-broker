@@ -231,7 +231,20 @@ async function startBroker(): Promise<BrokerRuntime> {
     const routes = probeRoutes(currentRegistry);
     await Promise.all([...routes].map(async ([provider, route]) => {
       const result = await probeProviderModels({ baseUrl: route.baseUrl, apiKey: route.apiKey });
-      if (result.status !== "ok") return; // retain prior listing; an outage is not a delisting
+      if (result.status !== "ok") {
+        // A listing outage is not a delisting. Only controller-observed credential denial or
+        // throttling changes broker health; transport failures retain the prior route state.
+        if (result.status === "http_error" && (result.code === 401 || result.code === 403 || result.code === 429)) {
+          const resources = Object.entries(currentRegistry.resources ?? {})
+            .filter(([resourceId, resource]: [string, any]) => (resource.model ?? parseResourceModel(resourceId))?.provider === provider);
+          await Promise.all(resources.map(([resourceId]) => requestBrokerIpc({
+            socketPath: supervisor.socketPath, authorization: supervisor.controllerToken,
+            method: result.code === 429 ? "markRateLimited" : "markUnknown",
+            params: result.code === 429 ? { resourceId } : { resourceId, reason: "controller provider listing credential denied" },
+          })));
+        }
+        return;
+      }
       liveListings.set(provider, new Map(result.models.map((id: string) => [id, result.created?.[id]])));
     }));
   };
