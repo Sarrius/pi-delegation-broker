@@ -248,6 +248,10 @@ export class BrokeredLaunchResolver {
             PI_BROKER_LEASE_ID: lease.leaseId,
             PI_BROKER_FENCING_TOKEN: String(lease.fencingToken),
             PI_BROKER_CAPABILITY: issued.capability,
+            // Pi's CLI has no max-tokens flag, so the leased hard output cap has to reach the
+            // child's provider request itself; without it a child asks for the model maximum
+            // and a low-balance account rejects the whole attempt.
+            ...(lease.maxOutputTokens === undefined ? {} : { PI_BROKER_MAX_OUTPUT_TOKENS: String(lease.maxOutputTokens) }),
           },
           onBeforeChildAbandoned: async () => this.releaseUnhanded(request.childId),
           onChildSessionOpened: async () => this.markChildHanded(request.childId),

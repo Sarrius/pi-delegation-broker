@@ -31,7 +31,32 @@ function writeToolReport(path: string, report: { activeTools: string[] }): void 
   renameSync(tmp, path);
 }
 
+/**
+ * Clamp the child's provider request to the leased output budget. Pi exposes no max-tokens
+ * flag, so without this the child asks each provider for that model's maximum and a leased
+ * hard cap is advisory only — which a low-balance account rejects outright.
+ */
+function enforceLeasedOutputBudget(pi: any): void {
+  const cap = Number.parseInt(process.env.PI_BROKER_MAX_OUTPUT_TOKENS ?? "", 10);
+  if (!Number.isSafeInteger(cap) || cap < 1) return;
+  pi.on("before_provider_request", (event: any) => {
+    const payload = event?.payload;
+    if (!payload || typeof payload !== "object") return undefined;
+    const next: Record<string, unknown> = { ...payload };
+    for (const key of ["max_tokens", "max_output_tokens", "maxOutputTokens", "max_completion_tokens"]) {
+      const current = next[key];
+      if (typeof current === "number" && Number.isFinite(current) && current > cap) next[key] = cap;
+    }
+    const generationConfig = next.generationConfig as Record<string, unknown> | undefined;
+    if (generationConfig && typeof generationConfig.maxOutputTokens === "number" && generationConfig.maxOutputTokens > cap) {
+      next.generationConfig = { ...generationConfig, maxOutputTokens: cap };
+    }
+    return next;
+  });
+}
+
 export default function childShim(pi: any): void {
+  enforceLeasedOutputBudget(pi);
   const specPath = process.env[SHIM_SPEC_ENV];
   if (!specPath) return;
   const spec = readShimSpec(specPath);

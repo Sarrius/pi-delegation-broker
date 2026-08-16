@@ -28,7 +28,9 @@ const FAILURE_SIGNATURES = Object.freeze([
   // Reasoning-mode refusals are route-specific policy, not a dead task: another route accepts it.
   Object.freeze({ kind: "unavailable", pattern: /reasoning is mandatory|cannot be disabled|always engages in thinking/i }),
   // Exhausted credit/balance is this account's problem, not the task's: cool it and move on.
-  Object.freeze({ kind: "auth_fatal", pattern: /\b402\b|requires more credits|insufficient (credits|balance)|purchase credits|upgrade to a paid account/i }),
+  // Spent balance belongs to the whole account, not one of its models, so it cools the capacity
+  // group like a throttle does and recovers through the broker's existing half-open probe.
+  Object.freeze({ kind: "account_exhausted", pattern: /\b402\b|requires more credits|insufficient (credits|balance)|purchase credits|upgrade to a paid account/i }),
   Object.freeze({ kind: "unavailable", pattern: /\b(50[0234]|service unavailable|bad gateway|upstream|connection (refused|reset)|econnrefused|etimedout|network)\b/i }),
 ]);
 
@@ -138,7 +140,7 @@ export class BrokeredChildRunner {
       if (kind === "fatal" || attempt === maxAttempts) break;
 
       if (resourceId !== undefined) {
-        if (kind === "rate_limited") await this.#reportRateLimited(resourceId, lastResult.retryAfterMs);
+        if (kind === "rate_limited" || kind === "account_exhausted") await this.#reportRateLimited(resourceId, lastResult.retryAfterMs);
         else if (kind === "auth_fatal" || kind === "unavailable") await this.#reportUnavailable(resourceId, `provider ${kind}`);
         // A context overflow leaves the provider healthy — only this route is wrong.
         if (kind !== "context_exhausted") excludeResources.push(resourceId);
