@@ -30,7 +30,7 @@ function signedSupervisor(root) {
   });
 }
 
-test("live: spawn Pi child, send prompt, get real response, verify, close", async () => {
+test("live: spawn Pi child, send prompt, get real response, verify, close", { skip: !process.env.LIVE_TEST }, async () => {
   const root = mkdtempSync(join(tmpdir(), "live-"));
   let supervisor;
   try {

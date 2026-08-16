@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import {
   chmodSync,
   closeSync,
@@ -17,6 +18,7 @@ import { isAbsolute, join } from "node:path";
 import { SqliteLeaseBroker } from "./broker.mjs";
 import { BrokerIpcServer } from "./ipc.mjs";
 import { verifySignedRegistry } from "./signed-registry.mjs";
+import { DynamicProviderWatcher } from "./dynamic-provider-watcher.mjs";
 
 const SOCKET_NAME = "broker.sock";
 const DATABASE_NAME = "broker.sqlite";
@@ -81,6 +83,8 @@ export class SingleHostBrokerSupervisor {
   #routeResolver;
   #verificationReceiptVerifier;
   #resourceRanker;
+  #dynamicProviders;
+  #providerWatcher;
   #sweepIntervalMs;
   #shutdownDrainMs;
   #instanceId = randomUUID();
@@ -107,6 +111,7 @@ export class SingleHostBrokerSupervisor {
     resourceRanker,
     sweepIntervalMs = 1_000,
     shutdownDrainMs = 2_000,
+    dynamicProviders = false,
   }) {
     if (signedRegistry !== undefined && registry !== undefined) {
       throw new Error("Broker supervisor accepts either signedRegistry or unsigned fixture registry, not both");
@@ -158,6 +163,7 @@ export class SingleHostBrokerSupervisor {
     this.#resourceRanker = resourceRanker;
     this.#sweepIntervalMs = sweepIntervalMs;
     this.#shutdownDrainMs = shutdownDrainMs;
+    this.#dynamicProviders = dynamicProviders;
   }
 
   get stateDir() { return this.#stateDir; }
@@ -218,6 +224,14 @@ export class SingleHostBrokerSupervisor {
       this.#sweepTimer = setInterval(() => this.#runSweep(), this.#sweepIntervalMs);
       this.#sweepTimer.unref?.();
       this.#state = "running";
+      if (this.#dynamicProviders) {
+        this.#providerWatcher = new DynamicProviderWatcher({
+          agentDir: join(homedir(), ".pi", "agent"),
+          broker: this.#broker,
+          onReload: () => { /* provider set changed; broker registry updated */ },
+        });
+        this.#providerWatcher.start();
+      }
       return this.status();
     } catch (error) {
       await this.#cleanupAfterFailedStart();
@@ -233,6 +247,7 @@ export class SingleHostBrokerSupervisor {
     }
     this.#state = "stopping";
     clearInterval(this.#sweepTimer);
+    this.#providerWatcher?.stop();
     let failure;
     try {
       await this.#server?.stop({ drainMs: this.#shutdownDrainMs });

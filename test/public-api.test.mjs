@@ -24,6 +24,7 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "ControllerRouteTable",
     "ControllerVerificationAuthority",
     "ControllerVerifiedRoutingBoard",
+    "DynamicProviderWatcher",
     "OUTCOME_PROPERTIES",
     "PROVIDER_PROTOCOL_VERSION",
     "ProviderProtocolError",

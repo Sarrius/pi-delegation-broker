@@ -45,6 +45,7 @@ export { ArtifactPipeline } from "./artifact-pipeline.mjs";
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";
 export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
 export { BrokeredLaunchResolver } from "./trusted-launch-resolver.mjs";
+export { DynamicProviderWatcher } from "./dynamic-provider-watcher.mjs";
 export { BrokeredChildRunner } from "./brokered-runner.mjs";
 export { spawnBrokeredChild } from "./child-launcher.mjs";
 export { Semaphore } from "./semaphore.mjs";
