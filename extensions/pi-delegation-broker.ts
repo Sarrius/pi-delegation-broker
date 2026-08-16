@@ -60,6 +60,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 
 const EXTENSIONS_DIR = dirname(fileURLToPath(import.meta.url));
 const CHILD_SHIM_PATH = join(EXTENSIONS_DIR, "child-shim.ts");
+const BEHAVIORAL_ENFORCEMENT_PATH = join(EXTENSIONS_DIR, "pi-behavioral-enforcement.ts");
 const PARENT_AGENT_DIR = join(homedir(), ".pi", "agent");
 const STATE_DIR = join(PARENT_AGENT_DIR, "delegation-broker");
 const KEYS_PATH = join(STATE_DIR, "registry-keys.json");
@@ -281,7 +282,12 @@ async function startBroker(): Promise<BrokerRuntime> {
     socketPath: supervisor.socketPath,
     controllerToken: supervisor.controllerToken,
     agentRoot: join(STATE_DIR, "child-agents"),
-    extensionPaths: [CHILD_SHIM_PATH],
+    extensionPaths: [CHILD_SHIM_PATH, BEHAVIORAL_ENFORCEMENT_PATH],
+    launcherAttestationConfig: {
+      behavioralExtensionPath: BEHAVIORAL_ENFORCEMENT_PATH,
+      trustedExtensionDigests: [CHILD_SHIM_PATH, BEHAVIORAL_ENFORCEMENT_PATH]
+        .map((path) => createHash("sha256").update(readFileSync(path)).digest("hex")),
+    },
     offline: false,
     selectContract: (request: any) => {
       const selected = baseSelectContract(request);
