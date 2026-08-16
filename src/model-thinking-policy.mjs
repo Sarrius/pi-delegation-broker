@@ -10,6 +10,8 @@
 const ALWAYS_REASONING = Object.freeze([
   Object.freeze({ provider: /^zai$/, model: /^glm-5\./ }),
   Object.freeze({ provider: /^openrouter$/, model: /^z-ai\/glm-5\./ }),
+  // Aggregator endpoints that publish reasoning as mandatory answer 400 on an explicit "off".
+  Object.freeze({ provider: /^openrouter$/, model: /thinking/i }),
 ]);
 
 const LEVELS = Object.freeze(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);

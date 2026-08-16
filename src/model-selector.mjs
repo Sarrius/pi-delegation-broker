@@ -318,7 +318,16 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
   const expectedModel = preferred.model ?? parseResourceModel(preferred.resourceId);
   if (!expectedModel) return deny("selected resource carries no provider and model identity");
 
-  const contract = buildContract({ requirement, budget, profile: chosen.profile, constraints });
+  // The broker leases inside the contracted class, so the class alone is not enough: without
+  // an explicit allow-list it can hand back a resource this selector deliberately filtered out
+  // (legacy or below the quality floor). Carry the vetted candidates into the contract.
+  const contract = buildContract({
+    requirement,
+    budget,
+    profile: chosen.profile,
+    constraints,
+    allowedResources: chosen.resources.map((entry) => entry.resourceId),
+  });
   if (typeof contract === "string") return deny(contract);
 
   return Object.freeze({
@@ -366,7 +375,7 @@ export function createResourceModelResolver(registry) {
   return (resourceId) => table.get(resourceId) ?? parseResourceModel(resourceId);
 }
 
-function buildContract({ requirement, budget, profile, constraints }) {
+function buildContract({ requirement, budget, profile, constraints, allowedResources }) {
   const taskId = constraints.taskId;
   if (typeof taskId !== "string" || !TASK_ID.test(taskId)) return "contract requires a bounded taskId";
   const promptDigest = constraints.promptDigest;
@@ -399,6 +408,9 @@ function buildContract({ requirement, budget, profile, constraints }) {
       minimumProfile: profile,
       required: requirement.capabilities,
       downgradePolicy: "forbid",
+      ...(Array.isArray(allowedResources) && allowedResources.length > 0
+        ? { allowedResources: Object.freeze([...allowedResources]) }
+        : {}),
     }),
     budget,
     ...(constraints.leaseTtlMs === undefined ? {} : { leaseTtlMs: constraints.leaseTtlMs }),

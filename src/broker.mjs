@@ -9,6 +9,7 @@ const PENDING_STATES = new Set(["waiting", "ready", "claimed", "awaiting_result"
 const EFFECT_CAPABLE_OPERATIONS = new Set(["propose_patch", "apply", "external_write"]);
 const BEHAVIORAL_ENFORCEMENT = new Set(["unavailable", "blocking_monitor"]);
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$/;
+const RESOURCE_ID = /^[A-Za-z0-9~][A-Za-z0-9._/:~-]{0,191}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
 const EVIDENCE_REF = /^controller:[0-9a-f-]{36}$/;
 const SECRET_PATTERNS = [
@@ -1418,6 +1419,14 @@ export class SqliteLeaseBroker {
     if (!Number.isSafeInteger(contract.latencyBudgetMs) || contract.latencyBudgetMs < 1) return "contract requires a positive latencyBudgetMs";
     if (contract.leaseTtlMs !== undefined && (!Number.isSafeInteger(contract.leaseTtlMs) || contract.leaseTtlMs < 1)) return "leaseTtlMs must be a positive safe integer";
     if (contract.capability.downgradePolicy !== "forbid") return "only forbid downgrade policy is implemented in broker MVP";
+    const allowedResources = contract.capability.allowedResources;
+    if (allowedResources !== undefined) {
+      if (!Array.isArray(allowedResources) || allowedResources.length < 1 || allowedResources.length > 5_000
+        || allowedResources.some((id) => typeof id !== "string" || !RESOURCE_ID.test(id))
+        || new Set(allowedResources).size !== allowedResources.length) {
+        return "capability allowedResources must be 1..5000 unique resource identifiers";
+      }
+    }
     if (!this.#profile(contract.capability.minimumProfile)) return "unknown or unapproved minimum profile";
     const requirements = contract.budget?.enforcement ?? {};
     if (Object.values(requirements).some((value) => !Object.hasOwn(ENFORCEMENT, value))) return "unknown budget enforcement class";
@@ -1446,6 +1455,10 @@ export class SqliteLeaseBroker {
 
   #resourceMatchesContract(resource, requestedProfile, contract) {
     if (!requestedProfile || resource.profile !== requestedProfile.id) return false;
+    // A controller-vetted allow-list is binding: capability class alone would let the broker
+    // lease a resource the selector excluded as legacy or below its quality floor.
+    const allowedResources = contract.capability.allowedResources;
+    if (Array.isArray(allowedResources) && !allowedResources.includes(resource.id)) return false;
     if (!contract.capability.required.every((capability) => requestedProfile.capabilities.includes(capability))) return false;
     const enforcement = parseJson(resource.enforcement);
     return Object.entries(contract.budget?.enforcement ?? {}).every(([dimension, required]) => enforcementSatisfies(enforcement[dimension], required));

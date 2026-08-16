@@ -25,6 +25,8 @@ const FAILURE_SIGNATURES = Object.freeze([
   Object.freeze({ kind: "unavailable", pattern: /\b(unsupported_value|reasoning summaries|organization must be verified|model is not supported)\b/i }),
   // A child that never answers is a dead route, not a dead task: fail over instead of hanging.
   Object.freeze({ kind: "unavailable", pattern: /\bcontroller prompt deadline\b/i }),
+  // Reasoning-mode refusals are route-specific policy, not a dead task: another route accepts it.
+  Object.freeze({ kind: "unavailable", pattern: /reasoning is mandatory|cannot be disabled|always engages in thinking/i }),
   Object.freeze({ kind: "unavailable", pattern: /\b(50[0234]|service unavailable|bad gateway|upstream|connection (refused|reset)|econnrefused|etimedout|network)\b/i }),
 ]);
 
