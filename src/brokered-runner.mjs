@@ -27,6 +27,8 @@ const FAILURE_SIGNATURES = Object.freeze([
   Object.freeze({ kind: "unavailable", pattern: /\bcontroller prompt deadline\b/i }),
   // Reasoning-mode refusals are route-specific policy, not a dead task: another route accepts it.
   Object.freeze({ kind: "unavailable", pattern: /reasoning is mandatory|cannot be disabled|always engages in thinking/i }),
+  // Exhausted credit/balance is this account's problem, not the task's: cool it and move on.
+  Object.freeze({ kind: "auth_fatal", pattern: /\b402\b|requires more credits|insufficient (credits|balance)|purchase credits|upgrade to a paid account/i }),
   Object.freeze({ kind: "unavailable", pattern: /\b(50[0234]|service unavailable|bad gateway|upstream|connection (refused|reset)|econnrefused|etimedout|network)\b/i }),
 ]);
 

@@ -18,3 +18,8 @@ test("models without the constraint keep the controller's requested mode", () =>
 test("a child that never settles is a failover-eligible route failure", () => {
   assert.equal(classifyChildFailure("controller prompt deadline exceeded after 180000ms"), "unavailable");
 });
+
+test("an exhausted account is a route failure, not a dead task", () => {
+  assert.equal(classifyChildFailure('402: {"message":"This request requires more credits, or fewer max_tokens"}'), "auth_fatal");
+  assert.equal(classifyChildFailure("400: Reasoning is mandatory for this endpoint and cannot be disabled."), "unavailable");
+});
