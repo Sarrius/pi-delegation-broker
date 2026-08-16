@@ -50,6 +50,7 @@ export { ControllerVerifiedRoutingBoard } from "./verified-routing-board.mjs";
 export { captureProviderContext } from "./provider-context.mjs";
 export { QUALITY_TIERS, meetsQualityFloor, qualityForModel } from "./model-quality-catalog.mjs";
 export { ModelAffinityJournal } from "./model-affinity-journal.mjs";
+export { TaskOrchestrator } from "./task-orchestrator.mjs";
 export {
   DEFAULT_MODEL_PREFERENCES,
   loadModelPreferences,

@@ -39,6 +39,7 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "SingleHostBrokerSupervisor",
     "SqliteLeaseBroker",
     "TERMINAL_OUTCOMES",
+    "TaskOrchestrator",
     "WorktreeCollectionError",
     "assignGenerations",
     "baseProviderFor",
