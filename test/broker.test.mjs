@@ -191,6 +191,18 @@ test("ready work is claimed against the exact contract and only a controller ver
   }, registry);
 });
 
+test("an immediate lease can become a durable verifier-bound task", () => {
+  withVerifiedBroker((broker, authority, store) => {
+    const contract = fixtureContract({ taskId: "direct-tracked" });
+    const lease = leased(broker, contract, 1_000);
+    assert.equal(broker.trackLeasedTask(contract, lease.leaseId, lease.fencingToken, 1_001).status, "tracked");
+    assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["claimed"]);
+    assert.equal(broker.releaseClaimedTaskForVerification("direct-tracked", lease.leaseId, lease.fencingToken, 1_002).status, "awaiting_verification");
+    assert.equal(broker.finalizeVerifiedTask("direct-tracked", lease.leaseId, lease.fencingToken,
+      acceptedReceipt(authority, store, "verifier-direct-tracked", { taskId: "direct-tracked", leaseId: lease.leaseId, fencingToken: lease.fencingToken }), 1_003).status, "completed");
+  });
+});
+
 test("a claimed child release without a parent result escalates at the task deadline", () => {
   const registry = fixtureRegistry();
   delete registry.resources.R2;

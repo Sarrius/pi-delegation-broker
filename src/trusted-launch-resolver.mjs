@@ -40,6 +40,7 @@ export class BrokeredLaunchResolver {
   #selectContract;
   #launcherAttestationConfig;
   #queuedTaskVerifier;
+  #trackImmediateTasks;
   #resolveModelForResource;
   #provisionChildAuth;
   #admissions = new Map();
@@ -53,6 +54,7 @@ export class BrokeredLaunchResolver {
     selectContract,
     launcherAttestationConfig,
     queuedTaskVerifier,
+    trackImmediateTasks = false,
     resolveModelForResource,
     provisionChildAuth,
   }) {
@@ -71,6 +73,9 @@ export class BrokeredLaunchResolver {
     }
     if (queuedTaskVerifier !== undefined && typeof queuedTaskVerifier.verifyAndFinalize !== "function") {
       throw new Error("Broker launch resolver queuedTaskVerifier must be a controller-owned verifier coordinator");
+    }
+    if (typeof trackImmediateTasks !== "boolean" || (trackImmediateTasks && !queuedTaskVerifier)) {
+      throw new Error("tracked immediate tasks require a controller-owned verifier coordinator");
     }
     if (launcherAttestationConfig !== undefined) {
       if (!launcherAttestationConfig || typeof launcherAttestationConfig !== "object" || Array.isArray(launcherAttestationConfig)
@@ -91,6 +96,7 @@ export class BrokeredLaunchResolver {
       trustedExtensionDigests: Object.freeze([...launcherAttestationConfig.trustedExtensionDigests]),
     });
     this.#queuedTaskVerifier = queuedTaskVerifier;
+    this.#trackImmediateTasks = trackImmediateTasks;
     this.#resolveModelForResource = resolveModelForResource;
     this.#provisionChildAuth = provisionChildAuth;
   }
@@ -136,6 +142,18 @@ export class BrokeredLaunchResolver {
     }
     if (reservation?.status !== "leased") return { action: "deny", reason: reservation?.status === "denied_capacity" ? "no compatible broker capacity" : "broker policy denied launch" };
     const lease = reservation.lease;
+    if (queuedTaskId === undefined && this.#trackImmediateTasks) {
+      const tracked = await this.#controller("trackLeasedTask", {
+        contract: selection.contract,
+        leaseId: lease.leaseId,
+        fencingToken: lease.fencingToken,
+      });
+      if (tracked?.status !== "tracked") {
+        await this.#releaseLease(lease).catch(() => undefined);
+        return { action: "deny", reason: "broker could not durably track launch" };
+      }
+      queuedTaskId = selection.contract.taskId;
+    }
     let agentDir;
     try {
       const issued = await this.#controller("issueLeaseCapability", { leaseId: lease.leaseId, fencingToken: lease.fencingToken });

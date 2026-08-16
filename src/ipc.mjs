@@ -14,7 +14,7 @@ const CHILD_METHODS = new Set([
   "getEffectiveChildCapability", "declareBehavioralAction", "authorizeBehavioralAction", "observeBehavioralResult",
 ]);
 const CONTROLLER_METHODS = new Set([
-  "reserve", "submit", "dispatchPending", "pendingTasks", "queueWaitMetrics", "readyTasks", "claimReadyTask", "abandonClaimedTask", "releaseClaimedTaskForVerification", "finalizeVerifiedTask", "reschedulePending", "finishPending",
+  "reserve", "submit", "dispatchPending", "pendingTasks", "queueWaitMetrics", "readyTasks", "claimReadyTask", "trackLeasedTask", "abandonClaimedTask", "releaseClaimedTaskForVerification", "finalizeVerifiedTask", "reschedulePending", "finishPending",
   "issueLeaseCapability", "bindEffectiveChildCapability", "markRateLimited", "markUnknown", "markHealthy", "release", "configureFakeProvider",
 ]);
 
@@ -188,6 +188,7 @@ export class BrokerIpcServer {
       if (method === "queueWaitMetrics") return this.#broker.queueWaitMetrics(now);
       if (method === "readyTasks") return this.#broker.readyTasks();
       if (method === "claimReadyTask") return this.#broker.claimReadyTask(params.taskId, params.leaseId, params.contract, now);
+      if (method === "trackLeasedTask") return this.#broker.trackLeasedTask(params.contract, params.leaseId, params.fencingToken, now);
       if (method === "abandonClaimedTask") return this.#broker.abandonClaimedTask(params.taskId, params.leaseId, params.fencingToken, now);
       if (method === "releaseClaimedTaskForVerification") return this.#broker.releaseClaimedTaskForVerification(params.taskId, params.leaseId, params.fencingToken, now);
       if (method === "finalizeVerifiedTask") return this.#broker.finalizeVerifiedTask(params.taskId, params.leaseId, params.fencingToken, params.verification, now);
