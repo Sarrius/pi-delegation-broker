@@ -4,6 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Semaphore } from "../src/semaphore.mjs";
+import { classifyChildFailure } from "../src/brokered-runner.mjs";
+
+test("route-specific provider policy rejection is failover-eligible", () => {
+  assert.equal(classifyChildFailure("OpenAI API error (400): organization must be verified to generate reasoning summaries"), "unavailable");
+});
 
 // We test the runner's deny path and semaphore release without spawning a real Pi process.
 // The spawn itself is tested through child-launcher's isolated unit, not here.
