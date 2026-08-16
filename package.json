@@ -10,6 +10,7 @@
   },
   "files": [
     "src",
+    "extensions",
     "docs/INTEGRATION.md",
     "docs/PROVIDER-PROXY-PROTOCOL.md",
     "README.md",

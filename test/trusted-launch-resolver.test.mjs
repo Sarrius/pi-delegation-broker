@@ -69,6 +69,13 @@ test("controller resolver admits a matching child with only scoped policy data a
     assert.equal(resolver.admissions().length, 1);
     assert.equal(supervisor.auditSnapshot().leases.length, 1);
     assert.equal(existsSync(decision.policy.agentDir), true);
+    const bound = await requestBrokerIpc({
+      socketPath: supervisor.socketPath,
+      authorization: decision.policy.environment.PI_BROKER_CAPABILITY,
+      method: "getEffectiveChildCapability",
+    });
+    assert.equal(bound.status, "bound");
+    assert.equal(bound.capability.capabilityFingerprint, decision.policy.authorizationPolicy.capabilityFingerprint);
 
     await decision.policy.onBeforeChildAbandoned("child_construction_failed");
     await decision.policy.onBeforeChildAbandoned("child_construction_failed");

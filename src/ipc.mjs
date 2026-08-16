@@ -3,13 +3,19 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync } from "n
 import { createConnection, createServer } from "node:net";
 import { dirname } from "node:path";
 import { captureProviderContext } from "./provider-context.mjs";
+import { captureLosslessJson } from "./lossless-json.mjs";
+import { compileEffectiveChildCapability } from "./capability-compiler.mjs";
+import { BehavioralRunMonitor } from "./behavior-monitor.mjs";
 import { ArtifactPipeline } from "./artifact-pipeline.mjs";
 import { AttemptSettlement, ProviderStreamAssembler, createAttemptRouteSnapshot, outcomeProperties } from "./provider-protocol.mjs";
 const MAX_REQUEST_BYTES = 1024 * 1024;
-const CHILD_METHODS = new Set(["heartbeat", "release", "providerAttempt", "providerStream"]);
+const CHILD_METHODS = new Set([
+  "heartbeat", "release", "providerAttempt", "providerStream",
+  "getEffectiveChildCapability", "declareBehavioralAction", "authorizeBehavioralAction", "observeBehavioralResult",
+]);
 const CONTROLLER_METHODS = new Set([
   "reserve", "submit", "dispatchPending", "pendingTasks", "queueWaitMetrics", "readyTasks", "claimReadyTask", "abandonClaimedTask", "finalizeClaimedTask", "reschedulePending", "finishPending",
-  "issueLeaseCapability", "markRateLimited", "markUnknown", "markHealthy", "release", "configureFakeProvider",
+  "issueLeaseCapability", "bindEffectiveChildCapability", "markRateLimited", "markUnknown", "markHealthy", "release", "configureFakeProvider",
 ]);
 
 function sameSecret(left, right) {
@@ -49,6 +55,7 @@ export class BrokerIpcServer {
   #server;
   #connections = new Set();
   #controllerEpoch = randomUUID();
+  #behavioralMonitors = new Map();
 
   constructor({ broker, socketPath, controllerToken = randomBytes(32).toString("base64url"), fakeProvider, providerTransport, routeResolver }) {
     if (!broker || !socketPath) throw new Error("Broker IPC server needs broker and socketPath");
@@ -186,6 +193,7 @@ export class BrokerIpcServer {
       if (method === "reschedulePending") return this.#broker.reschedulePending(params.taskId, params.recoveryOwner, params.eligibleAt, now);
       if (method === "finishPending") return this.#broker.finishPending(params.taskId, params.state, now);
       if (method === "issueLeaseCapability") return this.#broker.issueLeaseCapability(params.leaseId, params.fencingToken, now);
+      if (method === "bindEffectiveChildCapability") return this.#broker.bindEffectiveChildCapability(params.leaseId, params.fencingToken, params.capability, now);
       if (method === "markRateLimited") return this.#broker.markRateLimited(params.resourceId, params.retryAfterMs, now);
       if (method === "markUnknown") return this.#broker.markUnknown(params.resourceId, now, params.reason);
       if (method === "markHealthy") return this.#broker.markHealthy(params.resourceId, now);
@@ -200,8 +208,67 @@ export class BrokerIpcServer {
     if (capability.status !== "authorized") throw new Error("unauthorized");
     if (method === "heartbeat") return this.#broker.heartbeat(capability.lease.leaseId, capability.lease.fencingToken, now, validateTtl(params.ttlMs));
     if (method === "release") return this.#broker.release(capability.lease.leaseId, capability.lease.fencingToken, "child release", now);
+    if (method === "getEffectiveChildCapability") return this.#broker.effectiveChildCapabilityForLease(capability.lease.leaseId, capability.lease.fencingToken, now);
+    if (method === "declareBehavioralAction") return this.#declareBehavioralAction(capability.lease, params, now);
+    if (method === "authorizeBehavioralAction") return this.#authorizeBehavioralAction(capability.lease, params, now);
+    if (method === "observeBehavioralResult") return this.#observeBehavioralResult(capability.lease, params, now);
     if (method === "providerStream") return this.#providerStream(capability.lease, params, signal, socket, request.id);
     return this.#providerAttempt(capability.lease, params.inputDigest, signal);
+  }
+
+  #behavioralMonitor(lease, now) {
+    const loaded = this.#broker.effectiveChildCapabilityForLease(lease.leaseId, lease.fencingToken, now);
+    if (loaded.status !== "bound") throw new Error("effective_child_capability_unavailable");
+    const key = `${lease.leaseId}:${lease.fencingToken}:${loaded.capability.capabilityFingerprint}`;
+    let monitor = this.#behavioralMonitors.get(key);
+    if (!monitor) {
+      const { authorizationPolicy } = compileEffectiveChildCapability(loaded.capability);
+      monitor = new BehavioralRunMonitor({ doneWhen: loaded.capability.doneWhen, authorizationPolicy });
+      this.#behavioralMonitors.set(key, monitor);
+    }
+    return monitor;
+  }
+
+  #declareBehavioralAction(lease, params, now) {
+    const result = this.#behavioralMonitor(lease, now).declareAction(params);
+    const recorded = this.#broker.recordBehavioralEvent(lease.leaseId, lease.fencingToken, {
+      kind: "action_declared", status: result.status, stepId: result.stepId, actionHash: result.actionHash,
+    }, now);
+    if (recorded.status !== "recorded") throw new Error("lease no longer active");
+    return result;
+  }
+
+  #authorizeBehavioralAction(lease, params, now) {
+    const result = this.#behavioralMonitor(lease, now).authorizeAction(params);
+    const recorded = this.#broker.recordBehavioralEvent(lease.leaseId, lease.fencingToken, {
+      kind: "action_authorized", status: result.status, block: result.block === true, terminate: result.terminate === true,
+      ...(result.actionHash === undefined ? {} : { actionHash: result.actionHash }),
+    }, now);
+    if (recorded.status !== "recorded") throw new Error("lease no longer active");
+    return result;
+  }
+
+  #observeBehavioralResult(lease, params, now) {
+    // Pi's tool_result content can be large or non-JSON. Reject an unbounded
+    // report rather than letting a child convert an observation gap into
+    // apparent progress. The controller derives the state digest itself.
+    const captured = captureLosslessJson(params?.result, { maxBytes: 256 * 1024, maxDepth: 32, maxNodes: 10_000 });
+    const state = this.#broker.behavioralStateDigestForLease(lease.leaseId, lease.fencingToken, now);
+    if (state.status !== "observed") throw new Error("lease no longer active");
+    const monitor = this.#behavioralMonitor(lease, now);
+    const result = monitor.observeActionResult({
+      toolName: params?.toolName,
+      args: params?.args,
+      result: captured.value,
+      isError: params?.isError,
+      stateDigest: state.stateDigest,
+    });
+    const recorded = this.#broker.recordBehavioralEvent(lease.leaseId, lease.fencingToken, {
+      kind: "tool_result_observed", status: result.status,
+      resultDigest: createHash("sha256").update(captured.canonical).digest("hex"),
+    }, now);
+    if (recorded.status !== "recorded") throw new Error("lease no longer active");
+    return result;
   }
 
   async #providerStream(lease, params, signal, socket, requestId) {

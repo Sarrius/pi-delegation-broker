@@ -121,6 +121,14 @@ export class BrokeredLaunchResolver {
         downgradePolicy: selection.contract.capability.downgradePolicy,
       });
       const compiled = compileEffectiveChildCapability(capability);
+      const bound = await this.#controller("bindEffectiveChildCapability", {
+        leaseId: lease.leaseId,
+        fencingToken: lease.fencingToken,
+        capability,
+      });
+      if (bound?.status !== "bound" || bound.capabilityFingerprint !== capability.capabilityFingerprint) {
+        throw new Error("Broker declined effective child capability binding");
+      }
       const admission = {
         lease,
         agentDir,

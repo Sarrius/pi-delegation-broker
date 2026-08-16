@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { createEffectiveChildCapability } from "./capability-compiler.mjs";
 
 const ENFORCEMENT = Object.freeze({ hard: 2, metered_best_effort: 1, unavailable: 0 });
 const ADMISSION_CLASSES = new Set(["control", "verify", "work"]);
@@ -394,6 +395,89 @@ export class SqliteLeaseBroker {
     });
   }
 
+  /**
+   * Bind the controller-selected EffectiveChildCapability to one active lease.
+   * The capability is durable controller state, not a child environment value:
+   * children may retrieve their own record through a lease-scoped IPC request,
+   * but cannot nominate, replace, or broaden it.
+   */
+  bindEffectiveChildCapability(leaseId, fencingToken, capability, now) {
+    return this.#transaction(() => {
+      const lease = this.#db.prepare("SELECT * FROM leases WHERE lease_id = ? AND fencing_token = ? AND expires_at > ?")
+        .get(leaseId, fencingToken, now);
+      if (!lease) return { status: "denied_lease" };
+      const { capabilityFingerprint: suppliedFingerprint, ...capabilityInput } = capability ?? {};
+      const normalized = createEffectiveChildCapability(capabilityInput);
+      if (suppliedFingerprint !== undefined && suppliedFingerprint !== normalized.capabilityFingerprint) {
+        throw new Error("Effective child capability fingerprint is invalid");
+      }
+      if (normalized.taskId !== lease.task_id
+        || normalized.admissionClass !== lease.admission_class
+        || normalized.behavioralEnforcement !== lease.behavioral_enforcement
+        || JSON.stringify(normalized.budget.enforcement ?? {}) !== JSON.stringify(parseJson(lease.enforcement))
+        || normalized.budget.maxInputTokens !== (lease.max_input_tokens ?? undefined)
+        || normalized.budget.maxOutputTokens !== (lease.max_output_tokens ?? undefined)
+        || normalized.budget.maxCostMicros !== (lease.max_cost_micros ?? undefined)) {
+        throw new Error("Effective child capability does not match its lease");
+      }
+      const encoded = JSON.stringify(normalized);
+      const existing = this.#db.prepare("SELECT capability FROM effective_child_capabilities WHERE lease_id = ?").get(leaseId);
+      if (existing && existing.capability !== encoded) throw new Error("Effective child capability is already bound for this lease");
+      if (!existing) {
+        this.#db.prepare("INSERT INTO effective_child_capabilities (lease_id, fencing_token, capability) VALUES (?, ?, ?)")
+          .run(leaseId, fencingToken, encoded);
+        this.#record(now, "EffectiveChildCapabilityBound", {
+          leaseId,
+          fencingToken,
+          capabilityFingerprint: normalized.capabilityFingerprint,
+          behavioralEnforcement: normalized.behavioralEnforcement,
+        });
+      }
+      return { status: "bound", capabilityFingerprint: normalized.capabilityFingerprint };
+    });
+  }
+
+  /** Return the exact capability previously bound by the controller for an active lease. */
+  effectiveChildCapabilityForLease(leaseId, fencingToken, now) {
+    return this.#transaction(() => {
+      const row = this.#db.prepare(`
+        SELECT c.capability
+        FROM effective_child_capabilities c JOIN leases l ON l.lease_id = c.lease_id
+        WHERE c.lease_id = ? AND c.fencing_token = ? AND l.fencing_token = ? AND l.expires_at > ?
+      `).get(leaseId, fencingToken, fencingToken, now);
+      if (!row) return { status: "denied_or_unbound" };
+      let stored;
+      try { stored = JSON.parse(row.capability); } catch { throw new Error("Persisted effective child capability is malformed"); }
+      const { capabilityFingerprint, ...input } = stored ?? {};
+      const capability = createEffectiveChildCapability(input);
+      if (capability.capabilityFingerprint !== capabilityFingerprint) throw new Error("Persisted effective child capability fingerprint is invalid");
+      return { status: "bound", capability };
+    });
+  }
+
+  /**
+   * Hash only controller-owned durable state relevant to this lease. Behavioral
+   * observations include this value, never a child-supplied "state digest".
+   */
+  behavioralStateDigestForLease(leaseId, fencingToken, now) {
+    return this.#transaction(() => {
+      const row = this.#db.prepare(`
+        SELECT l.lease_id, l.fencing_token, l.expires_at, l.task_id, l.resource_id,
+               r.state AS resource_state, r.cooldown_until AS resource_cooldown_until,
+               g.breaker_state, g.cooldown_until AS group_cooldown_until, g.probe_lease_id
+        FROM leases l
+        JOIN resources r ON r.id = l.resource_id
+        JOIN capacity_groups g ON g.id = l.capacity_group
+        WHERE l.lease_id = ? AND l.fencing_token = ? AND l.expires_at > ?
+      `).get(leaseId, fencingToken, now);
+      if (!row) return { status: "denied_lease" };
+      return {
+        status: "observed",
+        stateDigest: createHash("sha256").update(JSON.stringify(row)).digest("hex"),
+      };
+    });
+  }
+
   /** Validate a child-scoped IPC capability without exposing controller authority. */
   leaseForCapability(capability, now) {
     this.#assertNondecreasingTime(now);
@@ -417,6 +501,17 @@ export class SqliteLeaseBroker {
       if (!lease) return { status: "denied_lease" };
       this.#record(now, "ProviderEvent", { leaseId, fencingToken, inputDigest, event });
       return { status: "recorded", lease: asLease(lease) };
+    });
+  }
+
+  /** Record a controller-observed behavioral gate fact without provider-health semantics. */
+  recordBehavioralEvent(leaseId, fencingToken, event, now) {
+    return this.#transaction(() => {
+      const lease = this.#db.prepare("SELECT * FROM leases WHERE lease_id = ? AND fencing_token = ? AND expires_at > ?")
+        .get(leaseId, fencingToken, now);
+      if (!lease) return { status: "denied_lease" };
+      this.#record(now, "BehavioralEvent", { leaseId, fencingToken, event });
+      return { status: "recorded" };
     });
   }
 
@@ -600,6 +695,11 @@ export class SqliteLeaseBroker {
         lease_id TEXT NOT NULL UNIQUE REFERENCES leases(lease_id) ON DELETE CASCADE,
         fencing_token INTEGER NOT NULL,
         expires_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS effective_child_capabilities (
+        lease_id TEXT PRIMARY KEY REFERENCES leases(lease_id) ON DELETE CASCADE,
+        fencing_token INTEGER NOT NULL,
+        capability TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS pending_tasks (
         task_id TEXT PRIMARY KEY,
