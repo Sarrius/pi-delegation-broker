@@ -28,18 +28,23 @@ function candidateIds(value) {
 export class ControllerVerifiedRoutingBoard {
   #board;
   #authority;
+  #affinityJournal;
   #now;
 
-  constructor({ routingBoard, verificationAuthority, now = () => Date.now() } = {}) {
+  constructor({ routingBoard, verificationAuthority, affinityJournal, now = () => Date.now() } = {}) {
     if (!routingBoard || typeof routingBoard.record !== "function" || typeof routingBoard.score !== "function" || typeof routingBoard.rank !== "function") {
       throw new Error("verified routing board requires a RoutingBoard");
     }
     if (!verificationAuthority || typeof verificationAuthority.verify !== "function") {
       throw new Error("verified routing board requires a controller verification authority");
     }
+    if (affinityJournal !== undefined && typeof affinityJournal.recordVerified !== "function") {
+      throw new Error("verified routing board affinityJournal must be controller-owned");
+    }
     if (typeof now !== "function") throw new Error("verified routing board requires a clock function");
     this.#board = routingBoard;
     this.#authority = verificationAuthority;
+    this.#affinityJournal = affinityJournal;
     this.#now = now;
   }
 
@@ -69,6 +74,16 @@ export class ControllerVerifiedRoutingBoard {
       timestamp,
     });
     for (const capability of requiredCapabilities) this.#board.record({ ...record, capability });
+    // This is intentionally after receipt authentication and terminal-outcome matching. A child
+    // cannot improve its own future routing score by reporting a convincing-looking success.
+    this.#affinityJournal?.recordVerified({
+      resourceId,
+      capabilities: requiredCapabilities,
+      outcome: record.outcome,
+      latencyMs,
+      ...(costMicros === undefined ? {} : { costMicros }),
+      timestamp,
+    });
     return Object.freeze({ resourceId, capabilities: requiredCapabilities, outcome: record.outcome, evidenceKind: EVIDENCE_KIND, timestamp });
   }
 

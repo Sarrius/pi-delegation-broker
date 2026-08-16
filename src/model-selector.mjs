@@ -157,8 +157,8 @@ function currencyIndex(currency) {
   return index;
 }
 
-function rankResources(entries) {
-  return [...entries].sort((left, right) => {
+function rankResources(entries, learnedRanker, capabilities) {
+  const baseline = [...entries].sort((left, right) => {
     const confidence = (CONFIDENCE_RANK[left.resource.confidence] ?? 3) - (CONFIDENCE_RANK[right.resource.confidence] ?? 3);
     if (confidence !== 0) return confidence;
     // During the explicit legacy fallback, prefer the newest legacy generation. In normal
@@ -169,6 +169,13 @@ function rankResources(entries) {
     if (cost !== 0) return cost;
     return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
   });
+  if (typeof learnedRanker !== "function") return baseline;
+  let ordered;
+  try { ordered = learnedRanker({ resourceIds: baseline.map((entry) => entry.id), capabilities }); } catch { return baseline; }
+  if (!Array.isArray(ordered) || ordered.length !== baseline.length || new Set(ordered).size !== baseline.length
+    || ordered.some((id) => !baseline.some((entry) => entry.id === id))) return baseline;
+  const positions = new Map(ordered.map((id, index) => [id, index]));
+  return baseline.sort((left, right) => positions.get(left.id) - positions.get(right.id));
 }
 
 /**
@@ -212,7 +219,7 @@ function requiresHardBudget(budget) {
  * `{action:"deny", reason}`. `alternatives` lists the remaining ranked classes so a caller that
  * hits `denied_capacity` can retry one tier up without re-deriving the requirement.
  */
-export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, currency, preferences, now } = {}) {
+export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, currency, preferences, learnedRanker, now } = {}) {
   if (!registry?.profiles || !registry?.resources) throw new Error("selectModelForTask requires a broker registry");
   if (constraints !== undefined && (typeof constraints !== "object" || constraints === null || Array.isArray(constraints))) {
     throw new Error("selectModelForTask constraints must be an object");
@@ -264,7 +271,7 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         // A class spanning several accounts can absorb one dying; a class living in one account
         // cannot. Surfacing it lets a caller prefer breadth when throughput matters.
         capacityGroups: Object.freeze([...new Set(entries.map((entry) => entry.resource.capacityGroup))]),
-        resources: Object.freeze(rankResources(entries).map((entry) => Object.freeze({
+        resources: Object.freeze(rankResources(entries, userOnly ? undefined : learnedRanker, requirement.capabilities).map((entry) => Object.freeze({
           resourceId: entry.id,
           capacityGroup: entry.resource.capacityGroup,
           confidence: entry.resource.confidence,
@@ -411,12 +418,13 @@ function defaultDoneWhen(operationClass) {
  * The callback reads only `request.capabilityRequest`, never a prompt: the resolver contract is
  * that a launch request carries no raw task text.
  */
-export function createSelectContract({ registry, availability, currency, preferences, constraints = {}, now = () => Date.now() } = {}) {
+export function createSelectContract({ registry, availability, currency, preferences, learnedRanker, constraints = {}, now = () => Date.now() } = {}) {
   if (registry === undefined) throw new Error("createSelectContract requires a registry or a registry provider");
   const readRegistry = typeof registry === "function" ? registry : () => registry;
   const readAvailability = typeof availability === "function" ? availability : () => availability;
   const readCurrency = typeof currency === "function" ? currency : () => currency;
   const readPreferences = typeof preferences === "function" ? preferences : () => preferences;
+  if (learnedRanker !== undefined && typeof learnedRanker !== "function") throw new Error("createSelectContract learnedRanker must be a function");
 
   return (request) => {
     const capabilityRequest = request?.capabilityRequest ?? {};
@@ -432,6 +440,7 @@ export function createSelectContract({ registry, availability, currency, prefere
       availability: readAvailability(),
       currency: readCurrency(),
       preferences: readPreferences(),
+      learnedRanker,
       constraints: merged,
       now: now(),
     });

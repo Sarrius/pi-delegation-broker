@@ -15,6 +15,7 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "BehavioralRunMonitor",
     "BrokerIpcServer",
     "LEGACY_GENERATION",
+    "ModelAffinityJournal",
     "BrokeredChildRunner",
     "BrokeredLaunchResolver",
     "ControllerAcceptanceVerifier",
