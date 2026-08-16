@@ -41,6 +41,7 @@ export class BrokeredLaunchResolver {
   #launcherAttestationConfig;
   #queuedTaskVerifier;
   #resolveModelForResource;
+  #provisionChildAuth;
   #admissions = new Map();
 
   constructor({
@@ -53,6 +54,7 @@ export class BrokeredLaunchResolver {
     launcherAttestationConfig,
     queuedTaskVerifier,
     resolveModelForResource,
+    provisionChildAuth,
   }) {
     if (typeof socketPath !== "string" || !isAbsolute(socketPath)) throw new Error("Broker launch resolver needs an absolute socketPath");
     if (typeof controllerToken !== "string" || controllerToken.length < 32) throw new Error("Broker launch resolver needs a controller-only token");
@@ -63,6 +65,9 @@ export class BrokeredLaunchResolver {
     if (typeof selectContract !== "function") throw new Error("Broker launch resolver needs a controller selectContract function");
     if (resolveModelForResource !== undefined && typeof resolveModelForResource !== "function") {
       throw new Error("Broker launch resolver resolveModelForResource must be a controller-owned function");
+    }
+    if (provisionChildAuth !== undefined && typeof provisionChildAuth !== "function") {
+      throw new Error("Broker launch resolver provisionChildAuth must be a controller-owned function");
     }
     if (queuedTaskVerifier !== undefined && typeof queuedTaskVerifier.verifyAndFinalize !== "function") {
       throw new Error("Broker launch resolver queuedTaskVerifier must be a controller-owned verifier coordinator");
@@ -87,6 +92,7 @@ export class BrokeredLaunchResolver {
     });
     this.#queuedTaskVerifier = queuedTaskVerifier;
     this.#resolveModelForResource = resolveModelForResource;
+    this.#provisionChildAuth = provisionChildAuth;
   }
 
   /** Compatible with TrustedChildLaunchResolver; request has no raw prompt. */
@@ -103,7 +109,12 @@ export class BrokeredLaunchResolver {
       return { action: "deny", reason: "child prompt is not bound to the selected broker contract" };
     }
     const expected = expectedModel(selection);
-    if (request.model?.provider !== expected.provider || request.model?.modelId !== expected.modelId) {
+    // An explicit request model is a manual override and must match the selection exactly.
+    // An absent model means the controller's selector decides: the contract pins a capability
+    // class, the broker leases a live resource inside it, and resolvedModel (below) reports
+    // what the child will actually run. Denying here would make auto-selection impossible.
+    if (request.model !== undefined
+      && (request.model.provider !== expected.provider || request.model.modelId !== expected.modelId)) {
       return { action: "deny", reason: "resolved model is not approved for this broker contract" };
     }
 
@@ -130,6 +141,21 @@ export class BrokeredLaunchResolver {
       const issued = await this.#controller("issueLeaseCapability", { leaseId: lease.leaseId, fencingToken: lease.fencingToken });
       if (issued?.status !== "issued" || typeof issued.capability !== "string") throw new Error("Broker declined lease capability issuance");
       agentDir = provisionBrokeredAgentDir(join(this.#agentRoot, request.childId)).agentDir;
+      // The broker may lease a different resource in the contracted class than the selector
+      // predicted, so the child runs on the model its lease is accounted against. Compute it
+      // before auth provisioning: the scoped credential written next is for THIS account.
+      const resolvedModel = this.#resolveModelForResource?.(lease.resourceId);
+      if (this.#provisionChildAuth !== undefined) {
+        await this.#provisionChildAuth({
+          agentDir,
+          childId: request.childId,
+          resourceId: lease.resourceId,
+          model: resolvedModel?.provider && resolvedModel?.modelId
+            ? Object.freeze({ provider: resolvedModel.provider, modelId: resolvedModel.modelId })
+            : undefined,
+          contract: selection.contract,
+        });
+      }
       const capability = createEffectiveChildCapability({
         schemaVersion: 1,
         taskId: lease.taskId,
@@ -180,12 +206,6 @@ export class BrokeredLaunchResolver {
         }),
       };
       this.#admissions.set(request.childId, admission);
-      // A contract pins a capability class, not one model, so the broker may lease a different
-      // resource in that class than the selection predicted — that indirection is exactly what
-      // lets a launch survive a provider dying between selection and reservation. Report which
-      // resource was actually leased, and the model it maps to, so the child runs on the model
-      // its budget is accounted against instead of the one that was merely expected.
-      const resolvedModel = this.#resolveModelForResource?.(lease.resourceId);
       return {
         action: "allow",
         resource: Object.freeze({ id: lease.resourceId, profile: lease.profile, capacityGroup: lease.capacityGroup }),

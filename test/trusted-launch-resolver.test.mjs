@@ -357,3 +357,107 @@ test("resolver policy includes compiled capability prompt rules and authorizatio
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("resolver admits a launch with no explicit model — the controller selector decides", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-auto-"));
+  const supervisor = signedSupervisor(root);
+  try {
+    await supervisor.start();
+    const resolver = resolverFor(supervisor, root, (input) => ({
+      expectedModel: MODEL,
+      contract: fixtureContract({ taskId: `task-${input.childId}` }),
+    }));
+    const { model: _omit, ...withoutModel } = request("child_auto");
+    const decision = await resolver.resolve(withoutModel);
+    assert.equal(decision.action, "allow", `auto-selected launch must be admitted, got: ${decision.reason}`);
+    assert.equal(supervisor.auditSnapshot().leases.length, 1);
+    await resolver.releaseUnhanded("child_auto");
+  } finally {
+    await supervisor.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolver still denies an explicit model that does not match the selection", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-mismatch-"));
+  const supervisor = signedSupervisor(root);
+  try {
+    await supervisor.start();
+    const resolver = resolverFor(supervisor, root, (input) => ({
+      expectedModel: MODEL,
+      contract: fixtureContract({ taskId: `task-${input.childId}` }),
+    }));
+    const mismatched = { ...request("child_mm"), model: { provider: "smuggled", modelId: "unapproved", thinkingLevel: "off" } };
+    const decision = await resolver.resolve(mismatched);
+    assert.equal(decision.action, "deny");
+    assert.match(decision.reason, /not approved/);
+    assert.equal(supervisor.auditSnapshot().leases.length, 0, "a denied mismatch reserves nothing");
+  } finally {
+    await supervisor.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("provisionChildAuth runs with the leased resource's model before handoff", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-auth-"));
+  const supervisor = signedSupervisor(root);
+  const calls = [];
+  try {
+    await supervisor.start();
+    const resolver = new BrokeredLaunchResolver({
+      socketPath: supervisor.socketPath,
+      controllerToken: supervisor.controllerToken,
+      agentRoot: join(root, "child-agents"),
+      extensionPaths: [EXTENSION_PATH],
+      offline: true,
+      selectContract: (input) => ({
+        expectedModel: MODEL,
+        contract: fixtureContract({ taskId: `task-${input.childId}` }),
+      }),
+      resolveModelForResource: (resourceId) => ({ provider: "broker-fake", modelId: `resolved-${resourceId}` }),
+      provisionChildAuth: (input) => { calls.push({ ...input }); },
+    });
+    const decision = await resolver.resolve(request("child_hook"));
+    assert.equal(decision.action, "allow");
+    assert.equal(calls.length, 1, "auth provisioning ran exactly once");
+    assert.equal(calls[0].childId, "child_hook");
+    assert.equal(calls[0].model.provider, "broker-fake");
+    assert.match(calls[0].model.modelId, /^resolved-/, "the hook sees the leased resource's model, not the prediction");
+    assert.equal(calls[0].agentDir, decision.policy.agentDir);
+    assert.equal(existsSync(calls[0].agentDir), true);
+    await resolver.releaseUnhanded("child_hook");
+  } finally {
+    await supervisor.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a failing provisionChildAuth denies the launch, frees the lease, and removes the agent dir", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-authfail-"));
+  const supervisor = signedSupervisor(root);
+  let capturedDir;
+  try {
+    await supervisor.start();
+    const resolver = new BrokeredLaunchResolver({
+      socketPath: supervisor.socketPath,
+      controllerToken: supervisor.controllerToken,
+      agentRoot: join(root, "child-agents"),
+      extensionPaths: [EXTENSION_PATH],
+      offline: true,
+      selectContract: (input) => ({
+        expectedModel: MODEL,
+        contract: fixtureContract({ taskId: `task-${input.childId}` }),
+      }),
+      provisionChildAuth: ({ agentDir }) => {
+        capturedDir = agentDir;
+        throw new Error("no credential for leased provider: broker-fake");
+      },
+    });
+    await assert.rejects(() => resolver.resolve(request("child_fail")), /no credential for leased provider/);
+    assert.equal(supervisor.auditSnapshot().leases.length, 0, "lease released after provisioning failure");
+    assert.equal(existsSync(capturedDir), false, "agent dir removed after provisioning failure");
+  } finally {
+    await supervisor.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

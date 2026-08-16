@@ -172,6 +172,21 @@ export class SingleHostBrokerSupervisor {
   /** Controller-only bootstrap capability; never put this in a child policy. */
   get controllerToken() { return this.#controllerToken; }
 
+  /**
+   * The dynamic provider watcher, when dynamicProviders is enabled. The controller needs it
+   * to hand the model selector a live registry view. Undefined otherwise.
+   */
+  get providerWatcher() { return this.#providerWatcher; }
+
+  /**
+   * Controller-side live routing inventory (health, cooldowns, breakers) for the model
+   * selector. Read-only, credential-free; never exposed through child IPC.
+   */
+  inventory() {
+    if (!this.#broker) throw new Error("Broker supervisor is not running");
+    return this.#broker.inventory(Date.now());
+  }
+
   /** Controller-local redacted read-only state; never exposed through child IPC. */
   auditSnapshot() {
     if (!this.#broker) throw new Error("Broker supervisor is not running");

@@ -89,6 +89,16 @@ function readPiCatalog(agentDir) {
 }
 
 /**
+ * Build a broker registry directly from a Pi agent dir, without a broker. The controller
+ * uses this to sign the supervisor's initial registry; the watcher then keeps it hot.
+ */
+export function readProviderRegistry(agentDir, { confidence = "observed" } = {}) {
+  const catalog = readPiCatalog(agentDir);
+  if (catalog.length === 0) throw new Error(`no provider catalog readable in ${agentDir}`);
+  return catalogToBrokerRegistry(catalog, { confidence });
+}
+
+/**
  * Controller-owned dynamic provider watcher. It monitors Pi's agent directory
  * for changes to auth.json and models-store.json, rebuilds the broker
  * registry catalog, re-signs it with a controller-generated key, and triggers
@@ -105,6 +115,7 @@ export class DynamicProviderWatcher {
   #watcher;
   #debounceTimer;
   #lastCatalogFingerprint;
+  #lastRegistry;
   #running = false;
 
   constructor({ agentDir, broker, onReload } = {}) {
@@ -144,6 +155,7 @@ export class DynamicProviderWatcher {
     // Only commit the fingerprint once the catalog is known to be representable, so a
     // transient bad read is retried rather than remembered as the current state.
     this.#lastCatalogFingerprint = fingerprint;
+    this.#lastRegistry = registry;
 
     const now = Date.now();
     const result = this.#broker.reloadRegistry(registry, now);
@@ -198,5 +210,19 @@ export class DynamicProviderWatcher {
   providers() {
     const catalog = readPiCatalog(this.#agentDir);
     return Object.freeze(catalog.map((e) => e.provider));
+  }
+
+  /**
+   * The registry built from the most recent successful catalog read. Falls back to a fresh
+   * read when nothing has been refreshed yet, so a selector wired to this accessor works
+   * from the moment the watcher is constructed.
+   */
+  currentRegistry() {
+    if (this.#lastRegistry === undefined) {
+      const catalog = readPiCatalog(this.#agentDir);
+      if (catalog.length === 0) throw new Error("DynamicProviderWatcher has no provider catalog to build a registry from");
+      this.#lastRegistry = catalogToBrokerRegistry(catalog, { confidence: "observed" });
+    }
+    return this.#lastRegistry;
   }
 }

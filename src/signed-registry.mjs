@@ -1,6 +1,9 @@
 import { createHash, createPublicKey, verify } from "node:crypto";
 
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+// A resource id is `${provider}/${modelId}`. Provider model ids legitimately carry vendor
+// paths, rolling aliases and variants such as `:batch` and `~openai/gpt-latest`.
+const RESOURCE_IDENTIFIER = /^[A-Za-z0-9~][A-Za-z0-9._/:~-]{0,191}$/;
 const ENFORCEMENT = new Set(["hard", "metered_best_effort", "unavailable"]);
 const PROFILE_STATUS = new Set(["approved", "disabled"]);
 const INVENTORY_CONFIDENCE = new Set(["measured", "observed", "assumed"]);
@@ -33,6 +36,11 @@ function ownKeysExactly(value, keys, label) {
 
 function requireIdentifier(value, label) {
   if (typeof value !== "string" || !IDENTIFIER.test(value)) throw new Error(`${label} is not a bounded identifier`);
+  return value;
+}
+
+function requireResourceIdentifier(value, label) {
+  if (typeof value !== "string" || !RESOURCE_IDENTIFIER.test(value)) throw new Error(`${label} is not a bounded resource identifier`);
   return value;
 }
 
@@ -100,13 +108,31 @@ function normalizedBrokerRegistry(registry) {
 
   const resources = {};
   for (const [id, resource] of Object.entries(registry.resources)) {
-    requireIdentifier(id, `resource ${id}`);
-    ownKeysExactly(resource, ["capacityGroup", "profile", "confidence", "enforcement"], `resource ${id}`);
+    requireResourceIdentifier(id, `resource ${id}`);
+    // catalogToBrokerRegistry carries controller-side identity/metadata (`model`, `catalog`)
+    // so the selector can map a lease back to a concrete model. The broker persists neither;
+    // permit and deliberately strip both while normalizing the signed registry. Unknown fields
+    // still fail closed.
+    const keys = [
+      "capacityGroup", "profile", "confidence", "enforcement",
+      ...(resource.model !== undefined ? ["model"] : []),
+      ...(resource.catalog !== undefined ? ["catalog"] : []),
+    ];
+    ownKeysExactly(resource, keys, `resource ${id}`);
     requireIdentifier(resource.capacityGroup, `resource ${id} capacityGroup`);
     requireIdentifier(resource.profile, `resource ${id} profile`);
     if (!capacityGroups[resource.capacityGroup]) throw new Error(`resource ${id} references unknown capacity group`);
     if (!profiles[resource.profile]) throw new Error(`resource ${id} references unknown profile`);
     if (!INVENTORY_CONFIDENCE.has(resource.confidence)) throw new Error(`resource ${id} has invalid confidence`);
+    let model;
+    if (resource.model !== undefined) {
+      ownKeysExactly(resource.model, ["provider", "modelId"], `resource ${id} model`);
+      requireIdentifier(resource.model.provider, `resource ${id} model provider`);
+      if (typeof resource.model.modelId !== "string" || resource.model.modelId.length < 1 || resource.model.modelId.length > 200 || /[\0\r\n]/.test(resource.model.modelId)) {
+        throw new Error(`resource ${id} model modelId is not a bounded string`);
+      }
+      model = { provider: resource.model.provider, modelId: resource.model.modelId };
+    }
     ownKeysExactly(resource.enforcement, ["input", "output", "cost"], `resource ${id} enforcement`);
     const enforcement = {};
     for (const dimension of ["input", "output", "cost"]) {
@@ -137,10 +163,17 @@ function decodeSignature(value) {
 export function signedRegistryMessage({ schemaVersion, keyId, registry }) {
   if (schemaVersion !== 2) throw new Error("Signed registry schemaVersion must equal 2");
   requireIdentifier(keyId, "keyId");
-  // Validate semantics before signing too, so a release tool cannot produce a
-  // valid-looking envelope whose payload a supervisor later refuses.
-  normalizedBrokerRegistry(registry);
-  return Buffer.from(canonicalize({ schemaVersion, keyId, registry }), "utf8");
+  // Sign the normalized broker shape, not controller-only catalog metadata. The latter may
+  // carry descriptive floating-point costs and is deliberately neither persisted nor routed by
+  // the broker; signing the raw object made any real catalog impossible to sign.
+  const normalized = normalizedBrokerRegistry(registry);
+  const signedRegistry = {
+    registryVersion: normalized.registryVersion,
+    issuedAt: normalized.issuedAt,
+    expiresAt: normalized.expiresAt,
+    ...normalized.brokerRegistry,
+  };
+  return Buffer.from(canonicalize({ schemaVersion, keyId, registry: signedRegistry }), "utf8");
 }
 
 /**

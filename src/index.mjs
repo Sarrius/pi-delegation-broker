@@ -10,6 +10,7 @@ export { ControllerAcceptanceVerifier, controllerVerificationReceipt } from "./a
 export { ControllerQueuedTaskVerifier, ControllerVerificationAuthority, createControllerVerifierRunId } from "./verification-authority.mjs";
 export { BrokerIpcServer, requestBrokerIpc, streamProviderIpc } from "./ipc.mjs";
 export { provisionBrokeredAgentDir } from "./isolated-child-config.mjs";
+export { baseProviderFor, writeScopedChildAuth } from "./scoped-child-auth.mjs";
 export {
   AttemptSettlement,
   OUTCOME_PROPERTIES,
@@ -47,12 +48,23 @@ export {
 export { RoutingBoard } from "./routing-board.mjs";
 export { ControllerVerifiedRoutingBoard } from "./verified-routing-board.mjs";
 export { captureProviderContext } from "./provider-context.mjs";
+export {
+  FAMILY_STALENESS_MS,
+  LEGACY_GENERATION,
+  assignGenerations,
+  buildCurrencyMap,
+  listingsFromCache,
+  parseModelVersion,
+  probeProviderModels,
+  readCurrencyCache,
+  writeCurrencyCache,
+} from "./provider-probe.mjs";
 export { compileEffectiveChildCapability, createEffectiveChildCapability, deriveAllowedTools } from "./capability-compiler.mjs";
 export { ArtifactPipeline } from "./artifact-pipeline.mjs";
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";
 export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
 export { BrokeredLaunchResolver } from "./trusted-launch-resolver.mjs";
-export { DynamicProviderWatcher } from "./dynamic-provider-watcher.mjs";
+export { DynamicProviderWatcher, readProviderRegistry } from "./dynamic-provider-watcher.mjs";
 export { BrokeredChildRunner, classifyChildFailure } from "./brokered-runner.mjs";
 export { spawnBrokeredChild } from "./child-launcher.mjs";
 export { Semaphore } from "./semaphore.mjs";

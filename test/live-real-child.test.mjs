@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fixtureContract, fixtureRegistry } from "../src/broker.mjs";
 import { signedRegistryMessage } from "../src/signed-registry.mjs";
+import { writeScopedChildAuth } from "../src/scoped-child-auth.mjs";
 import { SingleHostBrokerSupervisor } from "../src/supervisor.mjs";
 import { BrokeredLaunchResolver } from "../src/trusted-launch-resolver.mjs";
 import { BrokeredChildRunner } from "../src/brokered-runner.mjs";
@@ -48,14 +49,12 @@ test("live: spawn Pi child, send prompt, get real response, verify, close", { sk
         expectedModel: MODEL,
         contract: fixtureContract({ taskId: `live-${input.childId}`, promptDigest }),
       }),
+      resolveModelForResource: () => MODEL,
+      // Production auth path: the child gets exactly the leased account's credential in its
+      // own isolated agent dir — never the parent's full agent directory with every account.
+      provisionChildAuth: ({ agentDir, model }) =>
+        writeScopedChildAuth({ agentDir, provider: model.provider, parentAgentDir: PARENT_AGENT_DIR }),
     });
-
-    const originalResolve = resolver.resolve.bind(resolver);
-    resolver.resolve = async (request) => {
-      const decision = await originalResolve(request);
-      if (decision.action === "allow") decision.policy.agentDir = PARENT_AGENT_DIR;
-      return decision;
-    };
 
     const runner = new BrokeredChildRunner({
       resolver,

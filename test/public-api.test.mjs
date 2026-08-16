@@ -10,9 +10,11 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "AnthropicMessagesTransport",
     "AnthropicMessagesTransportError",
     "ArtifactPipeline",
+    "FAMILY_STALENESS_MS",
     "AttemptSettlement",
     "BehavioralRunMonitor",
     "BrokerIpcServer",
+    "LEGACY_GENERATION",
     "BrokeredChildRunner",
     "BrokeredLaunchResolver",
     "ControllerAcceptanceVerifier",
@@ -35,7 +37,10 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "SqliteLeaseBroker",
     "TERMINAL_OUTCOMES",
     "WorktreeCollectionError",
+    "assignGenerations",
+    "baseProviderFor",
     "buildAnthropicMessagesRequest",
+    "buildCurrencyMap",
     "capabilityTierId",
     "captureProviderContext",
     "catalogToBrokerRegistry",
@@ -58,16 +63,23 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "isTerminalOutcome",
     "loadControllerRouteConfiguration",
     "outcomeProperties",
+    "parseModelVersion",
     "parseResourceModel",
+    "probeProviderModels",
     "provisionBrokeredAgentDir",
+    "readCurrencyCache",
+    "readProviderRegistry",
     "requestBrokerIpc",
     "selectModelForTask",
     "signedRegistryMessage",
     "spawnBrokeredChild",
     "streamProviderIpc",
     "validateResultEvidence",
-    "verifySignedRegistry"
-  ]);
+    "verifySignedRegistry",
+    "writeCurrencyCache",
+    "writeScopedChildAuth",
+    "listingsFromCache"
+  ].sort());
   assert.equal("ScriptedFakeProvider" in api, false);
   assert.equal(typeof testing.ScriptedFakeProvider, "function");
 });

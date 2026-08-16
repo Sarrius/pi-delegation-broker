@@ -141,10 +141,28 @@ function costOf(resource) {
  * whose behaviour has actually been measured beats a cheaper one that is only assumed, because
  * an unmet budget cap costs more than the saving.
  */
+/**
+ * Normalize the optional currency map (see provider-probe#buildCurrencyMap) into a lookup.
+ * A legacy resource is never selected while anything current can serve the task; only when
+ * the entire current fleet is unusable does it become a visible last resort.
+ */
+function currencyIndex(currency) {
+  const index = new Map();
+  if (currency === undefined || currency === null) return index;
+  for (const [id, fact] of Object.entries(currency)) {
+    if (fact && typeof fact === "object") index.set(id, fact);
+  }
+  return index;
+}
+
 function rankResources(entries) {
   return [...entries].sort((left, right) => {
     const confidence = (CONFIDENCE_RANK[left.resource.confidence] ?? 3) - (CONFIDENCE_RANK[right.resource.confidence] ?? 3);
     if (confidence !== 0) return confidence;
+    // During the explicit legacy fallback, prefer the newest legacy generation. In normal
+    // routing all entries are current already, so this is a no-op.
+    const generation = (left.generation ?? 0) - (right.generation ?? 0);
+    if (generation !== 0) return generation;
     const cost = costOf(left.resource) - costOf(right.resource);
     if (cost !== 0) return cost;
     return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
@@ -192,7 +210,7 @@ function requiresHardBudget(budget) {
  * `{action:"deny", reason}`. `alternatives` lists the remaining ranked classes so a caller that
  * hits `denied_capacity` can retry one tier up without re-deriving the requirement.
  */
-export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, now } = {}) {
+export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, currency, now } = {}) {
   if (!registry?.profiles || !registry?.resources) throw new Error("selectModelForTask requires a broker registry");
   if (constraints !== undefined && (typeof constraints !== "object" || constraints === null || Array.isArray(constraints))) {
     throw new Error("selectModelForTask constraints must be an object");
@@ -202,6 +220,7 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
   const budget = buildBudget(constraints, requirement.effectCapable);
   const hardBudget = requiresHardBudget(budget);
   const live = availabilityIndex(availability);
+  const currencyLookup = currencyIndex(currency);
   const excluded = new Set(Array.isArray(constraints.excludeResources) ? constraints.excludeResources : []);
   const allowedProviders = Array.isArray(constraints.allowedProviders) && constraints.allowedProviders.length > 0
     ? new Set(constraints.allowedProviders)
@@ -210,36 +229,56 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
   const profiles = candidateProfiles(registry, requirement.capabilities);
   if (profiles.length === 0) return deny("no approved profile supports the required capabilities");
 
-  const tiers = [];
-  for (const profile of profiles) {
-    const entries = [];
-    for (const [id, resource] of Object.entries(registry.resources)) {
-      if (resource?.profile !== profile.id) continue;
-      if (excluded.has(id)) continue;
-      if (allowedProviders && !allowedProviders.has(resource.model?.provider ?? id)) continue;
-      const group = registry.capacityGroups?.[resource.capacityGroup];
-      if (!usable(id, live.get(id), {
-        now,
-        requiresHardBudget: hardBudget,
-        resourceConfidence: resource.confidence,
-        groupConfidence: group?.confidence,
-      })) continue;
-      entries.push({ id, resource });
+  let sawLegacy = false;
+  const buildTiers = (includeLegacy) => {
+    const tiers = [];
+    for (const profile of profiles) {
+      const entries = [];
+      for (const [id, resource] of Object.entries(registry.resources)) {
+        if (resource?.profile !== profile.id) continue;
+        if (excluded.has(id)) continue;
+        if (allowedProviders && !allowedProviders.has(resource.model?.provider ?? id)) continue;
+        const fact = currencyLookup.get(id);
+        if (fact?.legacy === true) {
+          if (!includeLegacy) { sawLegacy = true; continue; }
+        }
+        const group = registry.capacityGroups?.[resource.capacityGroup];
+        if (!usable(id, live.get(id), {
+          now,
+          requiresHardBudget: hardBudget,
+          resourceConfidence: resource.confidence,
+          groupConfidence: group?.confidence,
+        })) continue;
+        entries.push({ id, resource, generation: fact?.generation });
+      }
+      if (entries.length === 0) continue;
+      tiers.push(Object.freeze({
+        profile: profile.id,
+        supports: Object.freeze([...profile.supports]),
+        // A class spanning several accounts can absorb one dying; a class living in one account
+        // cannot. Surfacing it lets a caller prefer breadth when throughput matters.
+        capacityGroups: Object.freeze([...new Set(entries.map((entry) => entry.resource.capacityGroup))]),
+        resources: Object.freeze(rankResources(entries).map((entry) => Object.freeze({
+          resourceId: entry.id,
+          capacityGroup: entry.resource.capacityGroup,
+          confidence: entry.resource.confidence,
+          ...(entry.generation !== undefined ? { generation: entry.generation } : {}),
+          ...(entry.resource.model ? { model: Object.freeze({ ...entry.resource.model }) } : {}),
+        }))),
+      }));
     }
-    if (entries.length === 0) continue;
-    tiers.push(Object.freeze({
-      profile: profile.id,
-      supports: Object.freeze([...profile.supports]),
-      // A class spanning several accounts can absorb one dying; a class living in one account
-      // cannot. Surfacing it lets a caller prefer breadth when throughput matters.
-      capacityGroups: Object.freeze([...new Set(entries.map((entry) => entry.resource.capacityGroup))]),
-      resources: Object.freeze(rankResources(entries).map((entry) => Object.freeze({
-        resourceId: entry.id,
-        capacityGroup: entry.resource.capacityGroup,
-        confidence: entry.resource.confidence,
-        ...(entry.resource.model ? { model: Object.freeze({ ...entry.resource.model }) } : {}),
-      }))),
-    }));
+    return tiers;
+  };
+
+  // First pass: current generations only. Legacy models (glm-4.x beside glm-5.3, gpt-4 beside
+  // gpt-5.6, davinci beside anything) do not exist as far as this pass is concerned.
+  let tiers = buildTiers(false);
+  let legacyFallback = false;
+  if (tiers.length === 0 && sawLegacy) {
+    // Last resort, and visible: the whole current fleet is unusable, so history gets one
+    // chance — marked, so the route trail shows the harness ran on a stale model knowingly.
+    tiers = buildTiers(true);
+    legacyFallback = tiers.length > 0;
   }
 
   if (tiers.length === 0) {
@@ -271,6 +310,7 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
       escalated: chosen.supports.length > requirement.capabilities.length,
       candidateCount: chosen.resources.length,
       capacityGroupCount: chosen.capacityGroups.length,
+      ...(legacyFallback ? { legacyFallback: true } : {}),
     }),
     alternatives: Object.freeze(tiers.slice(1)),
     tier: chosen,
@@ -354,10 +394,11 @@ function defaultDoneWhen(operationClass) {
  * The callback reads only `request.capabilityRequest`, never a prompt: the resolver contract is
  * that a launch request carries no raw task text.
  */
-export function createSelectContract({ registry, availability, constraints = {}, now = () => Date.now() } = {}) {
+export function createSelectContract({ registry, availability, currency, constraints = {}, now = () => Date.now() } = {}) {
   if (registry === undefined) throw new Error("createSelectContract requires a registry or a registry provider");
   const readRegistry = typeof registry === "function" ? registry : () => registry;
   const readAvailability = typeof availability === "function" ? availability : () => availability;
+  const readCurrency = typeof currency === "function" ? currency : () => currency;
 
   return (request) => {
     const capabilityRequest = request?.capabilityRequest ?? {};
@@ -371,6 +412,7 @@ export function createSelectContract({ registry, availability, constraints = {},
       taskDescription: capabilityRequest.taskDescription ?? "",
       registry: readRegistry(),
       availability: readAvailability(),
+      currency: readCurrency(),
       constraints: merged,
       now: now(),
     });
