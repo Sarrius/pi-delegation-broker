@@ -22,6 +22,7 @@
 
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,9 +31,14 @@ import { fileURLToPath } from "node:url";
 import {
   BrokeredChildRunner,
   BrokeredLaunchResolver,
+  ControllerAcceptanceVerifier,
+  ControllerEvidenceStore,
+  ControllerQueuedTaskVerifier,
+  ControllerVerificationAuthority,
   SingleHostBrokerSupervisor,
   buildCurrencyMap,
   createSelectContract,
+  createControllerVerifierRunId,
   DEFAULT_MODEL_PREFERENCES,
   loadModelPreferences,
   parseResourceModel,
@@ -40,6 +46,7 @@ import {
   readProviderRegistry,
   writeModelPreferences,
   signedRegistryMessage,
+  requestBrokerIpc,
   writeScopedChildAuth,
   // @ts-expect-error — resolved relative to this file's real location
 } from "../src/index.mjs";
@@ -69,12 +76,30 @@ const DELEGATE_PARAMS = Type.Object({
   tier: Type.Optional(StringEnum(["cheap", "standard", "frontier"] as const, {
     description: "Optional user task level. Omit for controller inference; frontier respects ~/.pi/agent/delegation-broker/preferences.json.",
   })),
+  acceptance: Type.Optional(Type.Array(Type.Object({
+    id: Type.String({ description: "Stable controller check id." }),
+    claim: Type.String({ description: "Controller-verifiable acceptance claim." }),
+    argv: Type.Array(Type.String({ description: "One literal argv token; no shell syntax." }), { minItems: 1, maxItems: 32 }),
+    timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 120000 })),
+  }), { minItems: 1, maxItems: 20, description: "Fixed controller-owned checks. Omit when no independent acceptance check exists; such work cannot train routing affinity." })),
 });
 
 interface BrokerRuntime {
   supervisor: any;
   runner: any;
+  acceptancePlans: Map<string, Array<{ id: string; claim: string; argv: string[]; timeoutMs: number }>>;
   stopCurrencyRefresh: () => void;
+}
+
+function runControllerArgv(argv: string[], cwd: string, signal: AbortSignal): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(argv[0], argv.slice(1), { cwd, shell: false, signal, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", (data) => { stdout = (stdout + data).slice(0, 32_000); });
+    child.stderr.on("data", (data) => { stderr = (stderr + data).slice(0, 32_000); });
+    child.once("error", (error) => resolve({ exitCode: 127, stdout, stderr: String(error.message).slice(0, 32_000) }));
+    child.once("close", (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
+  });
 }
 
 function loadOrCreateRegistryKeys(): { publicKey: string; privateKey: string } {
@@ -160,6 +185,29 @@ async function startBroker(): Promise<BrokerRuntime> {
     sweepIntervalMs: 1_000,
   });
   await supervisor.start();
+  const acceptancePlans = new Map<string, Array<{ id: string; claim: string; argv: string[]; timeoutMs: number }>>();
+  const evidenceStore = new ControllerEvidenceStore({ root: join(STATE_DIR, "verification-evidence") });
+  const verificationAuthority = new ControllerVerificationAuthority({ evidenceStore });
+  const queuedTaskVerifier = new ControllerQueuedTaskVerifier({
+    authority: verificationAuthority,
+    createVerifier: async ({ taskId }: { taskId: string }) => {
+      const plan = acceptancePlans.get(taskId);
+      if (!plan) throw new Error("no controller acceptance plan registered for tracked task");
+      return new ControllerAcceptanceVerifier({
+        evidenceStore,
+        checks: plan.map(({ id, claim, timeoutMs }) => ({ id, claim, kind: "command", timeoutMs })),
+        runCheck: (check: { id: string }, { signal }: { signal: AbortSignal }) => {
+          const item = plan.find((entry) => entry.id === check.id);
+          if (!item) throw new Error("controller acceptance plan check missing");
+          return runControllerArgv(item.argv, PARENT_AGENT_DIR, signal);
+        },
+      });
+    },
+    finalize: ({ taskId, leaseId, fencingToken, verification }: any) => requestBrokerIpc({
+      socketPath: supervisor.socketPath, authorization: supervisor.controllerToken,
+      method: "finalizeVerifiedTask", params: { taskId, leaseId, fencingToken, verification },
+    }),
+  });
 
   // The catalog says what Pi knows; the probe says what providers still offer and when each
   // release appeared. Keep credentials here in the controller only — the currency map passed
@@ -182,19 +230,25 @@ async function startBroker(): Promise<BrokerRuntime> {
     liveListings,
   });
 
+  const baseSelectContract = createSelectContract({
+    registry: () => supervisor.providerWatcher.currentRegistry(),
+    availability: () => supervisor.inventory(),
+    currency,
+    preferences: () => loadModelPreferences(PREFERENCES_PATH),
+    enforceQuality: true,
+  });
   const resolver = new BrokeredLaunchResolver({
     socketPath: supervisor.socketPath,
     controllerToken: supervisor.controllerToken,
     agentRoot: join(STATE_DIR, "child-agents"),
     extensionPaths: [CHILD_SHIM_PATH],
     offline: false,
-    selectContract: createSelectContract({
-      registry: () => supervisor.providerWatcher.currentRegistry(),
-      availability: () => supervisor.inventory(),
-      currency,
-      preferences: () => loadModelPreferences(PREFERENCES_PATH),
-      enforceQuality: true,
-    }),
+    selectContract: (request: any) => {
+      const selected = baseSelectContract(request);
+      return acceptancePlans.has(request.childId) ? { ...selected, trackImmediateTask: true } : selected;
+    },
+    queuedTaskVerifier,
+    trackImmediateTasks: true,
     resolveModelForResource: parseResourceModel,
     provisionChildAuth: ({ agentDir, model }: { agentDir: string; model?: { provider: string; modelId: string } }) => {
       if (!model?.provider) throw new Error("broker leased a resource with no resolvable model");
@@ -210,6 +264,7 @@ async function startBroker(): Promise<BrokerRuntime> {
   return {
     supervisor,
     runner,
+    acceptancePlans,
     stopCurrencyRefresh: () => clearInterval(currencyTimer),
   };
 }
@@ -283,7 +338,7 @@ export default function piDelegationBroker(pi: any) {
       "Write the delegate task as a complete brief: the child sees nothing of this conversation, so include file paths, context, and exactly what output you expect.",
     ],
     parameters: DELEGATE_PARAMS,
-    async execute(_toolCallId: string, params: { task: string; capabilities?: string[]; tier?: "cheap" | "standard" | "frontier" }, _signal: AbortSignal, onUpdate: any, ctx: any) {
+    async execute(_toolCallId: string, params: { task: string; capabilities?: string[]; tier?: "cheap" | "standard" | "frontier"; acceptance?: Array<{ id: string; claim: string; argv: string[]; timeoutMs?: number }> }, _signal: AbortSignal, onUpdate: any, ctx: any) {
       if (!enabled) {
         return { content: [{ type: "text", text: "Delegation broker is stopped. Run /delegation-broker start to allow new children." }], isError: true };
       }
@@ -299,6 +354,7 @@ export default function piDelegationBroker(pi: any) {
 
       const childId = `delegate-${Date.now().toString(36)}-${++counter}`;
       const promptDigest = createHash("sha256").update(params.task).digest("hex");
+      if (params.acceptance) broker.acceptancePlans.set(childId, params.acceptance.map((check) => ({ ...check, timeoutMs: check.timeoutMs ?? 30_000 })));
       onUpdate?.({ content: [{ type: "text", text: "Selecting model and spawning child…" }] });
 
       const result = await broker.runner.run({
@@ -314,6 +370,7 @@ export default function piDelegationBroker(pi: any) {
         },
       });
 
+      broker.acceptancePlans.delete(childId);
       const route = (result.route ?? [])
         .map((hop: any) => `${hop.outcome}${hop.resourceId ? ` ${hop.resourceId}` : ""}`)
         .join(" → ");

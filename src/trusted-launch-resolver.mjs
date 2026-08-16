@@ -142,7 +142,7 @@ export class BrokeredLaunchResolver {
     }
     if (reservation?.status !== "leased") return { action: "deny", reason: reservation?.status === "denied_capacity" ? "no compatible broker capacity" : "broker policy denied launch" };
     const lease = reservation.lease;
-    if (queuedTaskId === undefined && this.#trackImmediateTasks) {
+    if (queuedTaskId === undefined && this.#trackImmediateTasks && selection.trackImmediateTask === true) {
       const tracked = await this.#controller("trackLeasedTask", {
         contract: selection.contract,
         leaseId: lease.leaseId,
