@@ -4,6 +4,7 @@ import { accessSync, constants, mkdirSync, readFileSync, realpathSync, rmSync, s
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnChildRpc } from "./child-rpc.mjs";
+import { baseProviderFor } from "./scoped-child-auth.mjs";
 
 const TOOL_REPORT_TIMEOUT_MS = 60_000;
 const TOOL_REPORT_POLL_MS = 100;
@@ -265,7 +266,12 @@ export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPi
   const model = spec.model ?? "broker-fake/lease-fake";
   const slash = model.indexOf("/");
   if (slash < 1) throw new Error(`Model must be "provider/model-id", got ${JSON.stringify(model)}`);
-  const provider = model.slice(0, slash);
+  const leasedProvider = model.slice(0, slash);
+  // Account aliases are registered by the parent's interactive multi-account extension, but
+  // children run with extension discovery disabled. Their scoped auth dir contains exactly the
+  // leased credential under this canonical name, so Pi can resolve the model without loading
+  // an account-management extension or gaining the parent's other credentials.
+  const provider = baseProviderFor(leasedProvider);
   const modelId = model.slice(slash + 1);
 
   const args = buildChildArgs({
@@ -290,7 +296,13 @@ export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPi
   const stem = join(shimDir, randomUUID());
   const toolReportPath = `${stem}.tools.json`;
   const specPath = `${stem}.spec.json`;
-  writeFileSync(specPath, JSON.stringify({ schema: spec.schema, toolReportPath }), { mode: 0o600 });
+  // Only an effect-capable controller policy exposes the shim's narrowly-scoped patch tool.
+  // Observe children never receive a latent mutation surface just because the shim is loaded.
+  writeFileSync(specPath, JSON.stringify({
+    schema: spec.schema,
+    toolReportPath,
+    effectCapable: launchPolicy?.authorizationPolicy?.effectCapable === true,
+  }), { mode: 0o600 });
 
   const env = launchPolicy?.environment
     ? { ...isolatedEnv(launchPolicy, specPath) }

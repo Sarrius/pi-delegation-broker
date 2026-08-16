@@ -9,12 +9,17 @@
  */
 
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { Type } from "typebox";
+import { applyProposedPatch } from "../src/proposed-patch.mjs";
 
 const SHIM_SPEC_ENV = "PI_SUBAGENT_SHIM_SPEC";
 
 interface ShimSpec {
   schema?: Record<string, unknown>;
   toolReportPath: string;
+  // The launcher derives this from the signed controller capability; the shim never trusts a
+  // model's prompt to decide whether it should expose a mutation surface.
+  effectCapable?: boolean;
 }
 
 function readShimSpec(path: string): ShimSpec {
@@ -60,6 +65,23 @@ export default function childShim(pi: any): void {
   const specPath = process.env[SHIM_SPEC_ENV];
   if (!specPath) return;
   const spec = readShimSpec(specPath);
+  if (spec.effectCapable === true) {
+    pi.registerTool({
+      name: "propose_patch",
+      label: "Propose Patch",
+      description: "Apply one unified Git diff only to the isolated child worktree. Declare this exact action with broker_declare_action immediately beforehand. The controller will independently verify the resulting patch; it will not be applied to the parent repository.",
+      parameters: Type.Object({
+        patch: Type.String({ minLength: 1, maxLength: 4 * 1024 * 1024, description: "A conventional unified git diff with diff --git headers." }),
+      }, { additionalProperties: false }),
+      async execute(_id: string, params: { patch: string }, _signal: AbortSignal, _onUpdate: unknown, ctx: { cwd: string }) {
+        const result = applyProposedPatch({ cwd: ctx.cwd, patch: params.patch });
+        return {
+          content: [{ type: "text", text: `Patch applied in the isolated worktree for: ${result.changed.join(", ")}.` }],
+          details: { changed: result.changed },
+        };
+      },
+    });
+  }
   if (spec.schema) {
     pi.registerTool({
       name: "report_result",

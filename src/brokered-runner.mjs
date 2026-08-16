@@ -30,7 +30,7 @@ const FAILURE_SIGNATURES = Object.freeze([
   // Exhausted credit/balance is this account's problem, not the task's: cool it and move on.
   // Spent balance belongs to the whole account, not one of its models, so it cools the capacity
   // group like a throttle does and recovers through the broker's existing half-open probe.
-  Object.freeze({ kind: "account_exhausted", pattern: /\b402\b|requires more credits|insufficient (credits|balance)|purchase credits|upgrade to a paid account/i }),
+  Object.freeze({ kind: "account_exhausted", pattern: /\b402\b|requires more credits|insufficient (credits|balance)|purchase credits|upgrade to a paid account|third-party apps now draw from your extra usage|claude\.ai\/settings\/usage/i }),
   Object.freeze({ kind: "unavailable", pattern: /\b(50[0234]|service unavailable|bad gateway|upstream|connection (refused|reset)|econnrefused|etimedout|network)\b/i }),
 ]);
 
@@ -200,6 +200,13 @@ export class BrokeredChildRunner {
       if (decision.action === "deny") throw new Error(`Broker denied launch: ${decision.reason}`);
 
       const policy = decision.policy;
+      // A proposed effect is only safe in a disposable Git worktree. Letting an otherwise
+      // correctly attested patch tool run against the caller's cwd would turn verification into
+      // after-the-fact damage control, so reject before a child process exists.
+      if (policy.authorizationPolicy?.effectCapable === true && isolation !== "worktree") {
+        await policy.onBeforeChildAbandoned?.("effect_requires_worktree");
+        throw new Error("effect-capable brokered launch requires worktree isolation");
+      }
       // The lease decides the model, not the request: the contract pins a capability class and
       // the broker picks a live resource inside it, which may not be the one predicted.
       const launchModel = decision.resolvedModel ?? model;

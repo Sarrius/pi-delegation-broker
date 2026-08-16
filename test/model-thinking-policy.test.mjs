@@ -21,5 +21,6 @@ test("a child that never settles is a failover-eligible route failure", () => {
 
 test("an exhausted account is a route failure, not a dead task", () => {
   assert.equal(classifyChildFailure('402: {"message":"This request requires more credits, or fewer max_tokens"}'), "account_exhausted");
+  assert.equal(classifyChildFailure("400: Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage"), "account_exhausted");
   assert.equal(classifyChildFailure("400: Reasoning is mandatory for this endpoint and cannot be disabled."), "unavailable");
 });

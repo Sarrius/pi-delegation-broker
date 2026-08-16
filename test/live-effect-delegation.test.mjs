@@ -90,7 +90,14 @@ test("live: a child proposes a change and only a controller-verified patch comes
       isolation: "worktree",
       thinkingLevel: "off",
       prompt: PROMPT,
-      capabilityRequest: { taskDescription: "edit a file in the repository", operationClass: "propose_patch" },
+      // This test changes one line. Its controller-owned hard cap proves the shim enforces the
+      // leased budget and keeps the live test within the fleet's remaining credit, rather than
+      // asking every provider for its 16k default maximum.
+      capabilityRequest: {
+        taskDescription: "edit a file in the repository",
+        operationClass: "propose_patch",
+        budget: { maxInputTokens: 20_000, maxOutputTokens: 2_048 },
+      },
     });
 
     assert.equal(result.status, "completed", `child should complete, got: ${result.error ?? result.text}`);

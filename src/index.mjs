@@ -82,3 +82,4 @@ export { spawnBrokeredChild } from "./child-launcher.mjs";
 export { Semaphore } from "./semaphore.mjs";
 export { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionError } from "./worktree.mjs";
 export { verifyProposedPatch, spawnControllerArgv, EffectVerificationError } from "./effect-verification.mjs";
+export { applyProposedPatch, proposedPatchPaths } from "./proposed-patch.mjs";

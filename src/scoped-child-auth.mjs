@@ -7,11 +7,13 @@
  * module writes a minimal per-child configuration instead:
  *
  * - `auth.json`        — the ONE credential entry for the leased provider, copied verbatim.
- * - `models-store.json` — that provider's model catalog. Multi-account providers
- *   (`openai-codex-account-2`, ...) have no catalog of their own: their models live under the
- *   base provider, so they are inherited with the provider field rewritten to the account.
+ *   For a `*-account-N` lease it is written under the canonical base provider id: a fresh Pi
+ *   process cannot resolve an alias provider unless its multi-account UI extension is also
+ *   loaded, while the isolated directory guarantees that base id still means exactly this one
+ *   leased account.
+ * - `models-store.json` — that provider's model catalog under the same canonical id.
  * - `models.json`      — the provider's endpoint config (api/baseUrl), when the parent has
- *   one, scoped to the single provider.
+ *   one, scoped to the same canonical provider.
  *
  * Everything here runs controller-side, inside the launch resolver's provisioning hook. The
  * files land in the child's owner-only agent directory (0o700 dir, 0o600 files) and are
@@ -72,14 +74,18 @@ export function writeScopedChildAuth({ agentDir, provider, parentAgentDir } = {}
   if (!credential || typeof credential !== "object" || typeof credential.type !== "string") {
     throw new Error(`no credential for leased provider: ${provider}`);
   }
-  writeOwnerOnly(join(resolvedAgentDir, "auth.json"), { [provider]: credential });
+  // `pi-multi-account` aliases exist in the parent interactive process, but isolated children
+  // deliberately run `--no-extensions`; Pi then has no provider definition for
+  // `anthropic-account-2` et al. A one-credential agent dir makes the canonical name safe:
+  // `anthropic` here can only authenticate as this leased account, never the parent's base one.
+  const base = baseProviderFor(provider);
+  writeOwnerOnly(join(resolvedAgentDir, "auth.json"), { [base]: credential });
 
   // 2. Model catalog: the provider's own entry, else the base provider's (multi-account
   //    inheritance), else whatever the endpoint config already lists. Model entries are
   //    self-describing (api + baseUrl), so a provider the child's Pi has never heard of is
   //    still fully defined by this file alone.
   const store = readJson(join(parentAgentDir, "models-store.json"));
-  const base = baseProviderFor(provider);
   const modelsConfig = readJson(join(parentAgentDir, "models.json"));
   const providerConfig = modelsConfig.providers?.[provider] ?? modelsConfig.providers?.[base];
   let models;
@@ -101,27 +107,29 @@ export function writeScopedChildAuth({ agentDir, provider, parentAgentDir } = {}
     .filter((model) => model && typeof model === "object" && typeof model.id === "string")
     .map((model) => ({
       ...model,
-      provider,
+      provider: base,
       ...(providerConfig?.api && !model.api ? { api: providerConfig.api } : {}),
       ...(providerConfig?.baseUrl && !model.baseUrl ? { baseUrl: providerConfig.baseUrl } : {}),
     }));
   if (scopedModels.length > 0) {
-    writeOwnerOnly(join(resolvedAgentDir, "models-store.json"), { [provider]: { models: scopedModels } });
+    writeOwnerOnly(join(resolvedAgentDir, "models-store.json"), { [base]: { models: scopedModels } });
   }
 
-  // 3. Endpoint config: scoped to the one provider. For a multi-account id the child's Pi
-  //    has no built-in definition, so give it a complete self-contained entry when we can.
+  // 3. Endpoint config: also canonicalized, matching auth/catalog and the launch --provider.
   const scopedConfig = providerConfig
     ? { ...providerConfig, models: scopedModels.length > 0 ? scopedModels : providerConfig.models }
     : (scopedModels.length > 0 && scopedModels[0].api && scopedModels[0].baseUrl)
       ? { api: scopedModels[0].api, baseUrl: scopedModels[0].baseUrl }
       : undefined;
   if (scopedConfig) {
-    writeOwnerOnly(join(resolvedAgentDir, "models.json"), { providers: { [provider]: scopedConfig } });
+    writeOwnerOnly(join(resolvedAgentDir, "models.json"), { providers: { [base]: scopedConfig } });
   }
 
   return Object.freeze({
+    // `provider` is the controller/audit identity; `runtimeProvider` only appears when a
+    // fresh Pi must use a different canonical id to represent that exact scoped credential.
     provider,
+    ...(base === provider ? {} : { runtimeProvider: base }),
     credentialType: credential.type,
     modelCount: scopedModels.length,
     modelsSource,

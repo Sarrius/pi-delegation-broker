@@ -57,7 +57,7 @@ test("scoped auth writes exactly one credential and that provider's catalog", ()
   }
 });
 
-test("multi-account provider inherits the base catalog with provider rewritten", () => {
+test("multi-account lease is represented under a canonical provider with its own credential", () => {
   const parent = parentDir({
     "auth.json": {
       "openai-codex": { type: "oauth", access: "a", refresh: "r", expires: 1, accountId: "acc-0" },
@@ -73,22 +73,22 @@ test("multi-account provider inherits the base catalog with provider rewritten",
     assert.equal(summary.modelsSource, "base");
     assert.equal(summary.modelCount, 1);
     assert.equal(summary.credentialType, "oauth");
+    assert.equal(summary.provider, "openai-codex-account-2", "audit retains the leased account identity");
+    assert.equal(summary.runtimeProvider, "openai-codex");
 
     const auth = JSON.parse(readFileSync(join(child, "auth.json"), "utf8"));
-    assert.deepEqual(Object.keys(auth), ["openai-codex-account-2"]);
-    assert.equal(auth["openai-codex-account-2"].accountId, "acc-2", "the account's own credential, not the base one");
+    assert.deepEqual(Object.keys(auth), ["openai-codex"]);
+    assert.equal(auth["openai-codex"].accountId, "acc-2", "the account's own credential, not the base one");
 
     const store = JSON.parse(readFileSync(join(child, "models-store.json"), "utf8"));
-    const model = store["openai-codex-account-2"].models[0];
-    assert.equal(model.provider, "openai-codex-account-2", "provider field rewritten to the account");
+    const model = store["openai-codex"].models[0];
+    assert.equal(model.provider, "openai-codex", "a fresh Pi process can resolve the canonical provider");
     assert.equal(model.api, "openai-codex-responses");
     assert.equal(model.baseUrl, "https://chatgpt.com/backend-api");
 
-    // A self-contained endpoint config lets the child's Pi use an account provider it has
-    // never heard of without the multi-account extension present.
     const config = JSON.parse(readFileSync(join(child, "models.json"), "utf8"));
-    assert.equal(config.providers["openai-codex-account-2"].api, "openai-codex-responses");
-    assert.equal(config.providers["openai-codex-account-2"].baseUrl, "https://chatgpt.com/backend-api");
+    assert.equal(config.providers["openai-codex"].api, "openai-codex-responses");
+    assert.equal(config.providers["openai-codex"].baseUrl, "https://chatgpt.com/backend-api");
   } finally {
     rmSync(parent, { recursive: true, force: true });
     rmSync(child, { recursive: true, force: true });
