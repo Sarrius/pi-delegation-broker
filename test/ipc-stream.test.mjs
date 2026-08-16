@@ -56,8 +56,7 @@ function fakeContext(overrides = {}) {
   return {
     systemPrompt: "You are a careful code reviewer.",
     messages: [{ role: "user", content: "Review src/window.mjs for off-by-one errors." }],
-    tools: [{ name: "read", description: "Read a file", schema: { path: "string" } }],
-    options: {},
+    tools: [{ name: "read", description: "Read a file", inputSchema: { type: "object", additionalProperties: false } }],
     ...overrides,
   };
 }
@@ -286,7 +285,7 @@ test("streaming rejects deeply nested context that exceeds the depth limit", asy
       () => streamProviderIpc({
         socketPath: server.socketPath,
         authorization: capability,
-        context: { systemPrompt: "x", messages: [], tools: [], options: deep },
+        context: { systemPrompt: "x", messages: [], tools: [], unexpected: deep },
       }),
       /depth limit/,
     );
@@ -400,7 +399,7 @@ test("real transport route failure and malformed context make no provider dispat
   }
 });
 
-test("real transport rejects malformed canonical context without provider health mutation or dispatch", async () => {
+test("real transport rejects malformed canonical context at ingress without provider health mutation or dispatch", async () => {
   let dispatches = 0;
   const { directory, broker, server } = createRealServer({
     fetchImpl: async () => { dispatches += 1; return anthropicSse([]); },
@@ -408,15 +407,12 @@ test("real transport rejects malformed canonical context without provider health
   await server.start();
   try {
     const capability = await reserveCapability(server, "real-stream-context-fail");
-    const { frames, terminal } = await streamProviderIpc({
-      socketPath: server.socketPath,
-      authorization: capability,
-      context: realContext({ unexpected: true }),
-    });
+    await assert.rejects(
+      () => streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: realContext({ unexpected: true }) }),
+      /context has unknown field unexpected/,
+    );
     assert.equal(dispatches, 0);
-    assert.deepEqual(frames.map((frame) => frame.type), ["attempt_accepted", "terminal"]);
-    assert.equal(terminal.payload.outcome, "controller_failure");
-    assert.equal(broker.leases().length, 0);
+    assert.equal(broker.leases().length, 1); // Child may retry with a valid frame before TTL.
     assert.equal(broker.events().some((event) => event.type === "ProviderEvent"), false);
   } finally {
     await server.stop();

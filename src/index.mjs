@@ -28,6 +28,7 @@ export {
   buildAnthropicMessagesRequest,
 } from "./anthropic-messages-transport.mjs";
 export { RoutingBoard } from "./routing-board.mjs";
+export { captureProviderContext } from "./provider-context.mjs";
 export { compileEffectiveChildCapability, createEffectiveChildCapability, deriveAllowedTools } from "./capability-compiler.mjs";
 export { ArtifactPipeline } from "./artifact-pipeline.mjs";
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";

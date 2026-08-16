@@ -24,6 +24,7 @@ test("public API excludes test fixtures while exposing only unconfigured transpo
     "SqliteLeaseBroker",
     "TERMINAL_OUTCOMES",
     "buildAnthropicMessagesRequest",
+    "captureProviderContext",
     "catalogToBrokerRegistry",
     "compileEffectiveChildCapability",
     "createAttemptRouteSnapshot",

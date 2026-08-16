@@ -58,10 +58,10 @@ The attempt handle is one-shot. Once admitted into controller middleware it cann
 
 ## Request ingress
 
-The child sends canonical context, not only a digest. The controller:
+The child sends canonical context, not only a digest. The currently implemented vocabulary is deliberately narrow: `systemPrompt` string, text-only `user | assistant` messages, and uniquely named tools with `name`, `description`, and JSON `inputSchema`. Provider options, provider response IDs, replay/cache handles, unknown fields, non-text modalities, tool-result blocks, malformed arguments and duplicate tool names fail before route/credential resolution; they are not silently transformed or dropped. The controller:
 
 1. parses a size-bounded request frame;
-2. validates a closed schema and semantic block vocabulary;
+2. validates the closed schema through `captureProviderContext` and semantic block vocabulary;
 3. creates one detached lossless-JSON snapshot with depth/node/byte limits;
 4. verifies contract/prompt/tool digests against the lease;
 5. retains or references the exact snapshot according to evidence policy;

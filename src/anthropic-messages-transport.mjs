@@ -1,4 +1,5 @@
 import { captureLosslessJson } from "./lossless-json.mjs";
+import { captureProviderContext } from "./provider-context.mjs";
 import { ProviderProtocolError } from "./provider-protocol.mjs";
 
 /**
@@ -125,16 +126,13 @@ function normalizeTools(context) {
  */
 export function buildAnthropicMessagesRequest(snapshot, context) {
   validateSnapshot(snapshot);
-  const captured = captureLosslessJson(context, {
-    maxBytes: snapshot.maxInputBytes,
-    maxNodes: 100_000,
-    maxDepth: 32,
-  });
-  const value = captured.value;
-  if (!isPlainObject(value)) fail("context_invalid", "context must be a plain object");
-  for (const key of Object.keys(value)) {
-    if (!["systemPrompt", "messages", "tools"].includes(key)) fail("context_invalid", `context has unknown field ${key}`);
+  let captured;
+  try {
+    captured = captureProviderContext(context, { maxBytes: snapshot.maxInputBytes });
+  } catch (error) {
+    fail("context_invalid", error instanceof Error ? error.message : "context validation failed");
   }
+  const value = captured.value;
   const systemPrompt = boundedText(value.systemPrompt, "systemPrompt", 256 * 1024);
   const request = {
     model: snapshot.model,

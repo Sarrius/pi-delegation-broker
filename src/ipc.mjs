@@ -2,7 +2,7 @@ import { randomBytes, createHash, randomUUID, timingSafeEqual } from "node:crypt
 import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { dirname } from "node:path";
-import { captureLosslessJson } from "./lossless-json.mjs";
+import { captureProviderContext } from "./provider-context.mjs";
 import { ArtifactPipeline } from "./artifact-pipeline.mjs";
 import { AttemptSettlement, ProviderStreamAssembler, createAttemptRouteSnapshot, outcomeProperties } from "./provider-protocol.mjs";
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -214,12 +214,9 @@ export class BrokerIpcServer {
     const context = params?.context;
     if (!context || typeof context !== "object") throw new Error("stream requires typed context");
 
-    // Phase 1: bounded lossless context ingress (synchronous, before any writes)
-    const captured = captureLosslessJson(context, { maxBytes: 512 * 1024, maxNodes: 100_000, maxDepth: 32 });
+    // Phase 1: bounded lossless, closed-schema context ingress (before writes)
+    const captured = captureProviderContext(context, { maxBytes: 512 * 1024 });
     const inputDigest = createHash("sha256").update(captured.canonical).digest("hex");
-    if (typeof captured.value.systemPrompt !== "string") throw new Error("context requires string systemPrompt");
-    if (!Array.isArray(captured.value.messages)) throw new Error("context requires array messages");
-    if (!Array.isArray(captured.value.tools)) throw new Error("context requires array tools");
 
     // Phase 2: immutable route snapshot
     const route = this.#fakeProvider.routeForLease(lease);
@@ -352,11 +349,8 @@ export class BrokerIpcServer {
   async #realProviderStream(lease, params, signal, socket, requestId) {
     const context = params?.context;
     if (!context || typeof context !== "object") throw new Error("stream requires typed context");
-    const captured = captureLosslessJson(context, { maxBytes: 512 * 1024, maxNodes: 100_000, maxDepth: 32 });
+    const captured = captureProviderContext(context, { maxBytes: 512 * 1024 });
     const inputDigest = createHash("sha256").update(captured.canonical).digest("hex");
-    if (typeof captured.value.systemPrompt !== "string") throw new Error("context requires string systemPrompt");
-    if (!Array.isArray(captured.value.messages)) throw new Error("context requires array messages");
-    if (!Array.isArray(captured.value.tools)) throw new Error("context requires array tools");
 
     // Resolve a controller-owned route before admitting the stream. Route
     // selection failure is a controller admission failure, never an ambient
