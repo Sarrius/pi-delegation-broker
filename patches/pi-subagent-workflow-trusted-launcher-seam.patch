@@ -223,7 +223,7 @@ index 007df98..5f41b71 100644
    return args;
  }
 diff --git a/src/runner/subprocess/spawn-child.ts b/src/runner/subprocess/spawn-child.ts
-index da0132a..6a6406b 100644
+index da0132a..8608153 100644
 --- a/src/runner/subprocess/spawn-child.ts
 +++ b/src/runner/subprocess/spawn-child.ts
 @@ -11,11 +11,16 @@ import { fileURLToPath } from "node:url";
@@ -312,9 +312,12 @@ index da0132a..6a6406b 100644
    });
    const capture: SchemaCapture | undefined = spec.schema ? { called: false } : undefined;
    const args = buildChildArgs({
-@@ -125,6 +156,10 @@ export async function spawnSubprocessChild(
+@@ -123,8 +154,12 @@ export async function spawnSubprocessChild(
+     excludeTools,
+     sessionDir: persistence.sessionsDir,
      forkSessionFile: persistence.forkSessionFile,
-     appendSystemPrompt: SUBAGENT_FRAMING,
+-    appendSystemPrompt: SUBAGENT_FRAMING,
++    appendSystemPrompt: [SUBAGENT_FRAMING, launchPolicy?.promptRules].filter((part): part is string => part !== undefined).join("\n\n"),
      shimPath,
 +    trustedExtensionPaths: launchPolicy?.extensionPaths,
 +    isolatedDiscovery: launchPolicy !== undefined,
@@ -334,14 +337,28 @@ index da0132a..6a6406b 100644
      });
    } catch (error) {
      rmSync(specPath, { force: true });
+@@ -178,6 +215,13 @@ export async function spawnSubprocessChild(
+         + `Active tools: ${report.activeTools.join(", ") || "none"}.`,
+       );
+     }
++    const missingRequired = (launchPolicy?.requiredActiveTools ?? []).filter((name) => !report.activeTools.includes(name));
++    if (missingRequired.length > 0) {
++      throw new Error(
++        `Trusted launcher attestation failed: required active tool(s) missing: ${missingRequired.join(", ")}. `
++        + `The brokered child was not handed off. Active tools: ${report.activeTools.join(", ") || "none"}.`,
++      );
++    }
+     const session = await RpcChildSession.start(rpc);
+     if (capture) wireSchemaCapture(session, capture);
+     return {
 diff --git a/src/runner/trusted-launch-policy.ts b/src/runner/trusted-launch-policy.ts
 new file mode 100644
-index 0000000..53a3e99
+index 0000000..dca57da
 --- /dev/null
 +++ b/src/runner/trusted-launch-policy.ts
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,281 @@
 +import { createHash } from "node:crypto";
-+import { accessSync, constants, realpathSync, statSync } from "node:fs";
++import { accessSync, constants, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 +import { isAbsolute } from "node:path";
 +import type { SubagentSpec, ThinkingLevel } from "../types.js";
 +import { resolveModel, type ParentContext } from "./child.js";
@@ -357,12 +374,35 @@ index 0000000..53a3e99
 +  readonly error?: string;
 +}
 +
++export interface TrustedExtensionSource {
++  /** Canonical source path used in the explicit --extension argument. */
++  readonly path: string;
++  /** SHA-256 of the reviewed extension bytes. */
++  readonly digest: string;
++}
++
++/** Controller-generated, parent-verified source-order commitment. */
++export interface TrustedLauncherAttestation {
++  readonly schemaVersion: 1;
++  readonly capabilityFingerprint: string;
++  readonly extensions: readonly TrustedExtensionSource[];
++  /** Must equal the final record in extensions. */
++  readonly behavioralExtension: TrustedExtensionSource;
++  readonly fingerprint: string;
++}
++
 +export interface TrustedChildLaunchPolicy {
 +  readonly policyId: string;
 +  /** Existing, absolute, owner-only Pi agent dir selected by the controller. */
 +  readonly agentDir: string;
 +  /** Explicit extensions permitted in the otherwise discovery-free child. */
 +  readonly extensionPaths?: readonly string[];
++  /** Optional controller-pinned source/order verification for explicit extensions. */
++  readonly launcherAttestation?: TrustedLauncherAttestation;
++  /** Tool names which must appear in the child startup report before handoff. */
++  readonly requiredActiveTools?: readonly string[];
++  /** Child-visible rules generated from the controller-bound capability. */
++  readonly promptRules?: string;
 +  /** Disable Pi startup network operations for non-live/fake child runs. */
 +  readonly offline?: boolean;
 +  /**
@@ -417,6 +457,72 @@ index 0000000..53a3e99
 +
 +function readonlyList(values: readonly string[] | undefined): readonly string[] | undefined {
 +  return values === undefined ? undefined : Object.freeze([...values]);
++}
++
++const SHA256 = /^[a-f0-9]{64}$/;
++const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
++
++function requireDigest(value: unknown, label: string): string {
++  if (typeof value !== "string" || !SHA256.test(value)) throw new Error(`${label} must be a SHA-256 hex digest`);
++  return value;
++}
++
++function boundedPromptRules(value: unknown): string | undefined {
++  if (value === undefined) return undefined;
++  if (typeof value !== "string" || value.length < 1 || value.length > 16_384 || value.includes("\0")) {
++    throw new Error("Trusted child launch policy promptRules must be 1..16384 characters without NUL");
++  }
++  return value;
++}
++
++function requiredTools(value: readonly string[] | undefined): readonly string[] | undefined {
++  if (value === undefined) return undefined;
++  if (!Array.isArray(value) || value.length < 1 || value.length > 128) {
++    throw new Error("Trusted child launch policy requiredActiveTools must contain 1..128 names");
++  }
++  if (value.some((name) => typeof name !== "string" || !TOOL_NAME.test(name)) || new Set(value).size !== value.length) {
++    throw new Error("Trusted child launch policy requiredActiveTools contains an invalid or duplicate tool name");
++  }
++  return Object.freeze([...value]);
++}
++
++function normalizeLauncherAttestation(value: TrustedLauncherAttestation | undefined, extensionPaths: readonly string[]): TrustedLauncherAttestation | undefined {
++  if (value === undefined) return undefined;
++  if (!value || typeof value !== "object" || value.schemaVersion !== 1 || !Array.isArray(value.extensions)) {
++    throw new Error("Trusted child launch policy launcherAttestation is malformed");
++  }
++  requireDigest(value.capabilityFingerprint, "Trusted launcher attestation capabilityFingerprint");
++  requireDigest(value.fingerprint, "Trusted launcher attestation fingerprint");
++  if (value.extensions.length !== extensionPaths.length || value.extensions.length < 1) {
++    throw new Error("Trusted launcher attestation extension count does not match explicit paths");
++  }
++  const extensions = value.extensions.map((entry, index) => {
++    if (!entry || typeof entry !== "object" || typeof entry.path !== "string" || typeof entry.digest !== "string") {
++      throw new Error("Trusted launcher attestation extension record is malformed");
++    }
++    if (entry.path !== extensionPaths[index]) throw new Error("Trusted launcher attestation extension order does not match explicit paths");
++    if (lstatSync(entry.path).isSymbolicLink()) throw new Error("Trusted launcher attestation extension must not be a symbolic link");
++    const actual = createHash("sha256").update(readFileSync(entry.path)).digest("hex");
++    if (actual !== requireDigest(entry.digest, "Trusted launcher attestation extension digest")) {
++      throw new Error("Trusted launcher attestation extension changed after approval");
++    }
++    return Object.freeze({ path: entry.path, digest: entry.digest });
++  });
++  const behavioral = value.behavioralExtension;
++  if (!behavioral || typeof behavioral.path !== "string" || typeof behavioral.digest !== "string") {
++    throw new Error("Trusted launcher attestation behavioralExtension is malformed");
++  }
++  const last = extensions.at(-1);
++  if (!last || behavioral.path !== last.path || behavioral.digest !== last.digest) {
++    throw new Error("Trusted launcher attestation requires behavioral extension final in explicit order");
++  }
++  return Object.freeze({
++    schemaVersion: 1,
++    capabilityFingerprint: value.capabilityFingerprint,
++    extensions: Object.freeze(extensions),
++    behavioralExtension: Object.freeze({ path: behavioral.path, digest: behavioral.digest }),
++    fingerprint: value.fingerprint,
++  });
 +}
 +
 +/** Resolve and validate a controller decision before any child-side artifact exists. */
@@ -483,6 +589,10 @@ index 0000000..53a3e99
 +    }
 +  });
 +
++  const launcherAttestation = normalizeLauncherAttestation(input.launcherAttestation, extensionPaths);
++  const activeToolRequirements = requiredTools(input.requiredActiveTools);
++  const promptRules = boundedPromptRules(input.promptRules);
++
 +  const environment: Record<string, string> = {};
 +  for (const [key, value] of Object.entries(input.environment ?? {})) {
 +    if (!ALLOWED_POLICY_ENVIRONMENT.has(key)) throw new Error(`Trusted child launch policy cannot set environment variable ${key}`);
@@ -509,6 +619,9 @@ index 0000000..53a3e99
 +    ...(input.onChildSessionOpened ? { onChildSessionOpened: input.onChildSessionOpened } : {}),
 +    ...(input.onChildSessionClosed ? { onChildSessionClosed: input.onChildSessionClosed } : {}),
 +    ...(extensionPaths.length ? { extensionPaths: Object.freeze(extensionPaths) } : {}),
++    ...(launcherAttestation ? { launcherAttestation } : {}),
++    ...(activeToolRequirements ? { requiredActiveTools: activeToolRequirements } : {}),
++    ...(promptRules ? { promptRules } : {}),
 +    ...(Object.keys(environment).length ? { environment: Object.freeze(environment) } : {}),
 +  });
 +}

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { generateKeyPairSync, sign } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,7 @@ import { BrokeredLaunchResolver } from "../src/trusted-launch-resolver.mjs";
 const MODEL = { provider: "broker-fake", modelId: "lease-fake" };
 const CONTROLLER_TOKEN = "r".repeat(48);
 const EXTENSION_PATH = new URL("./isolated-fake-provider.ts", import.meta.url).pathname;
+const BEHAVIORAL_EXTENSION_PATH = new URL("../extensions/pi-behavioral-enforcement.ts", import.meta.url).pathname;
 
 function signedSupervisor(root, registry = fixtureRegistry()) {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -39,14 +40,15 @@ function request(childId) {
   };
 }
 
-function resolverFor(supervisor, root, selectContract) {
+function resolverFor(supervisor, root, selectContract, launcherAttestationConfig, extensionPaths = [EXTENSION_PATH]) {
   return new BrokeredLaunchResolver({
     socketPath: supervisor.socketPath,
     controllerToken: supervisor.controllerToken,
     agentRoot: join(root, "child-agents"),
-    extensionPaths: [EXTENSION_PATH],
+    extensionPaths,
     offline: true,
     selectContract,
+    ...(launcherAttestationConfig === undefined ? {} : { launcherAttestationConfig }),
   });
 }
 
@@ -239,6 +241,50 @@ test("controller resolver denies a model mismatch before reservation and capacit
     await first.policy.onBeforeChildAbandoned("cancelled_before_child");
   } finally {
     await supervisor.stop().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolver adds a pinned final-extension attestation when controller configuration supplies every reviewed digest", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-attest-"));
+  const supervisor = signedSupervisor(root);
+  try {
+    await supervisor.start();
+    const digest = createHash("sha256").update(readFileSync(BEHAVIORAL_EXTENSION_PATH)).digest("hex");
+    const resolver = resolverFor(supervisor, root, () => ({
+      expectedModel: MODEL,
+      contract: fixtureContract({ taskId: "task-attested" }),
+    }), {
+      behavioralExtensionPath: BEHAVIORAL_EXTENSION_PATH,
+      trustedExtensionDigests: [digest],
+    }, [BEHAVIORAL_EXTENSION_PATH]);
+    const decision = await resolver.resolve(request("child_attested"));
+    assert.equal(decision.action, "allow");
+    assert.equal(decision.policy.launcherAttestation.capabilityFingerprint, decision.policy.authorizationPolicy.capabilityFingerprint);
+    assert.deepEqual(decision.policy.requiredActiveTools, ["broker_declare_action"]);
+    assert.equal(decision.policy.launcherAttestation.extensions.at(-1).path, decision.policy.launcherAttestation.behavioralExtension.path);
+    await decision.policy.onBeforeChildAbandoned("test_cleanup");
+  } finally {
+    await supervisor.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolver refuses effect-capable launch before reservation when its extension bytes are not pinned", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-attest-required-"));
+  const supervisor = signedSupervisor(root);
+  try {
+    await supervisor.start();
+    const resolver = resolverFor(supervisor, root, () => ({
+      expectedModel: MODEL,
+      contract: fixtureContract({ taskId: "task-effect-without-attestation", operationClass: "apply" }),
+    }));
+    assert.deepEqual(await resolver.resolve(request("child_effect_without_attestation")), {
+      action: "deny", reason: "effect capable brokered launch requires pinned extension attestation",
+    });
+    assert.equal(supervisor.auditSnapshot().leases.length, 0);
+  } finally {
+    await supervisor.stop();
     rmSync(root, { recursive: true, force: true });
   }
 });

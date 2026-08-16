@@ -3,6 +3,7 @@ import { isAbsolute, join } from "node:path";
 import { compileEffectiveChildCapability, createEffectiveChildCapability, deriveAllowedTools } from "./capability-compiler.mjs";
 import { provisionBrokeredAgentDir } from "./isolated-child-config.mjs";
 import { requestBrokerIpc } from "./ipc.mjs";
+import { createLauncherAttestation } from "./launcher-attestation.mjs";
 
 const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
 
@@ -37,6 +38,7 @@ export class BrokeredLaunchResolver {
   #extensionPaths;
   #offline;
   #selectContract;
+  #launcherAttestationConfig;
   #admissions = new Map();
 
   constructor({
@@ -46,6 +48,7 @@ export class BrokeredLaunchResolver {
     extensionPaths,
     offline = false,
     selectContract,
+    launcherAttestationConfig,
   }) {
     if (typeof socketPath !== "string" || !isAbsolute(socketPath)) throw new Error("Broker launch resolver needs an absolute socketPath");
     if (typeof controllerToken !== "string" || controllerToken.length < 32) throw new Error("Broker launch resolver needs a controller-only token");
@@ -54,12 +57,24 @@ export class BrokeredLaunchResolver {
     }
     if (typeof offline !== "boolean") throw new Error("Broker launch resolver offline must be boolean");
     if (typeof selectContract !== "function") throw new Error("Broker launch resolver needs a controller selectContract function");
+    if (launcherAttestationConfig !== undefined) {
+      if (!launcherAttestationConfig || typeof launcherAttestationConfig !== "object" || Array.isArray(launcherAttestationConfig)
+        || !Array.isArray(launcherAttestationConfig.trustedExtensionDigests)
+        || launcherAttestationConfig.trustedExtensionDigests.length !== extensionPaths.length
+        || typeof launcherAttestationConfig.behavioralExtensionPath !== "string" || !isAbsolute(launcherAttestationConfig.behavioralExtensionPath)) {
+        throw new Error("Broker launch resolver launcherAttestationConfig needs final behavioralExtensionPath and one pinned digest per explicit extension");
+      }
+    }
     this.#socketPath = socketPath;
     this.#controllerToken = controllerToken;
     this.#agentRoot = ownerOnlyDirectory(agentRoot, "Broker child agent root");
     this.#extensionPaths = Object.freeze([...extensionPaths]);
     this.#offline = offline;
     this.#selectContract = selectContract;
+    this.#launcherAttestationConfig = launcherAttestationConfig === undefined ? undefined : Object.freeze({
+      behavioralExtensionPath: launcherAttestationConfig.behavioralExtensionPath,
+      trustedExtensionDigests: Object.freeze([...launcherAttestationConfig.trustedExtensionDigests]),
+    });
   }
 
   /** Compatible with TrustedChildLaunchResolver; request has no raw prompt. */
@@ -69,6 +84,9 @@ export class BrokeredLaunchResolver {
     const selection = await this.#selectContract(Object.freeze({ ...request }));
     if (selection?.action === "deny") return { action: "deny", reason: safeReason(selection.reason) };
     if (!selection?.contract) throw new Error("Broker launch selection did not return a contract");
+    if (["propose_patch", "apply", "external_write"].includes(selection.contract.operationClass) && !this.#launcherAttestationConfig) {
+      return { action: "deny", reason: "effect capable brokered launch requires pinned extension attestation" };
+    }
     if (selection.contract.promptDigest !== request.promptDigest) {
       return { action: "deny", reason: "child prompt is not bound to the selected broker contract" };
     }
@@ -121,6 +139,12 @@ export class BrokeredLaunchResolver {
         downgradePolicy: selection.contract.capability.downgradePolicy,
       });
       const compiled = compileEffectiveChildCapability(capability);
+      const launcherAttestation = this.#launcherAttestationConfig === undefined ? undefined : createLauncherAttestation({
+        capabilityFingerprint: capability.capabilityFingerprint,
+        extensionPaths: this.#extensionPaths,
+        trustedExtensionDigests: this.#launcherAttestationConfig.trustedExtensionDigests,
+        behavioralExtensionPath: this.#launcherAttestationConfig.behavioralExtensionPath,
+      });
       const bound = await this.#controller("bindEffectiveChildCapability", {
         leaseId: lease.leaseId,
         fencingToken: lease.fencingToken,
@@ -145,7 +169,13 @@ export class BrokeredLaunchResolver {
           promptRules: compiled.promptRules,
           authorizationPolicy: compiled.authorizationPolicy,
           offline: this.#offline,
-          extensionPaths: this.#extensionPaths,
+          extensionPaths: launcherAttestation === undefined
+            ? this.#extensionPaths
+            : Object.freeze(launcherAttestation.extensions.map((extension) => extension.path)),
+          ...(launcherAttestation === undefined ? {} : {
+            launcherAttestation,
+            requiredActiveTools: ["broker_declare_action"],
+          }),
           environment: {
             PI_BROKER_SOCKET: this.#socketPath,
             PI_BROKER_LEASE_ID: lease.leaseId,

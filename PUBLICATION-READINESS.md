@@ -15,7 +15,7 @@
 - Tarball manifest: 15 files, 74,276 bytes unpacked. It contains only public source, public docs, license and npm metadata; it excludes tests, patch, logs, SQLite artifacts, sockets and local configuration.
 - A clean temporary consumer installed the generated tarball and imported `.` and `./testing`; fake transport is absent from the root export.
 - `git diff --check`, staged diff check and Git object integrity check passed.
-- The launcher seam patch applies with `git apply --check` to `pi-subagent-workflow` commit `0c28ce87bc45f4c3d66e0100b58ae13cf345978c`. Current unreleased patch SHA-256: `6928c0ad2b6fe115cc7f6111f490d8d716bdfe31a72dd4d277a6f871f3addf31` (adds terminal child-result reconciliation).
+- The launcher seam patch applies with `git apply --check` to `pi-subagent-workflow` commit `0c28ce87bc45f4c3d66e0100b58ae13cf345978c`. Current unreleased patch SHA-256: `aa35716325ee3bad305028fd0f16988e7f6785732277c88e9f58112a0eeffe7f` (adds terminal child-result reconciliation plus pinned extension/order/startup-tool attestation).
 - Non-live upstream integration scenarios (success, 429, expiry, stale capability and cancellation) passed using only `ScriptedFakeProvider`.
 - GitHub Actions CI passed on Ubuntu and macOS for the pushed `main` commit. `main` requires both CI checks, linear history and resolved conversations; force-push and branch deletion are disabled.
 - Private vulnerability reporting, Dependabot configuration and a reviewer-protected `npm-publish` GitHub Environment are enabled.
