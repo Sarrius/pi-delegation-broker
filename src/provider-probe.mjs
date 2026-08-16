@@ -25,7 +25,7 @@
  * credentials, and no part of this module runs inside a child.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
 
 /** Generations 0 and 1 are routable by default; 2+ only as an explicitly marked last resort. */
@@ -220,8 +220,13 @@ export function readCurrencyCache(path) {
 export function writeCurrencyCache(path, listings) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const serializable = {};
-  for (const [provider, ids] of listings) serializable[provider] = [...ids].sort();
-  writeFileSync(path, JSON.stringify({ probedAt: Date.now(), listings: serializable }), { mode: 0o600 });
+  for (const [provider, ids] of listings) {
+    const modelIds = ids instanceof Map ? [...ids.keys()] : ids instanceof Set ? [...ids] : [];
+    serializable[provider] = modelIds.filter((id) => typeof id === "string").sort();
+  }
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify({ probedAt: Date.now(), listings: serializable }), { mode: 0o600 });
+  renameSync(temporary, path);
 }
 
 export function listingsFromCache(cache) {

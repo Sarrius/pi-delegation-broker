@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { catalogToBrokerRegistry } from "../src/provider-catalog.mjs";
 import { createSelectContract, selectModelForTask } from "../src/model-selector.mjs";
@@ -8,6 +11,9 @@ import {
   buildCurrencyMap,
   parseModelVersion,
   probeProviderModels,
+  readCurrencyCache,
+  writeCurrencyCache,
+  listingsFromCache,
 } from "../src/provider-probe.mjs";
 
 function model(id, provider, { reasoning = false } = {}) {
@@ -136,6 +142,18 @@ test("live probes preserve upstream creation dates without exposing credentials"
   assert.equal(seen[0].url, "https://provider.example/v1/models");
   assert.equal(seen[0].authorization, "Bearer secret-never-returned");
   assert.equal(JSON.stringify(result).includes("secret-never-returned"), false);
+});
+
+test("currency cache is atomically persisted as credential-free listing facts", () => {
+  const root = mkdtempSync(join(tmpdir(), "currency-cache-"));
+  const path = join(root, "currency.json");
+  try {
+    writeCurrencyCache(path, new Map([["zai", new Map([["glm-5.3", 1_780]])]]));
+    const cache = readCurrencyCache(path);
+    assert.equal(typeof cache.probedAt, "number");
+    assert.deepEqual([...listingsFromCache(cache).get("zai")], ["glm-5.3"]);
+    assert.equal(JSON.stringify(cache).includes("1780"), false, "cache persists availability, not provider pricing/metadata");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("createSelectContract passes the live currency feed into automatic selection", () => {

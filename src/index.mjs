@@ -46,6 +46,7 @@ export {
   buildAnthropicMessagesRequest,
 } from "./anthropic-messages-transport.mjs";
 export { RoutingBoard } from "./routing-board.mjs";
+export { RoutingAuditJournal } from "./routing-audit-journal.mjs";
 export { ControllerVerifiedRoutingBoard } from "./verified-routing-board.mjs";
 export { captureProviderContext } from "./provider-context.mjs";
 export { QUALITY_TIERS, meetsQualityFloor, qualityForModel } from "./model-quality-catalog.mjs";

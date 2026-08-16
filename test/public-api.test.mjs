@@ -35,6 +35,7 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "QUALITY_TIERS",
     "ProviderProtocolError",
     "ProviderStreamAssembler",
+    "RoutingAuditJournal",
     "RoutingBoard",
     "Semaphore",
     "SingleHostBrokerSupervisor",

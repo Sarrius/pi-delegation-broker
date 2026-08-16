@@ -39,6 +39,7 @@ import {
   ControllerVerifiedRoutingBoard,
   ModelAffinityJournal,
   RoutingBoard,
+  RoutingAuditJournal,
   TaskOrchestrator,
   SingleHostBrokerSupervisor,
   buildCurrencyMap,
@@ -49,12 +50,15 @@ import {
   qualityForModel,
   parseResourceModel,
   probeProviderModels,
+  readCurrencyCache,
   readProviderRegistry,
   writeModelPreferences,
   signedRegistryMessage,
   requestBrokerIpc,
   removeModelPreference,
+  listingsFromCache,
   verifyProposedPatch,
+  writeCurrencyCache,
   writeScopedChildAuth,
   // @ts-expect-error — resolved relative to this file's real location
 } from "../src/index.mjs";
@@ -70,8 +74,11 @@ const STATE_DIR = join(PARENT_AGENT_DIR, "delegation-broker");
 const KEYS_PATH = join(STATE_DIR, "registry-keys.json");
 const PREFERENCES_PATH = join(STATE_DIR, "preferences.json");
 const ENABLED_PATH = join(STATE_DIR, "enabled.json");
+const CURRENCY_CACHE_PATH = join(STATE_DIR, "currency-cache.json");
+const ROUTING_AUDIT_PATH = join(STATE_DIR, "routing-audit.json");
 const REGISTRY_KEY_ID = "controller";
 const CURRENCY_REFRESH_MS = 15 * 60 * 1_000;
+const CURRENCY_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 
 const CAPABILITIES = ["text_generation", "code_reasoning", "large_context", "vision_input"] as const;
 
@@ -114,6 +121,7 @@ interface BrokerRuntime {
   acceptancePlans: Map<string, Array<{ id: string; claim: string; argv: string[]; timeoutMs: number }>>;
   stopCurrencyRefresh: () => void;
   lastRoute?: { summary: string; at: number };
+  routingAudit: any;
 }
 
 function formatPreferences(tier: string) {
@@ -274,6 +282,7 @@ async function startBroker(): Promise<BrokerRuntime> {
   const evidenceStore = new ControllerEvidenceStore({ root: join(STATE_DIR, "verification-evidence") });
   const verificationAuthority = new ControllerVerificationAuthority({ evidenceStore });
   const affinityJournal = new ModelAffinityJournal({ path: join(STATE_DIR, "model-affinity.json") });
+  const routingAudit = new RoutingAuditJournal({ path: ROUTING_AUDIT_PATH });
   const verifiedRouting = new ControllerVerifiedRoutingBoard({
     routingBoard: new RoutingBoard(), verificationAuthority, affinityJournal,
   });
@@ -310,9 +319,22 @@ async function startBroker(): Promise<BrokerRuntime> {
   // release appeared. Keep credentials here in the controller only — the currency map passed
   // to the selector contains model ids, dates and booleans, never secrets.
   const liveListings = new Map<string, Map<string, number | undefined>>();
+  // Reuse only a recent successful listing after restart. It is an availability hint, never a
+  // credential proof; the next live probe replaces it and stale cache is deliberately ignored.
+  const cachedCurrency = readCurrencyCache(CURRENCY_CACHE_PATH);
+  if (cachedCurrency && Number.isSafeInteger(cachedCurrency.probedAt) && Date.now() - cachedCurrency.probedAt <= CURRENCY_CACHE_MAX_AGE_MS) {
+    for (const [provider, ids] of listingsFromCache(cachedCurrency)) {
+      liveListings.set(provider, new Map([...ids].map((id) => [id, undefined])));
+    }
+  }
+  const currency = () => buildCurrencyMap({
+    resources: registryModels(supervisor.providerWatcher.currentRegistry()),
+    liveListings,
+  });
   const refreshCurrency = async () => {
     const currentRegistry = supervisor.providerWatcher.currentRegistry();
     const routes = probeRoutes(currentRegistry);
+    const successfullyRefreshed = new Map<string, Map<string, number | undefined>>();
     await Promise.all([...routes].map(async ([provider, route]) => {
       const result = await probeProviderModels({ baseUrl: route.baseUrl, apiKey: route.apiKey });
       if (result.status !== "ok") {
@@ -329,17 +351,20 @@ async function startBroker(): Promise<BrokerRuntime> {
         }
         return;
       }
-      liveListings.set(provider, new Map(result.models.map((id: string) => [id, result.created?.[id]])));
+      const listing = new Map(result.models.map((id: string) => [id, result.created?.[id]]));
+      liveListings.set(provider, listing);
+      successfullyRefreshed.set(provider, listing);
     }));
+    // Persist only facts freshly observed in this pass. A provider that is currently unreachable
+    // cannot refresh its old cache timestamp into a false declaration of liveness.
+    if (successfullyRefreshed.size > 0) writeCurrencyCache(CURRENCY_CACHE_PATH, successfullyRefreshed);
+    // Metrics cannot change selection. If the local journal is unavailable, the fresh probe
+    // facts still route normally and are retried next refresh.
+    try { routingAudit.recordCurrency(currency()); } catch { /* observability is best effort */ }
   };
   await refreshCurrency().catch(() => undefined);
   const currencyTimer = setInterval(() => { refreshCurrency().catch(() => undefined); }, CURRENCY_REFRESH_MS);
   currencyTimer.unref?.();
-  const currency = () => buildCurrencyMap({
-    resources: registryModels(supervisor.providerWatcher.currentRegistry()),
-    liveListings,
-  });
-
   const baseSelectContract = createSelectContract({
     registry: () => supervisor.providerWatcher.currentRegistry(),
     availability: () => supervisor.inventory(),
@@ -383,6 +408,7 @@ async function startBroker(): Promise<BrokerRuntime> {
     acceptancePlans,
     stopCurrencyRefresh: () => clearInterval(currencyTimer),
     lastRoute: undefined,
+    routingAudit,
   };
 }
 
@@ -436,7 +462,9 @@ export default function piDelegationBroker(pi: any) {
         const preferences = loadModelPreferences(PREFERENCES_PATH);
         const state = runtime ? runtime.supervisor.status().state : "not_started";
         const last = runtime?.lastRoute ? ` Last route: ${runtime.lastRoute.summary}` : "";
-        ctx.ui.notify(`Delegation broker: ${enabled ? "enabled" : "stopped"}; runtime: ${state}; frontier preferences: ${preferences.tiers.frontier.length}; standard: ${preferences.tiers.standard.length}; cheap: ${preferences.tiers.cheap.length}.${last} Use /delegation-broker models [provider] or tier <tier> <list|add|remove>.`, "info");
+        const metrics = runtime?.routingAudit?.summary?.().metrics;
+        const audit = metrics ? ` Audit: ${metrics.routes} routes, ${metrics.failovers} failovers, ${metrics.legacyTransitions} legacy transitions.` : "";
+        ctx.ui.notify(`Delegation broker: ${enabled ? "enabled" : "stopped"}; runtime: ${state}; frontier preferences: ${preferences.tiers.frontier.length}; standard: ${preferences.tiers.standard.length}; cheap: ${preferences.tiers.cheap.length}.${audit}${last} Use /delegation-broker models [provider] or tier <tier> <list|add|remove>.`, "info");
         return;
       }
       if (action === "models") {
@@ -553,6 +581,20 @@ export default function piDelegationBroker(pi: any) {
         .join(" → ");
       const routeExplanation = explainRoute(result);
       broker.lastRoute = { summary: routeExplanation, at: Date.now() };
+      // Persist facts observed by the controller/runner, never a child narrative. A denied
+      // attempt has no leased resource and is intentionally not fabricated into an audit route.
+      try {
+        if (result.resource?.id && Array.isArray(result.route) && result.route.length > 0
+          && result.route.every((hop: any) => typeof hop.resourceId === "string")) {
+          broker.routingAudit.recordRoute({
+            status: result.status,
+            resourceId: result.resource.id,
+            selection: result.selection,
+            route: result.route,
+            usage: result.usage,
+          });
+        }
+      } catch { /* audit storage must never change task completion semantics */ }
 
       if (result.status === "completed" && params.proposeChangesIn) {
         onUpdate?.({ content: [{ type: "text", text: "Verifying the proposed patch in a controller-owned scratch tree…" }] });
