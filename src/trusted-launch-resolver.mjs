@@ -208,9 +208,12 @@ export class BrokeredLaunchResolver {
     return { status: admission.phase };
   }
 
-  /** Idempotent post-session cleanup called only after trusted runner disposal. */
-  async finalizeHandedChild(childId, result) {
-    return this.#releaseAdmission(childId, "closed_release_pending", result?.status === "completed" ? "completed" : "failed");
+  /**
+   * Child teardown releases capacity but cannot complete the queued task. The
+   * durable task waits for a separate controller verifier receipt.
+   */
+  async finalizeHandedChild(childId, _result) {
+    return this.#releaseAdmission(childId, "closed_release_pending");
   }
 
   /** Retry only records explicitly known to be unhanded or session-closed. */
@@ -219,7 +222,7 @@ export class BrokeredLaunchResolver {
     for (const [childId, admission] of this.#admissions) {
       if (admission.phase !== "release_pending" && admission.phase !== "closed_release_pending") continue;
       try {
-        outcomes.push(Object.freeze({ childId, ...(await this.#releaseAdmission(childId, admission.phase, admission.terminalState)) }));
+        outcomes.push(Object.freeze({ childId, ...(await this.#releaseAdmission(childId, admission.phase)) }));
       } catch {
         outcomes.push(Object.freeze({ childId, status: "pending" }));
       }
@@ -239,11 +242,10 @@ export class BrokeredLaunchResolver {
     })));
   }
 
-  async #releaseAdmission(childId, pendingPhase, terminalState) {
+  async #releaseAdmission(childId, pendingPhase) {
     const admission = this.#admissions.get(childId);
     if (!admission) return { status: "already_released" };
     admission.phase = pendingPhase;
-    if (terminalState !== undefined) admission.terminalState = terminalState;
     // Do not forget an admission before controller IPC confirms. On a broker
     // transport failure the controller retains a redacted record and agent dir
     // for explicit retry/reconciliation instead of silently relying on TTL.
@@ -254,7 +256,7 @@ export class BrokeredLaunchResolver {
     } else if (pendingPhase === "release_pending") {
       result = await this.#abandonClaimed(admission.queuedTaskId, admission.lease);
     } else {
-      result = await this.#finalizeClaimed(admission.queuedTaskId, admission.lease, admission.terminalState ?? "failed");
+      result = await this.#releaseClaimedForVerification(admission.queuedTaskId, admission.lease);
     }
     this.#removeAgentDir(admission.agentDir);
     this.#admissions.delete(childId);
@@ -282,12 +284,11 @@ export class BrokeredLaunchResolver {
     });
   }
 
-  async #finalizeClaimed(taskId, lease, terminalState) {
-    return this.#controller("finalizeClaimedTask", {
+  async #releaseClaimedForVerification(taskId, lease) {
+    return this.#controller("releaseClaimedTaskForVerification", {
       taskId,
       leaseId: lease.leaseId,
       fencingToken: lease.fencingToken,
-      terminalState,
     });
   }
 

@@ -18,8 +18,9 @@ const unpackedSize = packed[0].unpackedSize;
 // The raw provider transport is intentionally source-shipped and independently
 // auditable rather than hidden in a generated artifact. Keep a bounded package
 // budget while allowing one reviewed streaming adapter, a source-auditable Pi
-// behavioral enforcement extension, and their protocol docs.
-if (!Number.isSafeInteger(unpackedSize) || unpackedSize > 320 * 1024) throw new Error(`npm package is unexpectedly large: ${unpackedSize}`);
+// behavioral enforcement extension, the fixed controller acceptance verifier,
+// and their protocol docs.
+if (!Number.isSafeInteger(unpackedSize) || unpackedSize > 340 * 1024) throw new Error(`npm package is unexpectedly large: ${unpackedSize}`);
 const packageJson = statSync(join(root, "package.json"));
 if ((packageJson.mode & 0o022) !== 0) throw new Error("package.json permissions must not grant group/other write access");
 console.log(`package check: pass (${names.length} files, ${unpackedSize} bytes unpacked)`);

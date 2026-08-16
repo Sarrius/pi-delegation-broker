@@ -14,7 +14,7 @@ const CHILD_METHODS = new Set([
   "getEffectiveChildCapability", "declareBehavioralAction", "authorizeBehavioralAction", "observeBehavioralResult",
 ]);
 const CONTROLLER_METHODS = new Set([
-  "reserve", "submit", "dispatchPending", "pendingTasks", "queueWaitMetrics", "readyTasks", "claimReadyTask", "abandonClaimedTask", "finalizeClaimedTask", "reschedulePending", "finishPending",
+  "reserve", "submit", "dispatchPending", "pendingTasks", "queueWaitMetrics", "readyTasks", "claimReadyTask", "abandonClaimedTask", "releaseClaimedTaskForVerification", "finalizeVerifiedTask", "reschedulePending", "finishPending",
   "issueLeaseCapability", "bindEffectiveChildCapability", "markRateLimited", "markUnknown", "markHealthy", "release", "configureFakeProvider",
 ]);
 
@@ -189,7 +189,8 @@ export class BrokerIpcServer {
       if (method === "readyTasks") return this.#broker.readyTasks();
       if (method === "claimReadyTask") return this.#broker.claimReadyTask(params.taskId, params.leaseId, params.contract, now);
       if (method === "abandonClaimedTask") return this.#broker.abandonClaimedTask(params.taskId, params.leaseId, params.fencingToken, now);
-      if (method === "finalizeClaimedTask") return this.#broker.finalizeClaimedTask(params.taskId, params.leaseId, params.fencingToken, params.terminalState, now);
+      if (method === "releaseClaimedTaskForVerification") return this.#broker.releaseClaimedTaskForVerification(params.taskId, params.leaseId, params.fencingToken, now);
+      if (method === "finalizeVerifiedTask") return this.#broker.finalizeVerifiedTask(params.taskId, params.leaseId, params.fencingToken, params.verification, now);
       if (method === "reschedulePending") return this.#broker.reschedulePending(params.taskId, params.recoveryOwner, params.eligibleAt, now);
       if (method === "finishPending") return this.#broker.finishPending(params.taskId, params.state, now);
       if (method === "issueLeaseCapability") return this.#broker.issueLeaseCapability(params.leaseId, params.fencingToken, now);

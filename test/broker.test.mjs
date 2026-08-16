@@ -132,7 +132,7 @@ test("queued capacity work wakes after lease release and becomes ready without a
   }, registry);
 });
 
-test("ready work is claimed against the exact contract and reconciled to terminal completion", () => {
+test("ready work is claimed against the exact contract and only a controller verifier can complete it", () => {
   const registry = fixtureRegistry();
   delete registry.resources.R2;
   delete registry.resources.R3;
@@ -151,7 +151,11 @@ test("ready work is claimed against the exact contract and reconciled to termina
 
     broker.release(claimed.lease.leaseId, claimed.lease.fencingToken, "child provider shutdown", 1_004);
     assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["awaiting_result"]);
-    assert.equal(broker.finalizeClaimedTask("claim-task", claimed.lease.leaseId, claimed.lease.fencingToken, "completed", 1_005).status, "completed");
+    assert.equal(broker.finalizeVerifiedTask("claim-task", claimed.lease.leaseId, claimed.lease.fencingToken, {
+      status: "accepted",
+      verifierRunId: "verifier-claim-task",
+      evidenceRefs: ["controller:11111111-1111-4111-8111-111111111111"],
+    }, 1_005).status, "completed");
     assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["completed"]);
     assert.equal(broker.leases().length, 0);
   }, registry);

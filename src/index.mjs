@@ -6,6 +6,7 @@
 export { BehavioralRunMonitor } from "./behavior-monitor.mjs";
 export { SqliteLeaseBroker } from "./broker.mjs";
 export { ControllerEvidenceStore, validateResultEvidence } from "./evidence.mjs";
+export { ControllerAcceptanceVerifier, controllerVerificationReceipt } from "./acceptance-verifier.mjs";
 export { BrokerIpcServer, requestBrokerIpc, streamProviderIpc } from "./ipc.mjs";
 export { provisionBrokeredAgentDir } from "./isolated-child-config.mjs";
 export {

@@ -10,6 +10,7 @@ const EFFECT_CAPABLE_OPERATIONS = new Set(["propose_patch", "apply", "external_w
 const BEHAVIORAL_ENFORCEMENT = new Set(["unavailable", "blocking_monitor"]);
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const EVIDENCE_REF = /^controller:[0-9a-f-]{36}$/;
 const SECRET_PATTERNS = [
   /sk-[A-Za-z0-9_-]{8,}/g,
   /(?:api[_-]?key|token|authorization)\s*[:=]\s*[^\s,;]+/gi,
@@ -33,6 +34,26 @@ function enforcementSatisfies(actual, required) {
   return Object.hasOwn(ENFORCEMENT, actual)
     && Object.hasOwn(ENFORCEMENT, required)
     && ENFORCEMENT[actual] >= ENFORCEMENT[required];
+}
+
+function normalizeVerificationReceipt(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("verification receipt must be an object");
+  const keys = Object.keys(value).sort();
+  const expected = ["evidenceRefs", "status", "verifierRunId"];
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw new Error("verification receipt has unsupported or missing fields");
+  }
+  if (value.status !== "accepted" && value.status !== "rejected") throw new Error("verification receipt status must be accepted or rejected");
+  if (typeof value.verifierRunId !== "string" || !IDENTIFIER.test(value.verifierRunId)) {
+    throw new Error("verification receipt verifierRunId is invalid");
+  }
+  if (!Array.isArray(value.evidenceRefs) || value.evidenceRefs.length > 20
+    || value.evidenceRefs.some((ref) => typeof ref !== "string" || !EVIDENCE_REF.test(ref))
+    || new Set(value.evidenceRefs).size !== value.evidenceRefs.length
+    || (value.status === "accepted" && value.evidenceRefs.length < 1)) {
+    throw new Error("verification receipt evidenceRefs are invalid");
+  }
+  return Object.freeze({ status: value.status, verifierRunId: value.verifierRunId, evidenceRefs: Object.freeze([...value.evidenceRefs]) });
 }
 
 function asLease(row) {
@@ -298,20 +319,53 @@ export class SqliteLeaseBroker {
     });
   }
 
-  finalizeClaimedTask(taskId, leaseId, fencingToken, terminalState, now) {
-    if (terminalState !== "completed" && terminalState !== "failed") return { status: "denied_policy" };
+  /**
+   * End child ownership without letting its exit/self-report complete the task.
+   * Capacity is released and the durable task waits for a controller verifier
+   * receipt, or escalates at its already registered reconciliation deadline.
+   */
+  releaseClaimedTaskForVerification(taskId, leaseId, fencingToken, now) {
     return this.#transaction(() => {
-      const pending = this.#db.prepare("SELECT 1 FROM pending_tasks WHERE task_id = ? AND lease_id = ? AND state IN ('claimed', 'awaiting_result')")
+      const pending = this.#db.prepare("SELECT state FROM pending_tasks WHERE task_id = ? AND lease_id = ? AND state IN ('claimed', 'awaiting_result')")
         .get(taskId, leaseId);
       if (!pending) return { status: "denied_policy" };
       const lease = this.#db.prepare("SELECT * FROM leases WHERE lease_id = ? AND fencing_token = ?").get(leaseId, fencingToken);
       if (lease) {
         this.#db.prepare("DELETE FROM leases WHERE lease_id = ?").run(leaseId);
         this.#afterLeaseRemoved(lease, now);
+      } else if (pending.state === "claimed") {
+        return { status: "denied_lease" };
       }
-      this.#db.prepare("UPDATE pending_tasks SET state = ?, eligible_at = NULL, updated_at = ?, lease_id = NULL WHERE task_id = ? AND state IN ('claimed', 'awaiting_result')")
+      this.#db.prepare("UPDATE pending_tasks SET state = 'awaiting_result', updated_at = ? WHERE task_id = ? AND lease_id = ? AND state IN ('claimed', 'awaiting_result')")
+        .run(now, taskId, leaseId);
+      this.#record(now, "TaskAwaitingVerification", { taskId, leaseId, fencingToken });
+      return { status: "awaiting_verification" };
+    });
+  }
+
+  /**
+   * Only a controller-owned verifier may make a queued task terminal. A child
+   * status, tool result, or provider terminal is intentionally not an input.
+   */
+  finalizeVerifiedTask(taskId, leaseId, fencingToken, verification, now) {
+    const verdict = normalizeVerificationReceipt(verification);
+    return this.#transaction(() => {
+      const pending = this.#db.prepare("SELECT 1 FROM pending_tasks WHERE task_id = ? AND lease_id = ? AND state = 'awaiting_result'")
+        .get(taskId, leaseId);
+      if (!pending) return { status: "denied_policy" };
+      const lease = this.#db.prepare("SELECT 1 FROM leases WHERE lease_id = ? AND fencing_token = ?").get(leaseId, fencingToken);
+      if (lease) return { status: "denied_lease" };
+      const terminalState = verdict.status === "accepted" ? "completed" : "failed";
+      this.#db.prepare("UPDATE pending_tasks SET state = ?, eligible_at = NULL, updated_at = ?, lease_id = NULL WHERE task_id = ? AND state = 'awaiting_result'")
         .run(terminalState, now, taskId);
-      this.#record(now, "TaskTerminal", { taskId, status: terminalState, source: "claimed_child_result" });
+      this.#record(now, "TaskTerminal", {
+        taskId,
+        status: terminalState,
+        source: "controller_verifier",
+        verifierRunId: verdict.verifierRunId,
+        verificationStatus: verdict.status,
+        evidenceRefs: verdict.evidenceRefs,
+      });
       return { status: terminalState };
     });
   }

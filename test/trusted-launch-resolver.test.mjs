@@ -135,7 +135,7 @@ test("controller resolver preserves and safely reconciles a release after contro
   }
 });
 
-test("controller resolver claims an exact ready task, requeues pre-handoff failure, and records terminal result", async () => {
+test("controller resolver claims an exact ready task, requeues pre-handoff failure, and requires verifier completion", async () => {
   const root = mkdtempSync(join(tmpdir(), "br-q-"));
   const registry = fixtureRegistry();
   delete registry.resources.R2;
@@ -190,8 +190,25 @@ test("controller resolver claims an exact ready task, requeues pre-handoff failu
     assert.equal(completed.action, "allow");
     await completed.policy.onChildSessionOpened();
     await completed.policy.onChildSessionClosed({ status: "completed" });
-    assert.deepEqual(supervisor.auditSnapshot().pendingTasks.map((task) => task.state), ["completed"]);
+    assert.deepEqual(supervisor.auditSnapshot().pendingTasks.map((task) => task.state), ["awaiting_result"], "child completion is not task acceptance");
     assert.equal(supervisor.auditSnapshot().leases.length, 0);
+    const verified = await requestBrokerIpc({
+      socketPath: supervisor.socketPath,
+      authorization: supervisor.controllerToken,
+      method: "finalizeVerifiedTask",
+      params: {
+        taskId: queuedContract.taskId,
+        leaseId: completed.policy.environment.PI_BROKER_LEASE_ID,
+        fencingToken: Number(completed.policy.environment.PI_BROKER_FENCING_TOKEN),
+        verification: {
+          status: "accepted",
+          verifierRunId: "resolver-queue-verifier",
+          evidenceRefs: ["controller:11111111-1111-4111-8111-111111111111"],
+        },
+      },
+    });
+    assert.deepEqual(verified, { status: "completed" });
+    assert.deepEqual(supervisor.auditSnapshot().pendingTasks.map((task) => task.state), ["completed"]);
     assert.equal(resolver.admissions().length, 0);
   } finally {
     await supervisor.stop().catch(() => undefined);
