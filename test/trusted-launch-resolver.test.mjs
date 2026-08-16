@@ -65,10 +65,15 @@ test("controller resolver admits a matching child with only scoped policy data a
     resolver = resolverFor(supervisor, root, (input) => {
       assert.equal(Object.hasOwn(input, "prompt"), false);
       assert.equal(input.promptDigest, "a".repeat(64));
-      return { expectedModel: MODEL, contract: fixtureContract({ taskId: `task-${input.childId}` }) };
+      return {
+        expectedModel: MODEL,
+        contract: fixtureContract({ taskId: `task-${input.childId}` }),
+        selection: { modelTier: "standard", preferenceSource: "auto", legacyExcluded: true, candidateCount: 2 },
+      };
     });
     const decision = await resolver.resolve(request("child_A"));
     assert.equal(decision.action, "allow");
+    assert.deepEqual(decision.selection, { modelTier: "standard", preferenceSource: "auto", legacyExcluded: true, candidateCount: 2 });
     assert.equal(decision.policy.environment.PI_BROKER_SOCKET, supervisor.socketPath);
     assert.match(decision.policy.environment.PI_BROKER_CAPABILITY, /^[A-Za-z0-9_-]{40,}$/);
     assert.equal(JSON.stringify(decision.policy).includes(CONTROLLER_TOKEN), false);

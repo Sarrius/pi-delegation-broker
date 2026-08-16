@@ -98,10 +98,12 @@ export class SqliteLeaseBroker {
   #behavioralEnforcement;
   #verificationReceiptVerifier;
   #resourceRanker;
+  #reconcileRegistryOnStart;
 
   constructor({
     path, registry, maxPendingTasks = 1_000, agingStepMs = 30_000,
     behavioralEnforcement = "unavailable", verificationReceiptVerifier, resourceRanker,
+    reconcileRegistryOnStart = false,
   }) {
     if (!path) throw new Error("SQLite broker needs a database path");
     if (!Number.isSafeInteger(maxPendingTasks) || maxPendingTasks < 1 || maxPendingTasks > 100_000) {
@@ -117,11 +119,13 @@ export class SqliteLeaseBroker {
     if (resourceRanker !== undefined && typeof resourceRanker !== "function") {
       throw new Error("resourceRanker must be a controller-owned function");
     }
+    if (typeof reconcileRegistryOnStart !== "boolean") throw new Error("reconcileRegistryOnStart must be boolean");
     this.#maxPendingTasks = maxPendingTasks;
     this.#agingStepMs = agingStepMs;
     this.#behavioralEnforcement = behavioralEnforcement;
     this.#verificationReceiptVerifier = verificationReceiptVerifier;
     this.#resourceRanker = resourceRanker;
+    this.#reconcileRegistryOnStart = reconcileRegistryOnStart;
     this.#db = new DatabaseSync(path);
     try {
       // Configure the connection wait before contending for the database-wide
@@ -990,6 +994,14 @@ export class SqliteLeaseBroker {
 
   #seed(registry) {
     this.#validateRegistry(registry);
+    const existing = this.#db.prepare("SELECT count(*) AS count FROM resources").get().count;
+    if (existing > 0 && this.#reconcileRegistryOnStart) {
+      // A dynamic catalog is expected to change between process lifetimes. Reuse the same
+      // add/drain/defer transition used by the live watcher; strict static brokers still refuse
+      // any membership surprise below, so this cannot silently broaden a fixed registry.
+      this.updateRegistry(registry, Date.now());
+      return;
+    }
     this.#transaction(() => this.#insertRegistry(registry));
   }
 

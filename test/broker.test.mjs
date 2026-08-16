@@ -557,6 +557,22 @@ test("a changed registry cannot silently leave stale persisted admission policy 
   }
 });
 
+test("a dynamic broker reconciles a changed catalog at startup through the drain-safe update path", () => {
+  const directory = mkdtempSync(join(tmpdir(), "delegation-broker-mvp-dynamic-startup-"));
+  const path = join(directory, "broker.sqlite");
+  const first = new SqliteLeaseBroker({ path, registry: fixtureRegistry() });
+  first.close();
+  const changed = fixtureRegistry();
+  delete changed.resources.R2;
+  delete changed.capacityGroups["G-independent"];
+  try {
+    const restarted = new SqliteLeaseBroker({ path, registry: changed, reconcileRegistryOnStart: true });
+    assert.deepEqual(restarted.inventory(Date.now()).map((row) => row.resourceId).sort(), ["R1", "R1_ALIAS", "R3"]);
+    assert.ok(restarted.events().some((event) => event.type === "RegistryUpdated"));
+    restarted.close();
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("SQLite ledger is durable and redacts canary secrets", () => {
   const directory = mkdtempSync(join(tmpdir(), "delegation-broker-mvp-ledger-"));
   const path = join(directory, "broker.sqlite");

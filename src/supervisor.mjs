@@ -225,6 +225,7 @@ export class SingleHostBrokerSupervisor {
         ...(this.#verificationReceiptVerifier === undefined ? {} : { verificationReceiptVerifier: this.#verificationReceiptVerifier }),
         ...(this.#resourceRanker === undefined ? {} : { resourceRanker: this.#resourceRanker }),
         behavioralEnforcement: this.#behavioralEnforcement,
+        reconcileRegistryOnStart: this.#dynamicProviders,
       });
       hardenFile(this.databasePath);
       this.#server = new BrokerIpcServer({
