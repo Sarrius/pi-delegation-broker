@@ -371,20 +371,23 @@ export default function piDelegationBroker(pi: any) {
       if (params.acceptance) broker.acceptancePlans.set(childId, params.acceptance.map((check) => ({ ...check, timeoutMs: check.timeoutMs ?? 30_000 })));
       onUpdate?.({ content: [{ type: "text", text: "Selecting model and spawning child…" }] });
 
-      const result = await broker.runner.run({
-        childId,
-        promptDigest,
-        cwd: ctx.cwd,
-        thinkingLevel: "off",
-        prompt: params.task,
-        capabilityRequest: {
-          taskDescription: params.task,
-          ...(params.capabilities?.length ? { requiredCapabilities: params.capabilities } : {}),
-          ...(params.tier ? { modelTier: params.tier } : {}),
-        },
-      });
-
-      broker.acceptancePlans.delete(childId);
+      let result: any;
+      try {
+        result = await broker.runner.run({
+          childId,
+          promptDigest,
+          cwd: ctx.cwd,
+          thinkingLevel: "off",
+          prompt: params.task,
+          capabilityRequest: {
+            taskDescription: params.task,
+            ...(params.capabilities?.length ? { requiredCapabilities: params.capabilities } : {}),
+            ...(params.tier ? { modelTier: params.tier } : {}),
+          },
+        });
+      } finally {
+        broker.acceptancePlans.delete(childId);
+      }
       const route = (result.route ?? [])
         .map((hop: any) => `${hop.outcome}${hop.resourceId ? ` ${hop.resourceId}` : ""}`)
         .join(" → ");
