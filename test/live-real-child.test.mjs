@@ -71,23 +71,7 @@ test("live: spawn Pi child, send prompt, get real response, verify, close", { sk
       prompt: PROMPT,
     });
 
-    // Capture all events for debugging
-    const allEvents = [];
-    const origOnEvent = handle.session.subscribe;
-    handle.session.subscribe = (listener) => {
-      return origOnEvent.call(handle.session, (event) => {
-        allEvents.push({ type: event.type, hasMessage: !!event.message, role: event.message?.role, contentLen: event.message?.content?.length });
-        listener(event);
-      });
-    };
-
     const result = await handle.result;
-    console.log("DEBUG events:", JSON.stringify(allEvents));
-    console.log("DEBUG status:", result.status);
-    console.log("DEBUG text:", JSON.stringify(result.text));
-    console.log("DEBUG error:", result.error);
-    console.log("DEBUG usage:", JSON.stringify(result.usage));
-    console.log("DEBUG resolved tools:", handle.resolved.tools);
     assert.equal(result.status, "completed", `child should complete, got: ${result.error ?? result.text}`);
     assert.ok(result.text.length > 0, "child must return non-empty text");
     assert.match(result.text.toLowerCase(), /hello/, `response should contain "hello", got: ${result.text}`);
