@@ -42,11 +42,48 @@ function capabilityClass(capabilities) {
 
 function fresh() { return { schemaVersion: SCHEMA_VERSION, observations: {} }; }
 
+function validEntry(entry) {
+  return Boolean(entry) && typeof entry === "object"
+    && typeof entry.taskClass === "string" && typeof entry.resourceId === "string" && RESOURCE_ID.test(entry.resourceId)
+    && [entry.accepted, entry.rejected, entry.latencyTotalMs, entry.lastObservedAt].every((value) => Number.isSafeInteger(value) && value >= 0);
+}
+
+/**
+ * Migrate a v1 journal instead of discarding it. Verified accept/reject history is expensive to
+ * re-earn — it only accumulates through authenticated verifier receipts — so dropping it would
+ * silently reset routing to guesswork. Consumption is a different matter: v1 recorded only a
+ * money estimate, which this journal no longer treats as evidence. Migrated entries therefore
+ * carry zero token/attempt samples, which the ranker already reads as "unmeasured" and scores
+ * neutrally, rather than as a route that consumed nothing.
+ */
+function migrateV1(value) {
+  const observations = {};
+  for (const [key, entry] of Object.entries(value.observations)) {
+    if (!validEntry(entry)) continue;
+    observations[key] = {
+      taskClass: entry.taskClass,
+      resourceId: entry.resourceId,
+      accepted: entry.accepted,
+      rejected: entry.rejected,
+      latencyTotalMs: entry.latencyTotalMs,
+      tokenTotal: 0,
+      attemptTotal: 0,
+      lastObservedAt: entry.lastObservedAt,
+    };
+  }
+  return { schemaVersion: SCHEMA_VERSION, observations };
+}
+
 function load(path) {
   if (!existsSync(path)) return fresh();
   try {
     const value = JSON.parse(readFileSync(path, "utf8"));
-    if (!value || value.schemaVersion !== SCHEMA_VERSION || !value.observations || typeof value.observations !== "object" || Array.isArray(value.observations)) return fresh();
+    if (!value || !value.observations || typeof value.observations !== "object" || Array.isArray(value.observations)) return fresh();
+    if (value.schemaVersion === 1) return migrateV1(value);
+    if (value.schemaVersion !== SCHEMA_VERSION) return fresh();
+    for (const [key, entry] of Object.entries(value.observations)) {
+      if (!validEntry(entry) || !Number.isSafeInteger(entry.tokenTotal) || !Number.isSafeInteger(entry.attemptTotal)) delete value.observations[key];
+    }
     return value;
   } catch { return fresh(); }
 }

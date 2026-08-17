@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -82,4 +82,41 @@ test("a route with no consumption sample is still ranked on reliability alone", 
     assert.equal(record.tokenTotal, 0, "an absent usage report must not be invented");
     assert.deepEqual(setup.journal.rank({ resourceIds: ["ollama/kimi-k3", measured], capabilities: CAPS }), [measured, "ollama/kimi-k3"]);
   } finally { rmSync(setup.root, { recursive: true, force: true }); }
+});
+
+test("a v1 journal keeps its verified reliability history and loses only the money estimate", () => {
+  const root = mkdtempSync(join(tmpdir(), "affinity-v1-"));
+  const path = join(root, "journal.json");
+  const taskClass = [...CAPS].sort().join("+");
+  const proven = "anthropic/claude-opus-5";
+  const key = `${taskClass}\u0000${proven}`;
+  try {
+    writeFileSync(path, JSON.stringify({
+      schemaVersion: 1,
+      observations: {
+        [key]: { taskClass, resourceId: proven, accepted: 6, rejected: 1, latencyTotalMs: 7_000, costTotalMicros: 42_000, lastObservedAt: 900 },
+        [`${taskClass}\u0000broken`]: { taskClass, resourceId: "broken", accepted: "many" },
+      },
+    }));
+    const migrated = new ModelAffinityJournal({ path, now: () => 1000 });
+    const entry = migrated.snapshot().observations[key];
+    assert.equal(migrated.snapshot().schemaVersion, 2);
+    assert.deepEqual(entry, {
+      taskClass, resourceId: proven, accepted: 6, rejected: 1,
+      latencyTotalMs: 7_000, tokenTotal: 0, attemptTotal: 0, lastObservedAt: 900,
+    }, "verified accept/reject history survives; the cost estimate does not become evidence");
+    assert.equal(Object.hasOwn(migrated.snapshot().observations, `${taskClass}\u0000broken`), false, "a corrupt entry is dropped, not migrated");
+    // Migrated evidence must still be usable immediately, and its absent token sample must not
+    // be read as a route that consumed nothing.
+    assert.deepEqual(migrated.rank({ resourceIds: ["ollama/kimi-k3", proven], capabilities: CAPS }), [proven, "ollama/kimi-k3"]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("an unknown future schema is not silently reinterpreted as current evidence", () => {
+  const root = mkdtempSync(join(tmpdir(), "affinity-v9-"));
+  const path = join(root, "journal.json");
+  try {
+    writeFileSync(path, JSON.stringify({ schemaVersion: 9, observations: { x: { taskClass: "t", resourceId: "a/b", accepted: 9, rejected: 0, latencyTotalMs: 1, lastObservedAt: 1 } } }));
+    assert.deepEqual(new ModelAffinityJournal({ path, now: () => 1000 }).snapshot(), { schemaVersion: 2, observations: {} });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
