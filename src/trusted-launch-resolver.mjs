@@ -340,7 +340,8 @@ export class BrokeredLaunchResolver {
    */
   async trackHandedChildForVerification(childId) {
     const admission = this.#admissions.get(childId);
-    if (!admission || admission.phase !== "handed") return { status: "denied_policy" };
+    if (!admission) return { status: "denied_policy", reason: "admission_missing" };
+    if (admission.phase !== "handed") return { status: "denied_policy", reason: `admission_phase_${admission.phase}` };
     if (admission.queuedTaskId) return { status: "tracked" };
     const tracked = await this.#controller("trackLeasedTask", {
       contract: admission.contract,

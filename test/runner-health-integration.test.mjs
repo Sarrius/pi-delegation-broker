@@ -124,3 +124,85 @@ test("a revoked credential condemns the whole account through the real IPC path"
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a successful child is durably tracked and finalized through the real controller path", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-track-ipc-"));
+  const supervisor = signedSupervisor(root);
+  try {
+    await supervisor.start();
+    let issued = 0;
+    const resolver = new BrokeredLaunchResolver({
+      socketPath: supervisor.socketPath,
+      controllerToken: supervisor.controllerToken,
+      agentRoot: join(root, "child-agents"),
+      extensionPaths: [new URL("../extensions/child-shim.ts", import.meta.url).pathname],
+      offline: true,
+      resolveModelForResource: () => MODEL,
+      selectContract: () => ({ expectedModel: MODEL, contract: fixtureContract({ taskId: `track-${++issued}` }) }),
+    });
+    const spawnChild = async () => ({
+      resolved: MODEL,
+      session: {
+        usage: { input: 4, output: 2 },
+        latestAssistantMessage: { stopReason: "stop", content: [{ type: "text", text: "four" }] },
+        async prompt() {}, async dispose() {},
+      },
+    });
+    const runner = new BrokeredChildRunner({ resolver, sessionsRoot: join(root, "sessions"), spawnChild, delay: async () => {} });
+    const result = await runner.run({
+      childId: "track-run", promptDigest: "a".repeat(64), model: MODEL, cwd: root, prompt: "x",
+      maxAttempts: 2, trackForVerification: true,
+    });
+    assert.equal(result.status, "completed", result.error);
+    // Tracked durably, then released for verification: without a configured verifier the task
+    // correctly waits for a controller receipt rather than completing itself.
+    assert.deepEqual(supervisor.auditSnapshot().pendingTasks.map((task) => task.state), ["awaiting_result"]);
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an untrackable final result reports why, instead of an opaque failure", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-track-reason-"));
+  const supervisor = signedSupervisor(root);
+  try {
+    await supervisor.start();
+    const resolver = new BrokeredLaunchResolver({
+      socketPath: supervisor.socketPath,
+      controllerToken: supervisor.controllerToken,
+      agentRoot: join(root, "child-agents"),
+      extensionPaths: [new URL("../extensions/child-shim.ts", import.meta.url).pathname],
+      offline: true,
+      resolveModelForResource: () => MODEL,
+      selectContract: () => ({ expectedModel: MODEL, contract: fixtureContract({ taskId: "reason-task" }) }),
+    });
+    const spawnChild = async () => ({
+      resolved: MODEL,
+      session: {
+        usage: { input: 1, output: 1 },
+        latestAssistantMessage: { stopReason: "stop", content: [{ type: "text", text: "ok" }] },
+        async prompt() {}, async dispose() {},
+      },
+    });
+    // Simulate the controller losing the admission before the terminal result is tracked.
+    const originalResolve = resolver.resolve.bind(resolver);
+    resolver.resolve = async (request) => {
+      const decision = await originalResolve(request);
+      if (decision.action === "allow") decision.policy.trackForVerification = async () => resolver.trackHandedChildForVerification("never-admitted");
+      return decision;
+    };
+    const runner = new BrokeredChildRunner({ resolver, sessionsRoot: join(root, "sessions"), spawnChild, delay: async () => {} });
+    const result = await runner.run({
+      childId: "reason-run", promptDigest: "a".repeat(64), model: MODEL, cwd: root, prompt: "x",
+      maxAttempts: 1, trackForVerification: true,
+    });
+    assert.equal(result.status, "failed");
+    assert.match(result.error, /admission_missing/, "the operator must learn which precondition failed");
+    // The lease must still be freed: a bookkeeping failure cannot strand capacity.
+    assert.deepEqual(supervisor.auditSnapshot().leases, []);
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});

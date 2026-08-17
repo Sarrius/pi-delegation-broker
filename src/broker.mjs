@@ -306,7 +306,11 @@ export class SqliteLeaseBroker {
     return this.#transaction(() => {
       this.#expire(now);
       const lease = this.#db.prepare("SELECT * FROM leases WHERE lease_id = ? AND fencing_token = ? AND expires_at > ?").get(leaseId, fencingToken, now);
-      if (!lease || lease.task_id !== contract?.taskId) return { status: "denied_policy" };
+      // A bare denial is undiagnosable in production: the caller cannot tell an expired lease
+      // from a contract mismatch from an already-tracked task, and all three need different
+      // repairs. The reason code carries no prompt, credential or contract content.
+      if (!lease) return { status: "denied_policy", reason: "lease_not_active" };
+      if (lease.task_id !== contract?.taskId) return { status: "denied_policy", reason: "lease_task_mismatch" };
       const recovery = contract.recovery ?? {};
       const deadlineAt = Number.isSafeInteger(recovery.deadlineAt) && recovery.deadlineAt > now
         ? recovery.deadlineAt : now + Math.max(300_000, contract.latencyBudgetMs ?? 0);
@@ -314,7 +318,7 @@ export class SqliteLeaseBroker {
       const inserted = this.#db.prepare(`INSERT INTO pending_tasks (task_id, contract, admission_class, state, created_at, updated_at, eligible_at, deadline_at, recovery_owner, lease_id)
         VALUES (?, ?, ?, 'claimed', ?, ?, NULL, ?, ?, ?) ON CONFLICT(task_id) DO NOTHING`)
         .run(contract.taskId, JSON.stringify(redact(contract)), contract.admissionClass, now, now, deadlineAt, owner, leaseId);
-      if (inserted.changes !== 1) return { status: "denied_policy" };
+      if (inserted.changes !== 1) return { status: "denied_policy", reason: "task_already_tracked" };
       this.#record(now, "TaskTracked", { taskId: contract.taskId, leaseId });
       return { status: "tracked" };
     });

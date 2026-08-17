@@ -205,7 +205,10 @@ export class BrokeredChildRunner {
     if (trackForVerification) {
       try {
         const tracked = await handle.policy.trackForVerification?.();
-        if (tracked?.status !== "tracked") throw new Error("controller could not durably track final child result");
+        if (tracked?.status !== "tracked") {
+          const reason = typeof tracked?.reason === "string" ? tracked.reason : (tracked?.status ?? "no_response");
+          throw new Error(`controller could not durably track final child result: ${reason}`);
+        }
       } catch (error) {
         trackingError = error instanceof Error ? error : new Error(String(error));
       }
