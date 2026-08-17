@@ -40,6 +40,12 @@ Hermes is a distinct integration: its review subprocess intentionally runs again
 
 Use an absolute path — Hermes normalizes with `resolve()` and does not expand a literal `~`. This lets the subprocess resolve the active alias and lets the multi-account extension perform its normal account-level failover. Do not set `llmModelOverride` to a stale route merely to conceal alias failures. A brokered child must not invoke `pi.setModel()` or auto-continue on its own. `ControllerAccountInventory` can consume a controller-injected registry snapshot only as `observed` inventory; it contains no credential and still requires signed-registry policy before admission.
 
+### Reloading during development
+
+`/reload` re-runs extension activation, but it does **not** re-import `src/*.mjs`: Node caches ES modules by URL for the lifetime of the process, so a reloaded extension keeps calling the already-loaded broker code. Editing anything under `src/` therefore requires a full Pi restart, not a reload.
+
+This matters because the failure is silent — the extension activates, the broker starts, and stale routing or health logic keeps running as if the fix were live. Do not conclude from a reloaded session that a `src/` change had no effect. Confirm which code is actually running by observing a field only the new code can emit; for example `RegistryReloaded` carries `healthCarried` only after the health-preserving reload landed. An audit event is evidence, an assumption is not.
+
 ### Credentialless controller-provider proxy
 
 For a controller that has explicitly injected an approved `providerTransport + routeResolver` pair, `BrokeredLaunchResolver` can be constructed with `controllerProxy: { providerId: "broker-proxy" }` and **without** `provisionChildAuth`. It launches the leased resource's model through `extensions/controller-provider-proxy.ts`; the child gets only `PI_BROKER_SOCKET`, its lease-scoped capability and a non-secret model id. There is no child `auth.json`, upstream endpoint credential, OAuth token or parent agent directory.
