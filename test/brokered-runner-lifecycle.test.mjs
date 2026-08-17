@@ -69,3 +69,85 @@ test("only the terminal successful failover attempt is tracked for controller ve
     ]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("the account that fails on the final attempt is still reported as cooled", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-final-health-"));
+  const cooled = [];
+  const condemned = [];
+  let resolved = 0;
+  const resolver = {
+    async resolve() {
+      const attempt = ++resolved;
+      return {
+        action: "allow",
+        resource: { id: `provider/model-${attempt}` },
+        resolvedModel: MODEL,
+        policy: {
+          policyId: `lease-${attempt}`, agentDir: root, environment: {},
+          async onChildSessionOpened() {},
+          async onBeforeChildAbandoned() {},
+          async onChildSessionClosed() { return { status: "released" }; },
+        },
+      };
+    },
+    async reportProviderRateLimited(resourceId) { cooled.push(resourceId); },
+    async reportProviderUnavailable(resourceId, _reason, scope) { condemned.push({ resourceId, scope }); },
+  };
+  const spawnChild = async () => ({
+    resolved: MODEL,
+    session: {
+      usage: { input: 1, output: 1 },
+      latestAssistantMessage: { stopReason: "error", errorMessage: "429 rate limit" },
+      async prompt() {}, async dispose() {},
+    },
+  });
+  try {
+    const runner = new BrokeredChildRunner({ resolver, sessionsRoot: join(root, "sessions"), spawnChild, delay: async () => {} });
+    const result = await runner.run({
+      childId: "exhaust-all", promptDigest: "a".repeat(64), model: MODEL, cwd: root,
+      prompt: "work", maxAttempts: 2,
+    });
+    assert.equal(result.status, "failed");
+    assert.deepEqual(cooled, ["provider/model-1", "provider/model-2"], "the terminal attempt's account must not stay healthy");
+    assert.deepEqual(condemned, []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a task-owned fatal error never blames the provider", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-fatal-health-"));
+  const cooled = [];
+  const condemned = [];
+  const resolver = {
+    async resolve() {
+      return {
+        action: "allow",
+        resource: { id: "provider/model-1" },
+        resolvedModel: MODEL,
+        policy: {
+          policyId: "lease-1", agentDir: root, environment: {},
+          async onChildSessionOpened() {},
+          async onBeforeChildAbandoned() {},
+          async onChildSessionClosed() { return { status: "released" }; },
+        },
+      };
+    },
+    async reportProviderRateLimited(resourceId) { cooled.push(resourceId); },
+    async reportProviderUnavailable(resourceId) { condemned.push(resourceId); },
+  };
+  const spawnChild = async () => ({
+    resolved: MODEL,
+    session: {
+      usage: { input: 1, output: 1 },
+      latestAssistantMessage: { stopReason: "error", errorMessage: "TypeError: undefined is not a function" },
+      async prompt() {}, async dispose() {},
+    },
+  });
+  try {
+    const runner = new BrokeredChildRunner({ resolver, sessionsRoot: join(root, "sessions"), spawnChild, delay: async () => {} });
+    const result = await runner.run({ childId: "fatal-task", promptDigest: "a".repeat(64), model: MODEL, cwd: root, prompt: "work", maxAttempts: 3 });
+    assert.equal(result.status, "failed");
+    assert.equal(result.route.length, 1, "a fatal task error must not retry other accounts");
+    assert.deepEqual(cooled, []);
+    assert.deepEqual(condemned, []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

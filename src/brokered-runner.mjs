@@ -154,9 +154,12 @@ export class BrokeredChildRunner {
 
       const kind = lastResult.status === "aborted" ? "fatal" : classifyChildFailure(lastResult.error ?? lastResult.text);
       route.push({ attempt, childId: attemptId, resourceId, outcome: kind, error: lastResult.error });
-      if (kind === "fatal" || attempt === maxAttempts) break;
 
-      if (resourceId !== undefined) {
+      // Provider health is reported before deciding whether to continue. A throttled or dead
+      // account is an observed fact about the fleet no matter which attempt saw it; reporting
+      // it only when a retry follows means the route that fails last is never cooled, and the
+      // next task selects that same exhausted account first and burns an attempt re-proving it.
+      if (resourceId !== undefined && kind !== "fatal") {
         if (kind === "rate_limited" || kind === "account_exhausted") await this.#reportRateLimited(resourceId, lastResult.retryAfterMs);
         // A revoked/expired credential belongs to the account, not the model: condemning only
         // this resource makes the next hop retry a sibling model on the same dead credential.
@@ -165,6 +168,8 @@ export class BrokeredChildRunner {
         // A context overflow leaves the provider healthy — only this route is wrong.
         if (kind !== "context_exhausted") excludeResources.push(resourceId);
       }
+      if (kind === "fatal" || attempt === maxAttempts) break;
+
       if (kind === "context_exhausted") {
         const widened = new Set([...(requiredCapabilities ?? []), "large_context"]);
         if (requiredCapabilities && widened.size === requiredCapabilities.length) break;

@@ -176,7 +176,9 @@ test("when every provider is throttled the run stops at its attempt bound and re
     assert.equal(result.status, "failed");
     assert.equal(result.route.length, 3, "bounded, not an infinite rotation storm");
     assert.ok(result.route.every((step) => step.outcome === "rate_limited"));
-    assert.equal(resolver.reports.length, 2, "each exhausted account was reported before moving on");
+    // Every throttled account is reported, including the one that failed on the final attempt:
+    // otherwise the last account stays healthy in broker state and the next task picks it first.
+    assert.equal(resolver.reports.length, 3, "each throttled account was reported, terminal attempt included");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
