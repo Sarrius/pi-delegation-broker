@@ -687,3 +687,17 @@ test("a model-specific refusal condemns only that route", () => withBroker((brok
   assert.equal(single.capacityGroup, undefined);
   assert.equal(broker.inventory(1_000).find((row) => row.resourceId === "R1_ALIAS").state, "healthy");
 }));
+
+test("a registry reload does not resurrect accounts already proven dead", () => withBroker((broker) => {
+  broker.markRateLimited("R1", 60_000, 1_000);            // throttled account
+  broker.markUnknown("R2", 1_000, "revoked", "resource"); // dead credential
+  const reloaded = broker.reloadRegistry(fixtureRegistry(), 1_001);
+  assert.equal(reloaded.status, "reloaded");
+  const inventory = broker.inventory(1_001);
+  const shared = inventory.find((row) => row.resourceId === "R1");
+  assert.equal(shared.breakerState, "cooling_down", "a throttle survives a configuration reload");
+  assert.ok(shared.groupCooldownUntil > 1_001, "the remaining cooldown is preserved, not reset");
+  assert.equal(inventory.find((row) => row.resourceId === "R2").state, "unknown");
+  // A healthy account is untouched, so a reload cannot silently quarantine a working route.
+  assert.equal(inventory.find((row) => row.resourceId === "R3").state, "healthy");
+}));

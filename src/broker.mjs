@@ -1031,16 +1031,40 @@ export class SqliteLeaseBroker {
       if (activeLeases.count > 0) return { status: "denied", reason: "active_leases_exist", count: activeLeases.count };
       const activeTasks = this.#db.prepare("SELECT count(*) AS count FROM pending_tasks WHERE state IN ('waiting','ready','claimed','awaiting_result')").get();
       if (activeTasks.count > 0) return { status: "denied", reason: "active_tasks_exist", count: activeTasks.count };
+      // Observed health is not registry data. A throttled account, a spent balance and a revoked
+      // credential are facts about the world that a configuration reload does not repeal, so they
+      // are carried across the replacement. Dropping them resurrects every dead account on every
+      // reload, and the next task rediscovers them one wasted attempt at a time.
+      const groupHealth = this.#db.prepare("SELECT id, cooldown_until, breaker_state FROM capacity_groups").all();
+      const resourceHealth = this.#db.prepare("SELECT id, state, cooldown_until FROM resources").all();
       this.#db.prepare("DELETE FROM resources").run();
       this.#db.prepare("DELETE FROM capacity_groups").run();
       this.#db.prepare("DELETE FROM profiles").run();
       this.#insertRegistry(newRegistry);
+      let carried = 0;
+      for (const group of groupHealth) {
+        if (!Object.hasOwn(newRegistry.capacityGroups, group.id)) continue;
+        if (group.cooldown_until <= 0 && group.breaker_state === "healthy") continue;
+        // probe_lease_id is deliberately not carried: reload requires zero active leases, so any
+        // recorded probe is already gone and would otherwise block the half-open probe forever.
+        this.#db.prepare("UPDATE capacity_groups SET cooldown_until = ?, breaker_state = ?, probe_lease_id = NULL WHERE id = ?")
+          .run(group.cooldown_until, group.breaker_state, group.id);
+        carried += 1;
+      }
+      for (const resource of resourceHealth) {
+        if (!Object.hasOwn(newRegistry.resources, resource.id)) continue;
+        if (resource.state === "healthy" && resource.cooldown_until <= 0) continue;
+        this.#db.prepare("UPDATE resources SET state = ?, cooldown_until = ? WHERE id = ?")
+          .run(resource.state, resource.cooldown_until, resource.id);
+        carried += 1;
+      }
       this.#record(now, "RegistryReloaded", {
         profiles: Object.keys(newRegistry.profiles).length,
         capacityGroups: Object.keys(newRegistry.capacityGroups).length,
         resources: Object.keys(newRegistry.resources).length,
+        healthCarried: carried,
       });
-      return { status: "reloaded" };
+      return { status: "reloaded", healthCarried: carried };
     });
   }
 
