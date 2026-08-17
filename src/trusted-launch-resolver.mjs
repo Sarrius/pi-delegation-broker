@@ -316,8 +316,9 @@ export class BrokeredLaunchResolver {
    * expired credential. Unlike a rate limit this does not recover by waiting, so the resource
    * stays out until a controller explicitly repairs it.
    */
-  async reportProviderUnavailable(resourceId, reason) {
-    return this.#controller("markUnknown", { resourceId, reason: safeReason(reason) });
+  async reportProviderUnavailable(resourceId, reason, scope = "resource") {
+    if (scope !== "resource" && scope !== "capacity_group") throw new Error("provider unavailable scope must be resource or capacity_group");
+    return this.#controller("markUnknown", { resourceId, reason: safeReason(reason), scope });
   }
 
   /** Idempotent pre-handoff cleanup called only by the trusted parent runner. */

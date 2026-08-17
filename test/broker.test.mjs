@@ -668,3 +668,22 @@ test("registry reload with invalid candidate rolls back to previous registry", (
     broker.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("a revoked credential condemns its whole account, not just the model that reported it", () => withBroker((broker) => {
+  // R1 and R1_ALIAS are two models of one account: they share a credential, so proving that
+  // credential dead on one of them is proof for both.
+  const auth = broker.markUnknown("R1", 1_000, "provider auth fatal", "capacity_group");
+  assert.equal(auth.capacityGroup, "G-shared");
+  assert.equal(auth.alsoAffected, 1, "the sibling model on the same account is condemned too");
+  const states = broker.inventory(1_000);
+  assert.equal(states.find((row) => row.resourceId === "R1_ALIAS").state, "unknown");
+  // A different account is untouched: this is credential evidence, not a global outage.
+  assert.equal(states.find((row) => row.resourceId === "R2").state, "healthy");
+}));
+
+test("a model-specific refusal condemns only that route", () => withBroker((broker) => {
+  const single = broker.markUnknown("R1", 1_000, "model refused request", "resource");
+  assert.equal(single.status, "unknown");
+  assert.equal(single.capacityGroup, undefined);
+  assert.equal(broker.inventory(1_000).find((row) => row.resourceId === "R1_ALIAS").state, "healthy");
+}));

@@ -665,10 +665,23 @@ export class SqliteLeaseBroker {
     });
   }
 
-  markUnknown(resourceId, now, reason = "unknown") {
+  /**
+   * `scope` distinguishes what the failure actually proves. A model-specific refusal condemns
+   * only that route, but a revoked or expired credential is a property of the account: every
+   * resource in the capacity group shares it, so leaving the siblings healthy makes the broker
+   * spend its remaining failover attempts re-proving the same dead credential.
+   */
+  markUnknown(resourceId, now, reason = "unknown", scope = "resource") {
+    if (scope !== "resource" && scope !== "capacity_group") throw new Error("markUnknown scope must be resource or capacity_group");
     return this.#transaction(() => {
       const update = this.#db.prepare("UPDATE resources SET state = 'unknown' WHERE id = ?").run(resourceId);
       if (update.changes !== 1) throw new Error(`Unknown resource ${resourceId}`);
+      if (scope === "capacity_group") {
+        const group = this.#db.prepare("SELECT capacity_group FROM resources WHERE id = ?").get(resourceId).capacity_group;
+        const siblings = this.#db.prepare("UPDATE resources SET state = 'unknown' WHERE capacity_group = ? AND state != 'unknown'").run(group);
+        this.#record(now, "CapacityGroupUnknown", { resourceId, capacityGroup: group, reason, alsoAffected: siblings.changes });
+        return { status: "unknown", resourceId, capacityGroup: group, alsoAffected: siblings.changes };
+      }
       this.#record(now, "ResourceUnknown", { resourceId, reason });
       // Return an explicit receipt: a void result is indistinguishable from "no reply" to a
       // controller waiting on the IPC response.

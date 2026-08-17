@@ -154,7 +154,10 @@ export class BrokeredChildRunner {
 
       if (resourceId !== undefined) {
         if (kind === "rate_limited" || kind === "account_exhausted") await this.#reportRateLimited(resourceId, lastResult.retryAfterMs);
-        else if (kind === "auth_fatal" || kind === "unavailable") await this.#reportUnavailable(resourceId, `provider ${kind}`);
+        // A revoked/expired credential belongs to the account, not the model: condemning only
+        // this resource makes the next hop retry a sibling model on the same dead credential.
+        else if (kind === "auth_fatal") await this.#reportUnavailable(resourceId, "provider auth_fatal", "capacity_group");
+        else if (kind === "unavailable") await this.#reportUnavailable(resourceId, "provider unavailable", "resource");
         // A context overflow leaves the provider healthy — only this route is wrong.
         if (kind !== "context_exhausted") excludeResources.push(resourceId);
       }
@@ -178,8 +181,8 @@ export class BrokeredChildRunner {
     catch { /* health reporting is best effort; the attempt is already excluded locally */ }
   }
 
-  async #reportUnavailable(resourceId, reason) {
-    try { await this.#resolver.reportProviderUnavailable?.(resourceId, reason); }
+  async #reportUnavailable(resourceId, reason, scope) {
+    try { await this.#resolver.reportProviderUnavailable?.(resourceId, reason, scope); }
     catch { /* health reporting is best effort; the attempt is already excluded locally */ }
   }
 

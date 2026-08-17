@@ -387,7 +387,7 @@ export class BrokerIpcServer {
       settlement.settleTerminal("rate_limited", { facts: { retryAfterMs: event.retryAfterMs, capacityGroup: cooldown.capacityGroup }, observedAt });
     } else if (event.type === "auth_fatal") {
       settlement.transition("headers_seen");
-      this.#broker.markUnknown(lease.resourceId, observedAt, "provider auth fatal");
+      this.#broker.markUnknown(lease.resourceId, observedAt, "provider auth fatal", "capacity_group");
       this.#broker.release(lease.leaseId, lease.fencingToken, "provider auth fatal", observedAt);
       emit("terminal", { outcome: "auth_fatal" });
       settlement.settleTerminal("auth_fatal", { observedAt });
@@ -560,7 +560,7 @@ export class BrokerIpcServer {
         this.#broker.markRateLimited(lease.resourceId, payload.retryAfterMs, observedAt);
         this.#broker.release(lease.leaseId, lease.fencingToken, "provider rate limited", observedAt);
       } else if (outcome === "auth_fatal" || outcome === "quota_fatal") {
-        this.#broker.markUnknown(lease.resourceId, observedAt, `provider ${outcome}`);
+        this.#broker.markUnknown(lease.resourceId, observedAt, `provider ${outcome}`, "capacity_group");
         this.#broker.release(lease.leaseId, lease.fencingToken, `provider ${outcome}`, observedAt);
       } else if (outcome !== "succeeded_terminal") {
         this.#broker.release(lease.leaseId, lease.fencingToken, `provider terminal ${outcome}`, observedAt);
@@ -635,7 +635,7 @@ export class BrokerIpcServer {
       return { status: "rate_limited", retryAfterMs: event.retryAfterMs, capacityGroup: cooldown.capacityGroup, retryAt: cooldown.until };
     }
     if (event.type === "auth_fatal") {
-      this.#broker.markUnknown(lease.resourceId, observedAt, "provider auth fatal");
+      this.#broker.markUnknown(lease.resourceId, observedAt, "provider auth fatal", "capacity_group");
       this.#broker.release(lease.leaseId, lease.fencingToken, "provider auth fatal", observedAt);
       return { status: "auth_fatal" };
     }
