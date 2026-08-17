@@ -8,7 +8,7 @@ import { BrokeredChildRunner } from "../src/brokered-runner.mjs";
 
 const MODEL = { provider: "broker-fake", modelId: "lease-fake" };
 
-test("only the terminal successful failover attempt is tracked for controller verification", async () => {
+test("every attempt is tracked while its lease lives, but only a completed one is verified", async () => {
   const root = mkdtempSync(join(tmpdir(), "runner-lifecycle-"));
   const tracks = [];
   const closes = [];
@@ -62,7 +62,10 @@ test("only the terminal successful failover attempt is tracked for controller ve
     });
     assert.equal(result.status, "completed");
     assert.deepEqual(result.route.map((hop) => hop.outcome), ["rate_limited", "completed"]);
-    assert.deepEqual(tracks, [2], "the failed first route must never enter the verification ledger");
+    // Tracking happens at handoff because the child releases its own lease when it exits, so a
+    // post-run write would arrive too late. Tracking is bookkeeping, not acceptance: the failed
+    // route requeues the task and only the completed route is closed toward verification.
+    assert.deepEqual(tracks, [1, 2], "each attempt registers its own live lease");
     assert.deepEqual(closes, [
       { attempt: 1, status: "failed", attempts: 1 },
       { attempt: 2, status: "completed", attempts: 2 },

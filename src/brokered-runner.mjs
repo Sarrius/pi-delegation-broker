@@ -134,10 +134,26 @@ export class BrokeredChildRunner {
       }
 
       const resourceId = handle.resource?.id;
+      if (trackForVerification) {
+        // The child releases its own lease when its session ends, so durable tracking has to
+        // happen while the child is still running. Tracking is not acceptance: a failed attempt
+        // requeues this task, and only a completed one reaches the verifier.
+        try {
+          const tracked = await handle.policy.trackForVerification?.();
+          if (tracked?.status !== "tracked") {
+            const reason = typeof tracked?.reason === "string" ? tracked.reason : (tracked?.status ?? "no_response");
+            throw new Error(`controller could not durably track this attempt: ${reason}`);
+          }
+        } catch (error) {
+          await this.#closeAttempt(handle, { status: "failed" }).catch(() => undefined);
+          route.push({ attempt, childId: attemptId, resourceId, outcome: "controller_track_failed", error: error.message });
+          return Object.freeze({ id: childId, status: "failed", text: "", error: error.message, route: Object.freeze(route) });
+        }
+      }
       lastResult = await handle.result;
       let closure;
       try {
-        closure = await this.#closeAttempt(handle, lastResult, trackForVerification && lastResult.status === "completed");
+        closure = await this.#closeAttempt(handle, lastResult);
       } catch (error) {
         route.push({ attempt, childId: attemptId, resourceId, outcome: "controller_close_failed", error: error.message });
         return Object.freeze({ ...lastResult, id: childId, status: "failed", error: `controller close failed: ${error.message}`, route: Object.freeze(route) });
@@ -200,29 +216,16 @@ export class BrokeredChildRunner {
    * allow/deny before any process starts. Returns a handle whose `result`
    * promise resolves to the child's terminal result (not task acceptance).
    */
-  async #closeAttempt(handle, result, trackForVerification) {
-    let trackingError;
-    if (trackForVerification) {
-      try {
-        const tracked = await handle.policy.trackForVerification?.();
-        if (tracked?.status !== "tracked") {
-          const reason = typeof tracked?.reason === "string" ? tracked.reason : (tracked?.status ?? "no_response");
-          throw new Error(`controller could not durably track final child result: ${reason}`);
-        }
-      } catch (error) {
-        trackingError = error instanceof Error ? error : new Error(String(error));
-      }
-    }
-    // Always close the resolver admission, even if tracking failed, so a failed bookkeeping
-    // write cannot strand a lease. A tracked final result enters controller verification here.
-    const closed = await handle.policy.onChildSessionClosed?.({
+  async #closeAttempt(handle, result) {
+    // Closing the resolver admission both frees capacity and decides the tracked task's next
+    // state: a completed child moves toward controller verification, any other outcome requeues
+    // the task so a later route can claim the same logical work.
+    return handle.policy.onChildSessionClosed?.({
       status: result.status,
       ...(result.error ? { error: result.error } : {}),
       ...(result.usage ? { usage: result.usage } : {}),
       attempts: handle.attempts,
     });
-    if (trackingError) throw trackingError;
-    return closed;
   }
 
   async spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, attempts = 1, deferClosePolicy = false }) {

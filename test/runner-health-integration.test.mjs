@@ -138,7 +138,7 @@ test("a successful child is durably tracked and finalized through the real contr
       extensionPaths: [new URL("../extensions/child-shim.ts", import.meta.url).pathname],
       offline: true,
       resolveModelForResource: () => MODEL,
-      selectContract: () => ({ expectedModel: MODEL, contract: fixtureContract({ taskId: `track-${++issued}` }) }),
+      selectContract: () => ({ expectedModel: MODEL, contract: fixtureContract({ taskId: "track-logical" }) }),
     });
     const spawnChild = async () => ({
       resolved: MODEL,
@@ -201,6 +201,54 @@ test("an untrackable final result reports why, instead of an opaque failure", as
     assert.match(result.error, /admission_missing/, "the operator must learn which precondition failed");
     // The lease must still be freed: a bookkeeping failure cannot strand capacity.
     assert.deepEqual(supervisor.auditSnapshot().leases, []);
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("one logical task survives a failed route and is verified on the route that works", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-relay-"));
+  const supervisor = signedSupervisor(root);
+  try {
+    await supervisor.start();
+    const resolver = new BrokeredLaunchResolver({
+      socketPath: supervisor.socketPath,
+      controllerToken: supervisor.controllerToken,
+      agentRoot: join(root, "child-agents"),
+      extensionPaths: [new URL("../extensions/child-shim.ts", import.meta.url).pathname],
+      offline: true,
+      resolveModelForResource: () => MODEL,
+      // The extension binds one taskId to the whole delegation, so every failover attempt
+      // presents the same logical contract.
+      selectContract: () => ({ expectedModel: MODEL, contract: fixtureContract({ taskId: "relay-task" }) }),
+    });
+    let attempt = 0;
+    const spawnChild = async () => {
+      const failing = ++attempt === 1;
+      return {
+        resolved: MODEL,
+        session: {
+          usage: { input: 3, output: 2 },
+          latestAssistantMessage: failing
+            ? { stopReason: "error", errorMessage: "429 rate limit" }
+            : { stopReason: "stop", content: [{ type: "text", text: "four" }] },
+          async prompt() {}, async dispose() {},
+        },
+      };
+    };
+    const runner = new BrokeredChildRunner({ resolver, sessionsRoot: join(root, "sessions"), spawnChild, delay: async () => {} });
+    const result = await runner.run({
+      childId: "relay-run", promptDigest: "a".repeat(64), model: MODEL, cwd: root, prompt: "x",
+      maxAttempts: 2, trackForVerification: true,
+    });
+    assert.equal(result.status, "completed", result.error);
+    assert.deepEqual(result.route.map((hop) => hop.outcome), ["rate_limited", "completed"]);
+    // Exactly one durable task exists for the delegation, and it reached verification through
+    // the second route rather than being duplicated or stranded by the first.
+    const tasks = supervisor.auditSnapshot().pendingTasks;
+    assert.deepEqual(tasks.map((task) => task.state), ["awaiting_result"]);
+    assert.equal(supervisor.auditSnapshot().leases.length, 0);
   } finally {
     await supervisor.stop().catch(() => undefined);
     rmSync(root, { recursive: true, force: true });

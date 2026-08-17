@@ -365,7 +365,11 @@ export class BrokeredLaunchResolver {
   async finalizeHandedChild(childId, result) {
     // Do not let the caller's child result influence terminal acceptance.
     const admission = this.#admissions.get(childId);
-    const released = await this.#releaseAdmission(childId, "closed_release_pending");
+    // Only a completed child may move its task toward verification. A failed route requeues the
+    // task instead, so the next attempt can claim the same logical work; sending a failure down
+    // the verification path would ask the verifier to judge work that was never produced.
+    const succeeded = result?.status === "completed";
+    const released = await this.#releaseAdmission(childId, succeeded ? "closed_release_pending" : "release_pending");
     if (!admission?.queuedTaskId || released.status !== "awaiting_verification" || !this.#queuedTaskVerifier) return released;
     const verification = await this.#queuedTaskVerifier.verifyAndFinalize({
       taskId: admission.queuedTaskId,

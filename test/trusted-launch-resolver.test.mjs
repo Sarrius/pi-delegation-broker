@@ -127,7 +127,9 @@ test("controller resolver preserves and safely reconciles a release after contro
     assert.equal(supervisor.auditSnapshot().leases.length, 1);
 
     await supervisor.stop();
-    await assert.rejects(() => decision.policy.onChildSessionClosed());
+    // A completed child: its admission must await verification rather than requeue. Closing
+    // without a result is deliberately treated as failure, so the intent is stated explicitly.
+    await assert.rejects(() => decision.policy.onChildSessionClosed({ status: "completed" }));
     assert.deepEqual(resolver.admissions().map((admission) => admission.phase), ["closed_release_pending"]);
     assert.equal(existsSync(decision.policy.agentDir), true);
 

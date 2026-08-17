@@ -318,8 +318,23 @@ export class SqliteLeaseBroker {
       const inserted = this.#db.prepare(`INSERT INTO pending_tasks (task_id, contract, admission_class, state, created_at, updated_at, eligible_at, deadline_at, recovery_owner, lease_id)
         VALUES (?, ?, ?, 'claimed', ?, ?, NULL, ?, ?, ?) ON CONFLICT(task_id) DO NOTHING`)
         .run(contract.taskId, JSON.stringify(redact(contract)), contract.admissionClass, now, now, deadlineAt, owner, leaseId);
-      if (inserted.changes !== 1) return { status: "denied_policy", reason: "task_already_tracked" };
-      this.#record(now, "TaskTracked", { taskId: contract.taskId, leaseId });
+      if (inserted.changes === 1) {
+        this.#record(now, "TaskTracked", { taskId: contract.taskId, leaseId });
+        return { status: "tracked" };
+      }
+      // One logical task may be attempted on several routes: a failed attempt requeues the row
+      // rather than terminating it, so a later lease must be able to pick the same task up.
+      // Only a requeued row qualifies — a claimed, awaiting_result or terminal task must never be
+      // silently rebound to a different lease, which would let one route overwrite another's
+      // pending verification.
+      const existing = this.#db.prepare("SELECT state FROM pending_tasks WHERE task_id = ?").get(contract.taskId);
+      if (existing?.state !== "waiting") return { status: "denied_policy", reason: existing ? `task_state_${existing.state}` : "task_missing" };
+      const rebound = this.#db.prepare(`
+        UPDATE pending_tasks SET state = 'claimed', lease_id = ?, updated_at = ?, eligible_at = NULL
+        WHERE task_id = ? AND state = 'waiting'
+      `).run(leaseId, now, contract.taskId);
+      if (rebound.changes !== 1) return { status: "denied_policy", reason: "task_rebind_failed" };
+      this.#record(now, "TaskTracked", { taskId: contract.taskId, leaseId, rebound: true });
       return { status: "tracked" };
     });
   }
