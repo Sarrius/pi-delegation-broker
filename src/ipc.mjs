@@ -201,7 +201,7 @@ export class BrokerIpcServer {
       if (method === "issueLeaseCapability") return this.#broker.issueLeaseCapability(params.leaseId, params.fencingToken, now);
       if (method === "bindEffectiveChildCapability") return this.#broker.bindEffectiveChildCapability(params.leaseId, params.fencingToken, params.capability, now);
       if (method === "markRateLimited") return this.#broker.markRateLimited(params.resourceId, params.retryAfterMs, now);
-      if (method === "markUnknown") return this.#broker.markUnknown(params.resourceId, now, params.reason);
+      if (method === "markUnknown") return this.#broker.markUnknown(params.resourceId, now, params.reason, params.scope);
       if (method === "markHealthy") return this.#broker.markHealthy(params.resourceId, now);
       if (method === "release") return this.#broker.release(params.leaseId, params.fencingToken, "controller release", now);
       if (method === "configureFakeProvider") {
