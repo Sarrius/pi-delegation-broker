@@ -701,3 +701,14 @@ test("a registry reload does not resurrect accounts already proven dead", () => 
   // A healthy account is untouched, so a reload cannot silently quarantine a working route.
   assert.equal(inventory.find((row) => row.resourceId === "R3").state, "healthy");
 }));
+
+test("a controller with no receipt authority says so instead of denying opaquely", () => withBroker((broker) => {
+  // withBroker wires no verificationReceiptVerifier, which is exactly the misconfiguration that
+  // silently made every verified completion fail: the acceptance path ran and was then discarded.
+  const denied = broker.finalizeVerifiedTask("t", "l", 1, {
+    status: "accepted", verifierRunId: "run-1", evidenceRefs: ["controller:11111111-1111-4111-8111-111111111111"],
+    receiptRef: "controller:22222222-2222-4222-8222-222222222222",
+  }, 1_000);
+  assert.equal(denied.status, "denied_verification");
+  assert.equal(denied.reason, "no_receipt_authority");
+}));

@@ -414,11 +414,15 @@ export class SqliteLeaseBroker {
     // The controller IPC token is necessary but insufficient: the receipt
     // must also be rooted in the controller's retained evidence authority.
     // This callback is boot-injected, never serialized or child-configurable.
+    // A deployment with no injected authority can never finalize anything. Saying so explicitly
+    // separates a misconfigured controller from a genuinely bad receipt; both fail closed, but
+    // only one is repaired by fixing configuration.
+    if (!this.#verificationReceiptVerifier) return { status: "denied_verification", reason: "no_receipt_authority" };
     let receiptVerified = false;
     try {
-      receiptVerified = this.#verificationReceiptVerifier?.(verdict, Object.freeze({ taskId, leaseId, fencingToken })) === true;
+      receiptVerified = this.#verificationReceiptVerifier(verdict, Object.freeze({ taskId, leaseId, fencingToken })) === true;
     } catch { /* fail closed */ }
-    if (!receiptVerified) return { status: "denied_verification" };
+    if (!receiptVerified) return { status: "denied_verification", reason: "receipt_not_authenticated" };
     return this.#transaction(() => {
       const pending = this.#db.prepare("SELECT 1 FROM pending_tasks WHERE task_id = ? AND lease_id = ? AND state = 'awaiting_result'")
         .get(taskId, leaseId);

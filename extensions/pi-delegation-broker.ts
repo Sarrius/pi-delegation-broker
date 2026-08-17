@@ -267,8 +267,15 @@ async function startBroker(): Promise<BrokerRuntime> {
     signature: sign(null, signedRegistryMessage(unsigned), keys.privateKey).toString("base64url"),
   };
 
+  // Built before the supervisor: the broker refuses to make any task terminal unless a receipt
+  // authenticates against this authority, so it has to exist at supervisor construction.
+  const evidenceStore = new ControllerEvidenceStore({ root: join(STATE_DIR, "verification-evidence") });
+  const verificationAuthority = new ControllerVerificationAuthority({ evidenceStore });
   const supervisor = new SingleHostBrokerSupervisor({
     stateDir: STATE_DIR,
+    // Without this the controller token alone would be trusted, and every verified completion
+    // would be denied instead — the acceptance path would exist but never finish a task.
+    verificationReceiptVerifier: (receipt: any, binding: any) => verificationAuthority.verify(receipt, binding),
     // Every child is launched with the attested behavioral enforcement extension, which is what
     // makes effect-capable contracts admissible at all.
     behavioralEnforcement: "blocking_monitor",
@@ -279,8 +286,6 @@ async function startBroker(): Promise<BrokerRuntime> {
   });
   await supervisor.start();
   const acceptancePlans = new Map<string, Array<{ id: string; claim: string; argv: string[]; timeoutMs: number }>>();
-  const evidenceStore = new ControllerEvidenceStore({ root: join(STATE_DIR, "verification-evidence") });
-  const verificationAuthority = new ControllerVerificationAuthority({ evidenceStore });
   const affinityJournal = new ModelAffinityJournal({ path: join(STATE_DIR, "model-affinity.json") });
   const routingAudit = new RoutingAuditJournal({ path: ROUTING_AUDIT_PATH });
   const verifiedRouting = new ControllerVerifiedRoutingBoard({
