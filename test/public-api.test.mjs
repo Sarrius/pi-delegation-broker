@@ -83,6 +83,8 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "parseModelVersion",
     "parseResourceModel",
     "probeProviderModels",
+    "proxyCanonicalContext",
+    "proxyTerminalError",
     "proposedPatchPaths",
     "provisionBrokeredAgentDir",
     "readCurrencyCache",

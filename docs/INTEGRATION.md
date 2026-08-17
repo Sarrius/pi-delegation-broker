@@ -40,6 +40,14 @@ Hermes is a distinct integration: its review subprocess intentionally runs again
 
 Use an absolute path — Hermes normalizes with `resolve()` and does not expand a literal `~`. This lets the subprocess resolve the active alias and lets the multi-account extension perform its normal account-level failover. Do not set `llmModelOverride` to a stale route merely to conceal alias failures. A brokered child must not invoke `pi.setModel()` or auto-continue on its own. `ControllerAccountInventory` can consume a controller-injected registry snapshot only as `observed` inventory; it contains no credential and still requires signed-registry policy before admission.
 
+### Credentialless controller-provider proxy
+
+For a controller that has explicitly injected an approved `providerTransport + routeResolver` pair, `BrokeredLaunchResolver` can be constructed with `controllerProxy: { providerId: "broker-proxy" }` and **without** `provisionChildAuth`. It launches the leased resource's model through `extensions/controller-provider-proxy.ts`; the child gets only `PI_BROKER_SOCKET`, its lease-scoped capability and a non-secret model id. There is no child `auth.json`, upstream endpoint credential, OAuth token or parent agent directory.
+
+The proxy calls child-authorized `providerStream` over the owner-only Unix socket. Its first supported context subset is intentionally text-only and tool-free. A context with tools, tool results, images or replay state is rejected before controller dispatch; do not widen this adapter by dropping unsupported blocks. The controller remains responsible for immutable route snapshots, one physical dispatch, provider health classification and all retry/failover decisions. The parent Pi extension stays on scoped direct auth by default because no live controller route is authorized by package configuration.
+
+`test/controller-proxy-child.test.mjs` is an owner-gated E2E: a real Pi process runs the native `broker-proxy` provider against `ScriptedFakeProvider`; it asserts no child `auth.json` exists and response blocks arrive through controller IPC. A real provider route still requires the owner-gated process in [the provider route protocol](PROVIDER-PROXY-PROTOCOL.md), never ambient authentication.
+
 ## Controller provider route gate
 
 `ControllerCredentialStore` keeps exact API keys only in controller memory. `ControllerRouteTable` is an owner-only, credential-free JSON configuration that maps one signed resource to exactly one account/model/endpoint/opaque credential reference. `createApprovedAnthropicProviderRoute` requires a matching `ControllerLiveProviderApproval` with a bounded expiry/request count before it can dispatch. It exposes no account rotation, default route, ambient auth, SDK retry or failover. A real call still requires a separately authorized/pre-registered live experiment; mocked adversarial tests do not establish a live capability.

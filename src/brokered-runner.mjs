@@ -246,7 +246,7 @@ export class BrokeredChildRunner {
       }
       // The lease decides the model, not the request: the contract pins a capability class and
       // the broker picks a live resource inside it, which may not be the one predicted.
-      const launchModel = decision.resolvedModel ?? model;
+      const launchModel = decision.childModel ?? decision.resolvedModel ?? model;
       if (!launchModel?.provider || !launchModel?.modelId) throw new Error("Broker allowed a launch without a resolved model");
       const sessionsDir = join(this.#sessionsRoot, childId, "sessions");
 

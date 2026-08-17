@@ -6,6 +6,7 @@ import { requestBrokerIpc } from "./ipc.mjs";
 import { createLauncherAttestation } from "./launcher-attestation.mjs";
 
 const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
+const PROVIDER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 /** Total tokens a route consumed, or undefined when the transport reported no usage. */
 function tokensOf(usage) {
@@ -49,6 +50,7 @@ export class BrokeredLaunchResolver {
   #trackImmediateTasks;
   #resolveModelForResource;
   #provisionChildAuth;
+  #controllerProxy;
   #admissions = new Map();
 
   constructor({
@@ -63,6 +65,7 @@ export class BrokeredLaunchResolver {
     trackImmediateTasks = false,
     resolveModelForResource,
     provisionChildAuth,
+    controllerProxy,
   }) {
     if (typeof socketPath !== "string" || !isAbsolute(socketPath)) throw new Error("Broker launch resolver needs an absolute socketPath");
     if (typeof controllerToken !== "string" || controllerToken.length < 32) throw new Error("Broker launch resolver needs a controller-only token");
@@ -76,6 +79,13 @@ export class BrokeredLaunchResolver {
     }
     if (provisionChildAuth !== undefined && typeof provisionChildAuth !== "function") {
       throw new Error("Broker launch resolver provisionChildAuth must be a controller-owned function");
+    }
+    if (controllerProxy !== undefined && (!controllerProxy || typeof controllerProxy !== "object"
+      || typeof controllerProxy.providerId !== "string" || !PROVIDER_ID.test(controllerProxy.providerId))) {
+      throw new Error("controllerProxy requires a bounded providerId");
+    }
+    if (controllerProxy !== undefined && provisionChildAuth !== undefined) {
+      throw new Error("controllerProxy and provisionChildAuth are mutually exclusive");
     }
     if (queuedTaskVerifier !== undefined && typeof queuedTaskVerifier.verifyAndFinalize !== "function") {
       throw new Error("Broker launch resolver queuedTaskVerifier must be a controller-owned verifier coordinator");
@@ -105,6 +115,7 @@ export class BrokeredLaunchResolver {
     this.#trackImmediateTasks = trackImmediateTasks;
     this.#resolveModelForResource = resolveModelForResource;
     this.#provisionChildAuth = provisionChildAuth;
+    this.#controllerProxy = controllerProxy === undefined ? undefined : Object.freeze({ providerId: controllerProxy.providerId });
   }
 
   /** Compatible with TrustedChildLaunchResolver; request has no raw prompt. */
@@ -180,6 +191,9 @@ export class BrokeredLaunchResolver {
           contract: selection.contract,
         });
       }
+      const childModel = this.#controllerProxy && resolvedModel?.modelId
+        ? Object.freeze({ provider: this.#controllerProxy.providerId, modelId: resolvedModel.modelId })
+        : resolvedModel;
       const capability = createEffectiveChildCapability({
         schemaVersion: 1,
         taskId: lease.taskId,
@@ -239,6 +253,9 @@ export class BrokeredLaunchResolver {
         ...(resolvedModel?.provider && resolvedModel?.modelId
           ? { resolvedModel: Object.freeze({ provider: resolvedModel.provider, modelId: resolvedModel.modelId }) }
           : {}),
+        ...(childModel?.provider && childModel?.modelId
+          ? { childModel: Object.freeze({ provider: childModel.provider, modelId: childModel.modelId }) }
+          : {}),
         policy: {
           policyId: lease.leaseId,
           agentDir,
@@ -261,6 +278,7 @@ export class BrokeredLaunchResolver {
             // child's provider request itself; without it a child asks for the model maximum
             // and a low-balance account rejects the whole attempt.
             ...(lease.maxOutputTokens === undefined ? {} : { PI_BROKER_MAX_OUTPUT_TOKENS: String(lease.maxOutputTokens) }),
+            ...(this.#controllerProxy && resolvedModel?.modelId ? { PI_BROKER_PROXY_MODEL_ID: resolvedModel.modelId } : {}),
           },
           onBeforeChildAbandoned: async () => this.releaseUnhanded(request.childId),
           onChildSessionOpened: async () => this.markChildHanded(request.childId),
