@@ -89,3 +89,11 @@ test("brokered runner releases semaphore when child spawn fails after resolver a
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("a spent plan allowance is an account fact, not the end of the task", () => {
+  // Observed live from the Codex CLI: no HTTP status, so an unclassified string would read as
+  // fatal and stop failover while other accounts were still healthy.
+  assert.equal(classifyChildFailure("Codex error: The usage limit has been reached"), "account_exhausted");
+  assert.equal(classifyChildFailure("Token Plan usage limit reached: Upgrade your Token Plan or purchase Credits for more usage."), "account_exhausted");
+  // A genuinely dead task must still be fatal: this must not swallow every unknown error.
+  assert.equal(classifyChildFailure("TypeError: cannot read properties of undefined"), "fatal");
+});

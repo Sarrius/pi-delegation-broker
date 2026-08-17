@@ -31,6 +31,10 @@ const FAILURE_SIGNATURES = Object.freeze([
   // Spent balance belongs to the whole account, not one of its models, so it cools the capacity
   // group like a throttle does and recovers through the broker's existing half-open probe.
   Object.freeze({ kind: "account_exhausted", pattern: /\b402\b|requires more credits|insufficient (credits|balance)|purchase credits|upgrade to a paid account|third-party apps now draw from your extra usage|claude\.ai\/settings\/usage/i }),
+  // A spent subscription/plan allowance reports no HTTP status through some CLIs ("Codex error:
+  // The usage limit has been reached"). Unclassified it reads as fatal and kills failover for a
+  // task that any other account could still finish.
+  Object.freeze({ kind: "account_exhausted", pattern: /usage limit (has been )?reached|plan usage limit|usage limit exceeded/i }),
   Object.freeze({ kind: "unavailable", pattern: /\b(50[0234]|service unavailable|bad gateway|upstream|connection (refused|reset)|econnrefused|etimedout|network)\b/i }),
 ]);
 
