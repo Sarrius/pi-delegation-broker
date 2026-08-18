@@ -65,6 +65,8 @@ import {
 
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
+// @ts-expect-error — resolved relative to this file's real location
+import { listReports, markReportRead, pruneReports, readReport, unreadReports, writeReport } from "../src/report-store.mjs";
 
 const EXTENSIONS_DIR = dirname(fileURLToPath(import.meta.url));
 const CHILD_SHIM_PATH = join(EXTENSIONS_DIR, "child-shim.ts");
@@ -76,6 +78,7 @@ const PREFERENCES_PATH = join(STATE_DIR, "preferences.json");
 const ENABLED_PATH = join(STATE_DIR, "enabled.json");
 const CURRENCY_CACHE_PATH = join(STATE_DIR, "currency-cache.json");
 const ROUTING_AUDIT_PATH = join(STATE_DIR, "routing-audit.json");
+const REPORTS_DIR = join(STATE_DIR, "reports");
 const REGISTRY_KEY_ID = "controller";
 const CURRENCY_REFRESH_MS = 15 * 60 * 1_000;
 const CURRENCY_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
@@ -103,6 +106,9 @@ const DELEGATE_PARAMS = Type.Object({
   })),
   tier: Type.Optional(StringEnum(["cheap", "standard", "frontier"] as const, {
     description: "Optional user task level. Omit for controller inference; frontier respects ~/.pi/agent/delegation-broker/preferences.json.",
+  })),
+  background: Type.Optional(Type.Boolean({
+    description: "Run without blocking: returns a task id immediately; the controller still verifies the result, and the verified report is read later with delegate_collect. Read-only tasks only — effect work (proposeChangesIn) stays synchronous.",
   })),
   acceptance: Type.Optional(Type.Array(Type.Object({
     id: Type.String({ description: "Stable controller check id." }),
@@ -421,6 +427,10 @@ export default function piDelegationBroker(pi: any) {
   let starting: Promise<BrokerRuntime> | undefined;
   let enabled = readEnabled();
   let counter = 0;
+  let lastCtx: any;
+  // Task ids already surfaced to the agent, so before_agent_start injects the unread-report
+  // notice only when something new settled — not the same list on every turn.
+  let notifiedUnread = new Set<string>();
 
   const ensureBroker = (): Promise<BrokerRuntime> => {
     if (runtime) return Promise.resolve(runtime);
@@ -430,8 +440,32 @@ export default function piDelegationBroker(pi: any) {
     return starting;
   };
 
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event: any, ctx: any) => {
+    lastCtx = ctx;
+    try { pruneReports(REPORTS_DIR); } catch { /* pruning is best effort */ }
     ensureBroker().catch(() => undefined);
+  });
+
+  // Surface newly settled background reports at the start of the next turn: the main agent
+  // keeps working while children run and learns their verified outcome here, not by polling.
+  pi.on("before_agent_start", async () => {
+    let unread;
+    try { unread = unreadReports(REPORTS_DIR); } catch { return; }
+    const fresh = unread.filter((report) => !notifiedUnread.has(report.taskId));
+    if (fresh.length === 0) {
+      if (unread.length === 0 && notifiedUnread.size > 0) notifiedUnread = new Set();
+      return;
+    }
+    notifiedUnread = new Set(unread.map((report) => report.taskId));
+    const lines = unread.slice(0, 10).map((report) =>
+      `${report.taskId}: ${report.status}${report.status === "failed" ? ` (${String(report.error ?? "").slice(0, 120)})` : ""}`);
+    return {
+      message: {
+        customType: "delegation-broker-reports",
+        content: `[delegation-broker] ${unread.length} background delegation report(s) ready:\n${lines.join("\n")}\nRead them with delegate_collect — no argument lists summaries, delegate_collect({ taskId }) returns the full controller-verified report.`,
+        display: false,
+      },
+    };
   });
 
   pi.on("session_shutdown", async () => {
@@ -534,7 +568,7 @@ export default function piDelegationBroker(pi: any) {
       "Write the delegate task as a complete brief: the child sees nothing of this conversation, so include file paths, context, and exactly what output you expect.",
     ],
     parameters: DELEGATE_PARAMS,
-    async execute(_toolCallId: string, params: { task: string; capabilities?: string[]; tier?: "cheap" | "standard" | "frontier"; acceptance?: Array<{ id: string; claim: string; argv: string[]; timeoutMs?: number }>; proposeChangesIn?: string }, _signal: AbortSignal, onUpdate: any, ctx: any) {
+    async execute(_toolCallId: string, params: { task: string; capabilities?: string[]; tier?: "cheap" | "standard" | "frontier"; background?: boolean; acceptance?: Array<{ id: string; claim: string; argv: string[]; timeoutMs?: number }>; proposeChangesIn?: string }, _signal: AbortSignal, onUpdate: any, ctx: any) {
       // An effect nobody can check is not delegable: without controller-owned checks the only
       // evidence a patch is good would be the child's own word for it.
       if (params.proposeChangesIn && !params.acceptance?.length) {
@@ -546,6 +580,7 @@ export default function piDelegationBroker(pi: any) {
       if (!enabled) {
         return { content: [{ type: "text", text: "Delegation broker is stopped. Run /delegation-broker start to allow new children." }], isError: true };
       }
+      lastCtx = ctx;
       let broker: BrokerRuntime;
       try {
         broker = await ensureBroker();
@@ -559,28 +594,94 @@ export default function piDelegationBroker(pi: any) {
       const childId = `delegate-${Date.now().toString(36)}-${++counter}`;
       const promptDigest = createHash("sha256").update(params.task).digest("hex");
       if (params.acceptance) broker.acceptancePlans.set(childId, params.acceptance.map((check) => ({ ...check, timeoutMs: check.timeoutMs ?? 30_000 })));
+      const runArgs = {
+        childId,
+        promptDigest,
+        // Preserve one logical controller task id across provider failover. The resolver
+        // tracks only the terminal successful attempt under this id, which finds this plan.
+        trackForVerification: Boolean(params.acceptance?.length && !params.proposeChangesIn),
+        cwd: params.proposeChangesIn ?? ctx.cwd,
+        ...(params.proposeChangesIn ? { isolation: "worktree" as const } : {}),
+        thinkingLevel: "off",
+        prompt: params.task,
+        capabilityRequest: {
+          taskId: childId,
+          taskDescription: params.task,
+          ...(params.proposeChangesIn ? { operationClass: "propose_patch" } : {}),
+          ...(params.capabilities?.length ? { requiredCapabilities: params.capabilities } : {}),
+          ...(params.tier ? { modelTier: params.tier } : {}),
+        },
+      };
+
+      if (params.background) {
+        // A background child writes files nobody reviews in-line, so effect work stays
+        // synchronous where the caller sees the verified patch before deciding anything.
+        if (params.proposeChangesIn) {
+          broker.acceptancePlans.delete(childId);
+          return {
+            content: [{ type: "text", text: "background mode cannot propose changes: effect work must stay synchronous so the caller sees the controller-verified patch." }],
+            isError: true,
+          };
+        }
+        const startedAt = Date.now();
+        void (async () => {
+          let result: any;
+          try {
+            result = await broker.runner.run(runArgs);
+          } catch (error) {
+            result = { status: "failed", error: (error as Error).message, route: [] };
+          } finally {
+            broker.acceptancePlans.delete(childId);
+          }
+          const route = (result.route ?? [])
+            .map((hop: any) => `${hop.outcome}${hop.resourceId ? ` ${hop.resourceId}` : ""}`)
+            .join(" → ");
+          const routeExplanation = explainRoute(result);
+          broker.lastRoute = { summary: routeExplanation, at: Date.now() };
+          try {
+            if (result.resource?.id && Array.isArray(result.route) && result.route.length > 0
+              && result.route.every((hop: any) => typeof hop.resourceId === "string")) {
+              broker.routingAudit.recordRoute({
+                status: result.status,
+                resourceId: result.resource.id,
+                selection: result.selection,
+                route: result.route,
+                usage: result.usage,
+              });
+            }
+          } catch { /* audit storage must never change task completion semantics */ }
+          try {
+            writeReport(REPORTS_DIR, {
+              taskId: childId,
+              status: result.status === "completed" ? "completed" : "failed",
+              task: params.task.slice(0, 2000),
+              ...(result.status === "completed" ? { text: result.text } : { error: result.error ?? "unknown error" }),
+              route,
+              routeExplanation,
+              ...(result.verification?.outcome?.status ? { verificationStatus: String(result.verification.outcome.status) } : {}),
+              startedAt,
+              completedAt: Date.now(),
+            });
+            lastCtx?.ui?.notify?.(
+              `Delegation report ready: ${childId} (${result.status}). Read it with delegate_collect.`,
+              result.status === "completed" ? "info" : "warning",
+            );
+          } catch { /* a report write failure must never crash a settled background run */ }
+        })().catch(() => undefined);
+        return {
+          content: [{
+            type: "text",
+            text: `Background delegation started: ${childId}. Keep working — the controller verifies the child result on its own; the verified report is read later with delegate_collect (called with no argument to list, or with taskId \"${childId}\" for the full report).`,
+          }],
+          details: { taskId: childId, background: true },
+        };
+      }
+
       onUpdate?.({ content: [{ type: "text", text: "Selecting model and spawning child…" }] });
 
       let result: any;
       try {
-        result = await broker.runner.run({
-          childId,
-          promptDigest,
-          // Preserve one logical controller task id across provider failover. The resolver
-          // tracks only the terminal successful attempt under this id, which finds this plan.
-          trackForVerification: Boolean(params.acceptance?.length && !params.proposeChangesIn),
-          cwd: params.proposeChangesIn ?? ctx.cwd,
-          ...(params.proposeChangesIn ? { isolation: "worktree" as const } : {}),
-          thinkingLevel: "off",
-          prompt: params.task,
-          capabilityRequest: {
-            taskId: childId,
-            taskDescription: params.task,
-            ...(params.proposeChangesIn ? { operationClass: "propose_patch" } : {}),
-            ...(params.capabilities?.length ? { requiredCapabilities: params.capabilities } : {}),
-            ...(params.tier ? { modelTier: params.tier } : {}),
-          },
-        });
+        result = await broker.runner.run(runArgs);
       } finally {
         broker.acceptancePlans.delete(childId);
       }
@@ -645,6 +746,56 @@ export default function piDelegationBroker(pi: any) {
         }],
         isError: true,
         details: { route, routeExplanation },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_collect",
+    label: "Collect delegation reports",
+    description:
+      "Read controller-verified reports from background delegate runs. "
+      + "Called with no argument it lists unread reports (task id, status, failure cause); called with a taskId it returns the full verified report and marks it read. "
+      + "Reports are written only after the run settled and the controller verified the result, so a listed report is always final.",
+    promptSnippet: "Read verified reports from background delegations",
+    promptGuidelines: [
+      "When a turn announces ready delegation reports, call delegate_collect with no argument to see them, then with a taskId for the full text of the ones that matter.",
+      "A failed report states its route and cause; do not retry the same task blindly on the same exhausted account family.",
+    ],
+    parameters: Type.Object({
+      taskId: Type.Optional(Type.String({ description: "Background task id returned by delegate with background: true. Omit to list unread reports." })),
+    }),
+    async execute(_toolCallId: string, params: { taskId?: string }, _signal: AbortSignal) {
+      if (!params.taskId) {
+        const unread = unreadReports(REPORTS_DIR);
+        if (unread.length === 0) {
+          return { content: [{ type: "text", text: "No unread delegation reports." }] };
+        }
+        const lines = unread.map((report) => {
+          const age = Math.max(0, Date.now() - report.completedAt);
+          const detail = report.status === "failed" ? ` — ${String(report.error ?? "").slice(0, 160)}` : "";
+          return `${report.taskId}  ${report.status}  ${Math.round(age / 1000)}s ago${detail}\n    task: ${report.task.slice(0, 160)}`;
+        });
+        return {
+          content: [{ type: "text", text: `${unread.length} unread delegation report(s):\n${lines.join("\n")}\n\nCall delegate_collect({ taskId }) for a full report.` }],
+          details: { unread: unread.map((report) => ({ taskId: report.taskId, status: report.status })) },
+        };
+      }
+      const report = readReport(REPORTS_DIR, params.taskId);
+      if (!report) {
+        return { content: [{ type: "text", text: `No delegation report ${params.taskId}. Call delegate_collect with no argument to list unread reports.` }], isError: true };
+      }
+      markReportRead(REPORTS_DIR, params.taskId);
+      const header = [
+        `${report.taskId}: ${report.status}`,
+        report.verificationStatus ? `verification: ${report.verificationStatus}` : undefined,
+        report.route ? `route: ${report.route}` : undefined,
+        report.routeExplanation ? `selection: ${report.routeExplanation}` : undefined,
+      ].filter(Boolean).join("\n");
+      const body = report.status === "completed" ? report.text : `Error: ${report.error}`;
+      return {
+        content: [{ type: "text", text: `${header}\n\n${body}` }],
+        details: report,
       };
     },
   });
