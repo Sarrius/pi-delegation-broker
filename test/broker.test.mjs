@@ -173,8 +173,11 @@ test("ready work is claimed against the exact contract and only a controller ver
     assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["claimed"]);
     assert.equal(broker.claimReadyTask("claim-task", ready.lease.leaseId, contract, 1_003).status, "denied_policy");
 
+    // The child releases its own lease on exit; only the controller's close path may then move
+    // the task toward verification — a bare release is capacity bookkeeping, not a result.
     broker.release(claimed.lease.leaseId, claimed.lease.fencingToken, "child provider shutdown", 1_004);
-    assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["awaiting_result"]);
+    assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["claimed"]);
+    assert.equal(broker.releaseClaimedTaskForVerification("claim-task", claimed.lease.leaseId, claimed.lease.fencingToken, 1_004).status, "awaiting_verification");
     assert.equal(broker.finalizeVerifiedTask("claim-task", claimed.lease.leaseId, claimed.lease.fencingToken, {
       status: "accepted", verifierRunId: "forged-controller-shape",
       evidenceRefs: ["controller:11111111-1111-4111-8111-111111111111"],
@@ -215,12 +218,13 @@ test("a claimed child release without a parent result escalates at the task dead
     const [ready] = broker.dispatchPending(1_002);
     const claimed = broker.claimReadyTask(contract.taskId, ready.lease.leaseId, contract, 1_003);
     broker.release(claimed.lease.leaseId, claimed.lease.fencingToken, "child provider shutdown", 1_004);
-    assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["awaiting_result"]);
+    assert.deepEqual(broker.pendingTasks().map((task) => task.state), ["claimed"],
+      "a child that released without a close is an orphan, not a result awaiting verification");
     broker.dispatchPending(2_000);
     assert.deepEqual(broker.pendingTasks().map((task) => ({ state: task.state, owner: task.recoveryOwner })), [
       { state: "escalated", owner: "result-owner" },
     ]);
-    assert.equal(broker.events().at(-1).payload.reason, "result_reconciliation_deadline");
+    assert.equal(broker.events().at(-1).payload.reason, "claimed_child_deadline");
   }, registry);
 });
 
@@ -711,4 +715,25 @@ test("a controller with no receipt authority says so instead of denying opaquely
   }, 1_000);
   assert.equal(denied.status, "denied_verification");
   assert.equal(denied.reason, "no_receipt_authority");
+}));
+
+test("a failed child that releases its own lease leaves the task requeueable for the next route", () => withBroker((broker) => {
+  // The exact live sequence: attempt 1's child fails and self-releases, then attempt 2 must be
+  // able to rebind the same logical task instead of finding it stranded in awaiting_result.
+  const contract = fixtureContract({ taskId: "relay" });
+  const first = broker.reserve(contract, 1_000);
+  assert.equal(broker.trackLeasedTask(contract, first.lease.leaseId, first.lease.fencingToken, 1_001).status, "tracked");
+  broker.release(first.lease.leaseId, first.lease.fencingToken, "child release", 1_002);
+  assert.equal(broker.pendingTasks().find((t) => t.taskId === "relay").state, "claimed",
+    "a failed child's lease release must not pretend its result is ready for verification");
+  assert.equal(broker.abandonClaimedTask("relay", first.lease.leaseId, first.lease.fencingToken, 1_003).status, "waiting");
+
+  const second = broker.reserve(contract, 1_004);
+  assert.equal(second.status, "leased");
+  assert.equal(broker.trackLeasedTask(contract, second.lease.leaseId, second.lease.fencingToken, 1_005).status, "tracked",
+    "the same logical task rebinds to the next attempt's lease");
+  // The second child completes and also self-releases before the controller closes it.
+  broker.release(second.lease.leaseId, second.lease.fencingToken, "child release", 1_006);
+  assert.equal(broker.releaseClaimedTaskForVerification("relay", second.lease.leaseId, second.lease.fencingToken, 1_007).status,
+    "awaiting_verification", "completion is verified even though the child released first");
 }));

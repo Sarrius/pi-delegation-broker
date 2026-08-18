@@ -213,12 +213,29 @@ export class SqliteLeaseBroker {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) throw new Error("dispatch limit must be between 1 and 1000");
     return this.#transaction(() => {
       this.#expire(now);
-      const overdue = this.#db.prepare("SELECT task_id, recovery_owner, state FROM pending_tasks WHERE state IN ('waiting', 'awaiting_result') AND deadline_at <= ?").all(now);
-      this.#db.prepare("UPDATE pending_tasks SET state = 'escalated', updated_at = ?, eligible_at = NULL WHERE state IN ('waiting', 'awaiting_result') AND deadline_at <= ?").run(now, now);
+      // Orphaned claimed tasks escalate too: a claimed task whose lease row is gone belongs to
+      // a child that has definitively exited (release deletes the row on any exit, success or
+      // failure). A live lease past deadline is still working and is left alone.
+      const overdue = this.#db.prepare(`
+        SELECT p.task_id, p.recovery_owner, p.state FROM pending_tasks p
+        WHERE p.deadline_at <= ? AND (
+          p.state IN ('waiting', 'awaiting_result')
+          OR (p.state = 'claimed' AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.lease_id = p.lease_id))
+        )
+      `).all(now);
+      this.#db.prepare(`
+        UPDATE pending_tasks SET state = 'escalated', updated_at = ?, eligible_at = NULL
+        WHERE deadline_at <= ? AND (
+          state IN ('waiting', 'awaiting_result')
+          OR (state = 'claimed' AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.lease_id = pending_tasks.lease_id))
+        )
+      `).run(now, now);
       for (const task of overdue) this.#record(now, "TaskEscalated", {
         taskId: task.task_id,
         recoveryOwner: task.recovery_owner,
-        reason: task.state === "awaiting_result" ? "result_reconciliation_deadline" : "capacity_wait_deadline",
+        reason: task.state === "awaiting_result" ? "result_reconciliation_deadline"
+          : task.state === "claimed" ? "claimed_child_deadline"
+          : "capacity_wait_deadline",
       });
 
       const eligible = this.#db.prepare(`
@@ -395,9 +412,10 @@ export class SqliteLeaseBroker {
       if (lease) {
         this.#db.prepare("DELETE FROM leases WHERE lease_id = ?").run(leaseId);
         this.#afterLeaseRemoved(lease, now);
-      } else if (pending.state === "claimed") {
-        return { status: "denied_lease" };
       }
+      // A missing lease row is the NORMAL case, not an error: the child releases its own lease
+      // when its session ends, which is exactly what proves it can no longer be running. Only a
+      // task whose lease still exists would need the controller-forced delete above.
       this.#db.prepare("UPDATE pending_tasks SET state = 'awaiting_result', updated_at = ? WHERE task_id = ? AND lease_id = ? AND state IN ('claimed', 'awaiting_result')")
         .run(now, taskId, leaseId);
       this.#record(now, "TaskAwaitingVerification", { taskId, leaseId, fencingToken });
@@ -649,10 +667,10 @@ export class SqliteLeaseBroker {
       if (!lease) return { status: "denied_lease" };
       this.#db.prepare("DELETE FROM leases WHERE lease_id = ?").run(leaseId);
       this.#afterLeaseRemoved(lease, now);
-      this.#db.prepare(`
-        UPDATE pending_tasks SET state = 'awaiting_result', updated_at = ?
-        WHERE lease_id = ? AND state = 'claimed'
-      `).run(now, leaseId);
+      // A bare lease release must NOT move the task: a failed child releases its lease on exit
+      // exactly like a completed one, and only the resolver knows which it was. Moving claimed
+      // to awaiting_result here strands a failed task where the abandon/requeue path can no
+      // longer find it, and the next failover attempt can no longer rebind it.
       this.#record(now, "LeaseReleased", { leaseId, fencingToken, reason });
       return { status: "released" };
     });
