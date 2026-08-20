@@ -101,6 +101,17 @@ test("backward wall-clock steps fail closed instead of extending an old capabili
   assert.equal(broker.leases()[0].expiresAt, lease.expiresAt);
 }));
 
+test("heartbeat keeps the IPC capability authorized past the original lease expiry", () => withBroker((broker) => {
+  const lease = leased(broker, fixtureContract({ taskId: "cap-ttl", leaseTtlMs: 1_000 }), 1_000);
+  const issued = broker.issueLeaseCapability(lease.leaseId, lease.fencingToken, 1_000);
+  assert.equal(issued.status, "issued");
+  assert.equal(broker.leaseForCapability(issued.capability, 1_500).status, "authorized");
+  assert.equal(broker.heartbeat(lease.leaseId, lease.fencingToken, 1_800, 5_000).status, "leased");
+  // Original capability snapshot expired at 2_000. A child that heartbeated at 1_800 must
+  // still be able to declare a tool at 2_500 — otherwise the lease looks alive and IPC is dead.
+  assert.equal(broker.leaseForCapability(issued.capability, 2_500).status, "authorized");
+}));
+
 test("expiry plus monotonic fencing prevents stale workers from authorizing an effect", () => withBroker((broker) => {
   const first = leased(broker, fixtureContract({ leaseTtlMs: 5 }));
   assert.deepEqual(broker.expire(1_005), [first.leaseId]);

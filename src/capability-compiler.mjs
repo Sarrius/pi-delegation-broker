@@ -13,6 +13,23 @@ const ADMISSION_CLASSES = Object.freeze(new Set(["control", "verify", "work"]));
 const EFFECT_CAPABLE = Object.freeze(new Set(["propose_patch", "apply", "external_write"]));
 const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const HEX64 = /^[a-f0-9]{64}$/;
+const MCP_PI_PREFIX = "mcp_pi_";
+
+/**
+ * Isolated children see unprefixed Pi tools (`read`). Parent sessions often see the same
+ * tools as `mcp_pi_read`. A child that declares the prefixed name for an allowed tool is
+ * asking for that tool, not for a different one.
+ */
+export function canonicalDeclaredToolName(toolName, allowedTools) {
+  if (typeof toolName !== "string" || !toolName) return toolName;
+  const allowed = allowedTools instanceof Set ? allowedTools : new Set(Array.isArray(allowedTools) ? allowedTools : []);
+  if (allowed.has(toolName)) return toolName;
+  if (toolName.startsWith(MCP_PI_PREFIX)) {
+    const inner = toolName.slice(MCP_PI_PREFIX.length);
+    if (inner && allowed.has(inner)) return inner;
+  }
+  return toolName;
+}
 const CAPABILITY_FIELDS = [
   "schemaVersion", "taskId", "operationClass", "admissionClass", "doneWhen",
   "allowedTools", "profileSupports", "budget", "latencyBudgetMs", "leaseTtlMs",
@@ -136,6 +153,7 @@ export function compileEffectiveChildCapability(cap) {
     `operation_class: ${cap.operationClass}`,
     `admission_class: ${cap.admissionClass}`,
     `allowed_tools: ${cap.allowedTools.join(", ")}`,
+    "Declare and invoke those tools by the names above, never the mcp_pi_ prefix.",
     `done_when:`,
     ...cap.doneWhen.map((c) => `  - ${c}`),
     `latency_budget_ms: ${cap.latencyBudgetMs}`,

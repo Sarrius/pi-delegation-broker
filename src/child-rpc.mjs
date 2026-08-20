@@ -7,6 +7,11 @@ const RPC_FRAME_TYPE_PREFIX_CHARS = 256;
 const MAX_DISCARDED_FRAME_CHARS = 512 * 1024 * 1024;
 const SETTLE_AFTER_EXIT_MS = 250;
 
+function observeRejection(promise) {
+  promise.catch(() => undefined);
+  return promise;
+}
+
 export class RpcChannelClosedError extends Error {
   constructor(message, options) {
     super(message, options);
@@ -64,7 +69,11 @@ export function spawnChildRpc(command, options) {
 
   child.stdout.on("data", (chunk) => {
     if (channelFailure !== undefined) return;
-    drainStdoutLines(stdoutDecoder.write(chunk));
+    try {
+      drainStdoutLines(stdoutDecoder.write(chunk));
+    } catch (error) {
+      failChannel({ code: null, signal: null }, `Child RPC stdout handler failed: ${error.message}`);
+    }
   });
 
   function drainStdoutLines(decoded = "", endOfStream = false) {
@@ -203,7 +212,11 @@ export function spawnChildRpc(command, options) {
     }
   });
   child.on("close", (code, signal) => {
-    drainStdoutLines(stdoutDecoder.end(), true);
+    try {
+      drainStdoutLines(stdoutDecoder.end(), true);
+    } catch (error) {
+      failChannel({ code: null, signal: null }, `Child RPC stdout close handler failed: ${error.message}`);
+    }
     settleChannel(exitInfo ?? { code, signal });
   });
   child.on("error", (error) => failChannel({ code: null, signal: null }, `child spawn error: ${error.message}`));
@@ -211,9 +224,9 @@ export function spawnChildRpc(command, options) {
 
   return Object.freeze({
     request(command, requestOptions = {}) {
-      if (channelFailure !== undefined) return Promise.reject(channelFailure);
+      if (channelFailure !== undefined) return observeRejection(Promise.reject(channelFailure));
       const id = `req-${++requestId}`;
-      return new Promise((resolve, reject) => {
+      const promise = new Promise((resolve, reject) => {
         const entry = { command: command.type, resolve, reject, onResponse: requestOptions.onResponse };
         if (requestOptions.timeoutMs !== undefined) {
           entry.timer = setTimeout(() => {
@@ -228,6 +241,11 @@ export function spawnChildRpc(command, options) {
           failChannel({ code: null, signal: null }, `Child RPC request write failed: ${error.message}`);
         });
       });
+      // stdout can reject this from the I/O callback before the caller attaches `await`.
+      // Node then converts unhandledRejection into uncaughtException and Pi's interactive
+      // session exits (“No API key found for cursor”). A sink here does not swallow the
+      // rejection for an actual awaiter — both handlers fire.
+      return observeRejection(promise);
     },
     send(message) {
       if (channelFailure !== undefined) return;

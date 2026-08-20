@@ -336,6 +336,41 @@ test("controller resolver denies a model mismatch before reservation and capacit
   }
 });
 
+test("denied_capacity on a full group retries on the next allow-listed account", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-cap-retry-"));
+  const supervisor = signedSupervisor(root);
+  try {
+    await supervisor.start();
+    const high = {
+      minimumProfile: "reasoning-high/v1",
+      required: ["code_reasoning", "repo_navigation"],
+      downgradePolicy: "forbid",
+    };
+    const resolver = resolverFor(supervisor, root, (input) => {
+      const excluded = new Set(input.capabilityRequest?.excludeResources ?? []);
+      const allowedResources = excluded.has("R1") ? ["R2"] : ["R1"];
+      return {
+        expectedModel: MODEL,
+        contract: fixtureContract({
+          taskId: `task-${input.childId}`,
+          capability: { ...high, allowedResources },
+        }),
+      };
+    });
+    const first = await resolver.resolve(request("child_slot"));
+    assert.equal(first.action, "allow");
+    const second = await resolver.resolve(request("child_teammate"));
+    assert.equal(second.action, "allow");
+    const leases = supervisor.auditSnapshot().leases.map((lease) => lease.resourceId).sort();
+    assert.deepEqual(leases, ["R1", "R2"]);
+    await first.policy.onBeforeChildAbandoned("test_cleanup");
+    await second.policy.onBeforeChildAbandoned("test_cleanup");
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("resolver adds a pinned final-extension attestation when controller configuration supplies every reviewed digest", async () => {
   const root = mkdtempSync(join(tmpdir(), "br-attest-"));
   const supervisor = signedSupervisor(root);

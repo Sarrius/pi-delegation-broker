@@ -302,9 +302,20 @@ export class SingleHostBrokerSupervisor {
       descriptor = openSync(lockPath, "wx", 0o600);
     } catch (error) {
       if (error && typeof error === "object" && error.code === "EEXIST") {
-        throw new Error("Broker stateDir is already locked or has a stale lock; manual recovery is required");
+        // A lock whose recorded owner pid no longer exists is debris from a killed host,
+        // not a running broker: refuse anything else, reclaim only that.
+        this.#reclaimProvablyStaleLock(lockPath);
+        try {
+          descriptor = openSync(lockPath, "wx", 0o600);
+        } catch (retryError) {
+          if (retryError && typeof retryError === "object" && retryError.code === "EEXIST") {
+            throw new Error("Broker stateDir is already locked or has a stale lock; manual recovery is required");
+          }
+          throw retryError;
+        }
+      } else {
+        throw error;
       }
-      throw error;
     }
     try {
       writeFileSync(descriptor, `${JSON.stringify({ instanceId: this.#instanceId, pid: process.pid, startedAt: Date.now() })}\n`);
@@ -313,6 +324,36 @@ export class SingleHostBrokerSupervisor {
       closeSync(descriptor);
     }
     hardenFile(lockPath);
+  }
+
+  /**
+   * Remove the lock only when it is parseable and its recorded pid is provably dead.
+   * A live or foreign-owned pid (EPERM) and unreadable contents stay fail-closed: pid
+   * reuse can produce a false "stale" never a false "alive", so this errs toward manual
+   * recovery whenever the lock cannot prove its owner is gone.
+   */
+  #reclaimProvablyStaleLock(lockPath) {
+    let parsed;
+    try { parsed = JSON.parse(readFileSync(lockPath, "utf8")); } catch {
+      throw new Error("Broker stateDir is already locked or has a stale lock; manual recovery is required");
+    }
+    const pid = parsed?.pid;
+    if (!Number.isInteger(pid) || pid <= 0) {
+      throw new Error("Broker stateDir is already locked or has a stale lock; manual recovery is required");
+    }
+    try {
+      process.kill(pid, 0);
+      throw new Error(`Broker stateDir is already locked by running broker pid ${pid}`);
+    } catch (error) {
+      if (error && typeof error === "object" && error.code === "ESRCH") {
+        rmSync(lockPath);
+        return;
+      }
+      if (error && typeof error === "object" && error.code === "EPERM") {
+        throw new Error(`Broker stateDir is already locked by running broker pid ${pid}`);
+      }
+      throw error;
+    }
   }
 
   #releaseOwnLock() {

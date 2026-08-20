@@ -12,6 +12,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { captureLosslessJson } from "../src/lossless-json.mjs";
 import { requestBrokerIpc } from "../src/ipc.mjs";
+import { canonicalDeclaredToolName } from "../src/capability-compiler.mjs";
 
 const DECLARATION_TOOL = "broker_declare_action";
 const MAX_RESULT_BYTES = 128 * 1024;
@@ -106,11 +107,12 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params) {
       if (!runtime || runtime.failed) throw new Error("broker behavioral monitor is unavailable");
       if (runtime.pending) throw new Error("execute or resolve the already declared action before declaring another");
-      if (!runtime.capability.allowedTools.includes(params.toolName)) throw new Error("declared tool is outside the broker capability");
+      const toolName = canonicalDeclaredToolName(params.toolName, runtime.capability.allowedTools);
+      if (!runtime.capability.allowedTools.includes(toolName)) throw new Error("declared tool is outside the broker capability");
       const captured = captureLosslessJson(params.args, { maxBytes: 256 * 1024, maxDepth: 32, maxNodes: 10_000 });
       const stepId = `step-${++runtime.step}`;
       const result = await controller<{ status?: string; actionHash?: string }>("declareBehavioralAction", {
-        stepId, toolName: params.toolName, args: captured.value,
+        stepId, toolName, args: captured.value,
       });
       if (result.status !== "declared") throw new Error("controller rejected behavioral declaration");
       runtime.pending = { stepId, toolName: params.toolName, args: captured.value };
@@ -137,11 +139,13 @@ export default function (pi: ExtensionAPI) {
       pi.setActiveTools([...pi.getActiveTools(), DECLARATION_TOOL]);
     }
     const heartbeatMs = Math.max(500, Math.min(30_000, Math.floor(loaded.capability.leaseTtlMs / 2)));
-    runtime.heartbeat = setInterval(() => {
+    const beat = () => {
       void controller("heartbeat", { ttlMs: Math.max(1_000, Math.min(60_000, heartbeatMs * 2)) }).catch(() => {
         if (runtime) runtime.failed = "controller lease heartbeat failed";
       });
-    }, heartbeatMs);
+    };
+    beat();
+    runtime.heartbeat = setInterval(beat, heartbeatMs);
     runtime.heartbeat.unref?.();
   });
 

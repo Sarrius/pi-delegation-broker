@@ -122,42 +122,68 @@ export class BrokeredLaunchResolver {
   async resolve(request) {
     if (!request || !CHILD_ID.test(request.childId ?? "")) throw new Error("Broker launch request has an invalid childId");
     if (this.#admissions.has(request.childId)) return { action: "deny", reason: "duplicate child admission" };
-    const selection = await this.#selectContract(Object.freeze({ ...request }));
-    if (selection?.action === "deny") return { action: "deny", reason: safeReason(selection.reason) };
-    if (!selection?.contract) throw new Error("Broker launch selection did not return a contract");
-    if (["propose_patch", "apply", "external_write"].includes(selection.contract.operationClass) && !this.#launcherAttestationConfig) {
-      return { action: "deny", reason: "effect capable brokered launch requires pinned extension attestation" };
-    }
-    if (selection.contract.promptDigest !== request.promptDigest) {
-      return { action: "deny", reason: "child prompt is not bound to the selected broker contract" };
-    }
-    const expected = expectedModel(selection);
-    // An explicit request model is a manual override and must match the selection exactly.
-    // An absent model means the controller's selector decides: the contract pins a capability
-    // class, the broker leases a live resource inside it, and resolvedModel (below) reports
-    // what the child will actually run. Denying here would make auto-selection impossible.
-    if (request.model !== undefined
-      && (request.model.provider !== expected.provider || request.model.modelId !== expected.modelId)) {
-      return { action: "deny", reason: "resolved model is not approved for this broker contract" };
-    }
 
-    let queuedTaskId;
+    // A full capacity group is not "no compatible resource". The selector's first allow-list
+    // is often one account (Cursor); a teammate already holding that slot must land elsewhere.
+    // Narrow the allow-list and select again instead of failing the whole launch.
+    const excludeResources = [...(Array.isArray(request.capabilityRequest?.excludeResources)
+      ? request.capabilityRequest.excludeResources : [])];
+    let selection;
     let reservation;
-    if (selection.readyTask !== undefined) {
-      if (!selection.readyTask || selection.readyTask.taskId !== selection.contract.taskId
-        || typeof selection.readyTask.leaseId !== "string" || !selection.readyTask.leaseId) {
-        return { action: "deny", reason: "ready task selection does not match broker contract" };
+    let queuedTaskId;
+    for (let attempt = 1; ; attempt++) {
+      selection = await this.#selectContract(Object.freeze({
+        ...request,
+        capabilityRequest: Object.freeze({
+          ...(request.capabilityRequest ?? {}),
+          ...(excludeResources.length > 0 ? { excludeResources: Object.freeze([...excludeResources]) } : {}),
+        }),
+      }));
+      if (selection?.action === "deny") return { action: "deny", reason: safeReason(selection.reason) };
+      if (!selection?.contract) throw new Error("Broker launch selection did not return a contract");
+      if (["propose_patch", "apply", "external_write"].includes(selection.contract.operationClass) && !this.#launcherAttestationConfig) {
+        return { action: "deny", reason: "effect capable brokered launch requires pinned extension attestation" };
       }
-      queuedTaskId = selection.readyTask.taskId;
-      reservation = await this.#controller("claimReadyTask", {
-        taskId: queuedTaskId,
-        leaseId: selection.readyTask.leaseId,
-        contract: selection.contract,
-      });
-    } else {
-      reservation = await this.#controller("reserve", { contract: selection.contract });
+      if (selection.contract.promptDigest !== request.promptDigest) {
+        return { action: "deny", reason: "child prompt is not bound to the selected broker contract" };
+      }
+      const expected = expectedModel(selection);
+      // An explicit request model is a manual override and must match the selection exactly.
+      // An absent model means the controller's selector decides: the contract pins a capability
+      // class, the broker leases a live resource inside it, and resolvedModel (below) reports
+      // what the child will actually run. Denying here would make auto-selection impossible.
+      if (request.model !== undefined
+        && (request.model.provider !== expected.provider || request.model.modelId !== expected.modelId)) {
+        return { action: "deny", reason: "resolved model is not approved for this broker contract" };
+      }
+
+      queuedTaskId = undefined;
+      if (selection.readyTask !== undefined) {
+        if (!selection.readyTask || selection.readyTask.taskId !== selection.contract.taskId
+          || typeof selection.readyTask.leaseId !== "string" || !selection.readyTask.leaseId) {
+          return { action: "deny", reason: "ready task selection does not match broker contract" };
+        }
+        queuedTaskId = selection.readyTask.taskId;
+        reservation = await this.#controller("claimReadyTask", {
+          taskId: queuedTaskId,
+          leaseId: selection.readyTask.leaseId,
+          contract: selection.contract,
+        });
+      } else {
+        reservation = await this.#controller("reserve", { contract: selection.contract });
+      }
+      if (reservation?.status === "leased") break;
+
+      const blocked = selection.contract.capability?.allowedResources;
+      const canNarrow = reservation?.status === "denied_capacity"
+        && Array.isArray(blocked) && blocked.length > 0
+        && attempt < 4
+        && blocked.some((id) => typeof id === "string" && !excludeResources.includes(id));
+      if (!canNarrow) {
+        return { action: "deny", reason: reservation?.status === "denied_capacity" ? "no compatible broker capacity" : "broker policy denied launch" };
+      }
+      for (const id of blocked) if (typeof id === "string" && !excludeResources.includes(id)) excludeResources.push(id);
     }
-    if (reservation?.status !== "leased") return { action: "deny", reason: reservation?.status === "denied_capacity" ? "no compatible broker capacity" : "broker policy denied launch" };
     const lease = reservation.lease;
     if (queuedTaskId === undefined && this.#trackImmediateTasks && selection.trackImmediateTask === true) {
       const tracked = await this.#controller("trackLeasedTask", {

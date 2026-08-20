@@ -152,3 +152,101 @@ test("baseProviderFor strips only the account suffix", () => {
   assert.equal(baseProviderFor("openai-codex"), "openai-codex");
   assert.equal(baseProviderFor("zai"), "zai");
 });
+
+test("cursor oauth is materialized as the proxy API key a bare Pi child can use", () => {
+  const parent = parentDir({
+    "auth.json": {
+      cursor: { type: "oauth", access: "tok-cursor", refresh: "ref-cursor", expires: 9_999_999_999 },
+    },
+    "models.json": {
+      providers: {
+        cursor: {
+          api: "openai-completions",
+          baseUrl: "http://127.0.0.1:54240/v1",
+          models: [MODEL("cursor-grok-4.6", "cursor")],
+        },
+      },
+    },
+  });
+  const child = childDir();
+  try {
+    const summary = writeScopedChildAuth({ agentDir: child, provider: "cursor", parentAgentDir: parent });
+    assert.equal(summary.credentialType, "api_key");
+    assert.equal(summary.modelsSource, "config");
+    const auth = JSON.parse(readFileSync(join(child, "auth.json"), "utf8"));
+    assert.deepEqual(auth.cursor, { type: "api_key", key: "tok-cursor" });
+    const config = JSON.parse(readFileSync(join(child, "models.json"), "utf8"));
+    assert.equal(config.providers.cursor.baseUrl, "http://127.0.0.1:54240/v1");
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+    rmSync(child, { recursive: true, force: true });
+  }
+});
+
+test("cursor-account-N oauth materializes under canonical cursor with that account's access token", () => {
+  const parent = parentDir({
+    "auth.json": {
+      cursor: { type: "oauth", access: "tok-base", refresh: "ref-base", expires: 1 },
+      "cursor-account-2": { type: "oauth", access: "tok-slot-2", refresh: "ref-slot-2", expires: 1 },
+    },
+    "models.json": {
+      providers: {
+        cursor: { api: "openai-completions", baseUrl: "http://127.0.0.1:54240/v1", models: [MODEL("cursor-grok-4.6", "cursor")] },
+        "cursor-account-2": { api: "openai-completions", baseUrl: "http://127.0.0.1:54240/v1", models: [MODEL("cursor-grok-4.6", "cursor-account-2")] },
+      },
+    },
+  });
+  const child = childDir();
+  try {
+    const summary = writeScopedChildAuth({ agentDir: child, provider: "cursor-account-2", parentAgentDir: parent });
+    assert.equal(summary.provider, "cursor-account-2");
+    assert.equal(summary.runtimeProvider, "cursor");
+    assert.equal(summary.credentialType, "api_key");
+    const auth = JSON.parse(readFileSync(join(child, "auth.json"), "utf8"));
+    assert.deepEqual(Object.keys(auth), ["cursor"]);
+    assert.deepEqual(auth.cursor, { type: "api_key", key: "tok-slot-2" }, "the leased slot's token, not the base account's");
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+    rmSync(child, { recursive: true, force: true });
+  }
+});
+
+test("cursor oauth without an access token fails closed before anything is written", () => {
+  const parent = parentDir({
+    "auth.json": { cursor: { type: "oauth", refresh: "ref-only", expires: 1 } },
+  });
+  const child = childDir();
+  try {
+    assert.throws(
+      () => writeScopedChildAuth({ agentDir: child, provider: "cursor", parentAgentDir: parent }),
+      /no access token to materialize as API key/,
+    );
+    assert.deepEqual(readdirSync(child), [], "nothing written on failure");
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+    rmSync(child, { recursive: true, force: true });
+  }
+});
+
+test("native anthropic oauth is copied verbatim, not rewritten into an API key", () => {
+  const parent = parentDir({
+    "auth.json": {
+      anthropic: { type: "oauth", access: "tok-ant", refresh: "ref-ant", expires: 1 },
+    },
+    "models-store.json": {
+      anthropic: { models: [MODEL("claude-opus-5", "anthropic", { api: "anthropic-messages", baseUrl: "https://api.anthropic.com" })] },
+    },
+  });
+  const child = childDir();
+  try {
+    const summary = writeScopedChildAuth({ agentDir: child, provider: "anthropic", parentAgentDir: parent });
+    assert.equal(summary.credentialType, "oauth");
+    const auth = JSON.parse(readFileSync(join(child, "auth.json"), "utf8"));
+    assert.equal(auth.anthropic.type, "oauth");
+    assert.equal(auth.anthropic.access, "tok-ant");
+    assert.equal(auth.anthropic.refresh, "ref-ant");
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+    rmSync(child, { recursive: true, force: true });
+  }
+});

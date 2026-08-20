@@ -121,17 +121,49 @@ test("supervisor scheduler wakes queued controller work after capacity is releas
   }
 });
 
-test("supervisor fails closed on a stale/foreign lock without deleting it", async () => {
+test("supervisor fails closed on a lock held by a live pid without deleting it", async () => {
   const stateDir = stateDirectory("broker-supervisor-lock-");
   const lockPath = join(stateDir, "broker.lock");
-  const foreignLock = '{"instanceId":"foreign","pid":99999}\n';
-  writeFileSync(lockPath, foreignLock, { mode: 0o600 });
+  const liveLock = `{"instanceId":"foreign","pid":${process.pid}}\n`;
+  writeFileSync(lockPath, liveLock, { mode: 0o600 });
+  const supervisor = new SingleHostBrokerSupervisor({ stateDir, registry: fixtureRegistry(), allowUnsignedFixture: true, controllerToken: CONTROLLER_TOKEN });
+  try {
+    await assert.rejects(() => supervisor.start(), /already locked by running broker pid/);
+    assert.equal(readFileSync(lockPath, "utf8"), liveLock);
+    assert.equal(existsSync(join(stateDir, "broker.sock")), false);
+    assert.equal(existsSync(join(stateDir, "broker.sqlite")), false);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("supervisor reclaims a lock whose recorded pid is dead", async () => {
+  const stateDir = stateDirectory("broker-sup-stale-");
+  const lockPath = join(stateDir, "broker.lock");
+  // Pid 99999 is not a running broker; a killed host leaves exactly this behind.
+  writeFileSync(lockPath, '{"instanceId":"dead-host","pid":99999}\n', { mode: 0o600 });
+  const supervisor = new SingleHostBrokerSupervisor({ stateDir, registry: fixtureRegistry(), allowUnsignedFixture: true, controllerToken: CONTROLLER_TOKEN });
+  try {
+    await supervisor.start();
+    const reclaimed = JSON.parse(readFileSync(lockPath, "utf8"));
+    assert.equal(reclaimed.instanceId !== "dead-host", true);
+    assert.equal(reclaimed.pid, process.pid);
+    assert.equal(existsSync(join(stateDir, "broker.sock")), true);
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("supervisor fails closed on an unparseable lock without deleting it", async () => {
+  const stateDir = stateDirectory("broker-sup-badjson-");
+  const lockPath = join(stateDir, "broker.lock");
+  writeFileSync(lockPath, "not json\n", { mode: 0o600 });
   const supervisor = new SingleHostBrokerSupervisor({ stateDir, registry: fixtureRegistry(), allowUnsignedFixture: true, controllerToken: CONTROLLER_TOKEN });
   try {
     await assert.rejects(() => supervisor.start(), /already locked or has a stale lock/);
-    assert.equal(readFileSync(lockPath, "utf8"), foreignLock);
+    assert.equal(readFileSync(lockPath, "utf8"), "not json\n");
     assert.equal(existsSync(join(stateDir, "broker.sock")), false);
-    assert.equal(existsSync(join(stateDir, "broker.sqlite")), false);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

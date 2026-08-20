@@ -81,9 +81,13 @@ test("a provider rate limit is classified as a routing fact, not a child failure
   assert.equal(classifyChildFailure("HTTP 429 Too Many Requests"), "rate_limited");
   assert.equal(classifyChildFailure("rate limit reached for this account"), "rate_limited");
   assert.equal(classifyChildFailure("401 Unauthorized"), "auth_fatal");
+  assert.equal(classifyChildFailure("No API key found for cursor."), "auth_fatal");
   assert.equal(classifyChildFailure("prompt is too long for the context window"), "context_exhausted");
   assert.equal(classifyChildFailure("503 service unavailable"), "unavailable");
   assert.equal(classifyChildFailure("the tests did not pass"), "fatal");
+  assert.equal(classifyChildFailure("child completed without a result"), "unavailable");
+  assert.equal(classifyChildFailure("controller lease heartbeat failed"), "unavailable");
+  assert.equal(classifyChildFailure("broker behavioral monitor is unavailable"), "unavailable");
 });
 
 test("a rate limit mid-run reports the account, reroutes, and the work still completes", async () => {
@@ -199,6 +203,31 @@ test("the semaphore is fully released after a multi-attempt run", async () => {
     const result = await runner.run({ childId: "job-6", promptDigest: "c".repeat(64), cwd: root, prompt: "x" });
     assert.equal(result.status, "completed");
     assert.equal(semaphore.running, 0, "a retried run must not leak an admission slot");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a child that settles with no answer fails over instead of reporting completed", async () => {
+  const resolver = fakeResolver({ resources: [{ id: "acct-a/weak" }, { id: "acct-b/weak" }] });
+  const { runner, root } = runnerWith(resolver, scriptedSpawn([
+    { text: "" },
+    { text: "name=@sars267/pi-delegation-broker" },
+  ]));
+
+  try {
+    const result = await runner.run({
+      childId: "job-empty",
+      promptDigest: "c".repeat(64),
+      cwd: root,
+      prompt: "read the file",
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.text, "name=@sars267/pi-delegation-broker");
+    assert.equal(result.route[0].outcome, "unavailable");
+    assert.equal(result.route[0].error, "child completed without a result");
+    assert.equal(result.route[1].outcome, "completed");
+    assert.equal(resolver.reports[0].kind, "unavailable");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -72,15 +72,30 @@ function readPiCatalog(agentDir) {
         })),
       });
     } else if (cfg.baseUrl) {
-      // Provider has auth and config but no models — create a minimal entry
+      // Provider has auth and endpoint config. models.json may carry the real model
+      // list (multi-account provisions its slots there at login); only fall back to a
+      // placeholder when it does not.
+      const configuredModels = Array.isArray(cfg.models)
+        ? cfg.models
+            .map((m) => (typeof m === "string" ? { id: m } : m))
+            .filter((m) => m && typeof m.id === "string" && m.id.length > 0)
+        : [];
       catalog.push({
         provider,
         baseUrl: cfg.baseUrl,
         api: cfg.api ?? "openai-completions",
-        models: [{
-          id: "default", name: provider, contextWindow: 200_000, maxTokens: 8_000,
-          reasoning: false, input: ["text"],
-        }],
+        models: configuredModels.length > 0
+          ? configuredModels.map((m) => ({
+              id: m.id, name: typeof m.name === "string" ? m.name : m.id,
+              contextWindow: Number.isSafeInteger(m.contextWindow) ? m.contextWindow : 200_000,
+              maxTokens: Number.isSafeInteger(m.maxTokens) ? m.maxTokens : 8_000,
+              reasoning: m.reasoning !== false,
+              input: Array.isArray(m.input) ? m.input : ["text"],
+            }))
+          : [{
+              id: "default", name: provider, contextWindow: 200_000, maxTokens: 8_000,
+              reasoning: false, input: ["text"],
+            }],
       });
     }
   }

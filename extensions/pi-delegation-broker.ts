@@ -67,6 +67,7 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 // @ts-expect-error — resolved relative to this file's real location
 import { listReports, markReportRead, pruneReports, readReport, unreadReports, writeReport } from "../src/report-store.mjs";
+import { planUnreadNotice, seedNotifiedUnread } from "../src/unread-notice.mjs";
 
 const EXTENSIONS_DIR = dirname(fileURLToPath(import.meta.url));
 const CHILD_SHIM_PATH = join(EXTENSIONS_DIR, "child-shim.ts");
@@ -428,8 +429,8 @@ export default function piDelegationBroker(pi: any) {
   let enabled = readEnabled();
   let counter = 0;
   let lastCtx: any;
-  // Task ids already surfaced to the agent, so before_agent_start injects the unread-report
-  // notice only when something new settled — not the same list on every turn.
+  // Task ids already surfaced, or already sitting unread when this session started.
+  // Seeded on session_start so a restart cannot dump yesterday's inbox onto the first prompt.
   let notifiedUnread = new Set<string>();
 
   const ensureBroker = (): Promise<BrokerRuntime> => {
@@ -443,29 +444,25 @@ export default function piDelegationBroker(pi: any) {
   pi.on("session_start", (_event: any, ctx: any) => {
     lastCtx = ctx;
     try { pruneReports(REPORTS_DIR); } catch { /* pruning is best effort */ }
+    try { notifiedUnread = seedNotifiedUnread(unreadReports(REPORTS_DIR)); } catch { notifiedUnread = new Set(); }
     ensureBroker().catch(() => undefined);
   });
 
-  // Surface newly settled background reports at the start of the next turn: the main agent
-  // keeps working while children run and learns their verified outcome here, not by polling.
-  pi.on("before_agent_start", async () => {
+  // Newly settled reports go through systemPrompt, never `{ message }`. Pi converts custom
+  // messages to user and appends them after the prompt, which steals the turn — including
+  // pi-multi-account's failover continuation, which is a sendUserMessage follow-up.
+  pi.on("before_agent_start", async (event: { prompt?: string; systemPrompt?: string }) => {
     let unread;
     try { unread = unreadReports(REPORTS_DIR); } catch { return; }
-    const fresh = unread.filter((report) => !notifiedUnread.has(report.taskId));
-    if (fresh.length === 0) {
-      if (unread.length === 0 && notifiedUnread.size > 0) notifiedUnread = new Set();
-      return;
-    }
-    notifiedUnread = new Set(unread.map((report) => report.taskId));
-    const lines = unread.slice(0, 10).map((report) =>
-      `${report.taskId}: ${report.status}${report.status === "failed" ? ` (${String(report.error ?? "").slice(0, 120)})` : ""}`);
-    return {
-      message: {
-        customType: "delegation-broker-reports",
-        content: `[delegation-broker] ${unread.length} background delegation report(s) ready:\n${lines.join("\n")}\nRead them with delegate_collect — no argument lists summaries, delegate_collect({ taskId }) returns the full controller-verified report.`,
-        display: false,
-      },
-    };
+    const planned = planUnreadNotice({
+      unread,
+      notifiedIds: notifiedUnread,
+      prompt: event?.prompt,
+      systemPrompt: event?.systemPrompt,
+    });
+    notifiedUnread = planned.notifiedIds;
+    if (!planned.inject) return;
+    return { systemPrompt: planned.systemPrompt };
   });
 
   pi.on("session_shutdown", async () => {
@@ -559,11 +556,20 @@ export default function piDelegationBroker(pi: any) {
     description:
       "Delegate a self-contained subtask to an isolated brokered child agent. "
       + "The broker selects a current, quality-sufficient model/account and learns efficiency only from controller-verified outcomes, then spawns an isolated Pi child with only that account's credential, "
-      + "and retries on another account if the provider throttles mid-task. Returns the child's final answer.",
-    promptSnippet: "Delegate a self-contained subtask to an isolated brokered child agent",
+      + "and retries on another account if the provider throttles mid-task. Returns the child's final answer. "
+      + "Route every task deliberately before doing it yourself: "
+      + "self = needs this conversation's context, edits the parent harness, or judges the user's intent; "
+      + "one cheap child = self-contained read/summarize/grep/draft; "
+      + "one standard child = self-contained code reasoning at non-frontier difficulty; "
+      + "one frontier child = self-contained, hard, or effect-capable via proposeChangesIn; "
+      + "team = 2+ independent branches via delegate_workflow.",
+    promptSnippet: "Delegate a self-contained subtask to an isolated brokered child agent (cheap/standard/frontier tier, or delegate_workflow for a team)",
     promptGuidelines: [
+      "Before doing work yourself, ask: is this self-contained? If yes, delegate; if no, be able to say why. Self is a decision, not a default.",
       "Use delegate when a subtask is self-contained: reading or summarizing files, answering a focused question, drafting text that does not need this conversation's context.",
       "Do not use delegate for work that needs this conversation's history or your judgement about the user's intent.",
+      "Pick the tier explicitly: cheap for read/summarize/draft, standard for code reasoning, frontier for hard or effect-capable work. Omit tier only when the task is genuinely ambiguous.",
+      "For 2+ independent subtasks use delegate_workflow instead of sequential delegate calls.",
       "To get a code change, pass proposeChangesIn with the repository path and acceptance checks: the child edits an isolated worktree and the controller returns a verified patch that you or the user still have to apply.",
       "Write the delegate task as a complete brief: the child sees nothing of this conversation, so include file paths, context, and exactly what output you expect.",
     ],
@@ -607,7 +613,10 @@ export default function piDelegationBroker(pi: any) {
         capabilityRequest: {
           taskId: childId,
           taskDescription: params.task,
-          ...(params.proposeChangesIn ? { operationClass: "propose_patch" } : {}),
+          // Pin the operation class explicitly: only proposeChangesIn makes this child
+          // effect-capable. Leaving it unset would fall back to keyword guessing over the
+          // task text, which misfires on negations ("do not modify anything" → propose_patch).
+          operationClass: params.proposeChangesIn ? "propose_patch" : "observe",
           ...(params.capabilities?.length ? { requiredCapabilities: params.capabilities } : {}),
           ...(params.tier ? { modelTier: params.tier } : {}),
         },

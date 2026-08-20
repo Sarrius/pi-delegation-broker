@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createEffectiveChildCapability,
   compileEffectiveChildCapability,
+  canonicalDeclaredToolName,
 } from "../src/capability-compiler.mjs";
 import { BehavioralRunMonitor } from "../src/behavior-monitor.mjs";
 
@@ -49,6 +50,7 @@ test("capability compiler generates prompt rules and authorization policy from o
 
   assert.equal(typeof promptRules, "string");
   assert.ok(promptRules.includes("allowed_tools: read, grep, ls"));
+  assert.ok(promptRules.includes("never the mcp_pi_ prefix"));
   assert.ok(promptRules.includes("operation_class: observe"));
   assert.ok(promptRules.includes("capability_fingerprint:"));
 
@@ -148,4 +150,13 @@ test("behavioral monitor without authorization policy works as before", () => {
   monitor.declareAction({ stepId: "s1", toolName: "bash", args: { command: "ls" } });
   const verdict = monitor.authorizeAction({ stepId: "s1", toolName: "bash", args: { command: "ls" } });
   assert.equal(verdict.status, "allowed");
+});
+
+test("mcp_pi_ prefix on an allowed tool canonicalizes to the unprefixed name", () => {
+  const allowed = ["read", "grep"];
+  assert.equal(canonicalDeclaredToolName("read", allowed), "read");
+  assert.equal(canonicalDeclaredToolName("mcp_pi_read", allowed), "read");
+  assert.equal(canonicalDeclaredToolName("mcp_pi_read", new Set(allowed)), "read");
+  assert.equal(canonicalDeclaredToolName("mcp_pi_bash", allowed), "mcp_pi_bash");
+  assert.equal(canonicalDeclaredToolName("bash", allowed), "bash");
 });

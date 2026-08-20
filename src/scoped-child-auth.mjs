@@ -6,11 +6,16 @@
  * child every credential the parent holds: fifteen accounts where the lease covers one. This
  * module writes a minimal per-child configuration instead:
  *
- * - `auth.json`        — the ONE credential entry for the leased provider, copied verbatim.
- *   For a `*-account-N` lease it is written under the canonical base provider id: a fresh Pi
- *   process cannot resolve an alias provider unless its multi-account UI extension is also
- *   loaded, while the isolated directory guarantees that base id still means exactly this one
- *   leased account.
+ * - `auth.json`        — the ONE credential for the leased provider. Native Pi OAuth
+ *   (Anthropic, Codex, …) is copied verbatim. Extension-backed OAuth that Pi only understands
+ *   through a parent-side provider (Cursor: a localhost OpenAI-compatible proxy) is written as
+ *   `type: api_key` whose key is that account's access token: a `--no-extensions` child cannot
+ *   run Cursor's OAuth handler, and copying `type: oauth` made Pi throw "No API key found for
+ *   cursor" — which used to crash the parent interactive session via unhandledRejection.
+ *   For a `*-account-N` lease the entry is stored under the canonical base provider id: a fresh
+ *   Pi process cannot resolve an alias unless its multi-account UI extension is also loaded,
+ *   while the isolated directory guarantees that base id still means exactly this one leased
+ *   account.
  * - `models-store.json` — that provider's model catalog under the same canonical id.
  * - `models.json`      — the provider's endpoint config (api/baseUrl), when the parent has
  *   one, scoped to the same canonical provider.
@@ -49,6 +54,31 @@ export function baseProviderFor(provider) {
   return provider.replace(ACCOUNT_SUFFIX, "");
 }
 
+function isLoopbackProxyUrl(value) {
+  if (typeof value !== "string" || !value) return false;
+  try {
+    const url = new URL(value);
+    return (url.hostname === "127.0.0.1" || url.hostname === "localhost" || url.hostname === "::1") && url.port !== "";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Isolated children do not load provider extensions. Native Pi OAuth still works from a
+ * copied `type: oauth` entry. Cursor (and any similar proxy-backed slot) is provisioned as a
+ * localhost OpenAI-compatible endpoint whose Authorization header IS the access token — that
+ * is how pi-multi-account's shared proxy identifies the leased account.
+ */
+function credentialForIsolatedChild(base, credential, providerConfig) {
+  const proxyBacked = base === "cursor" || isLoopbackProxyUrl(providerConfig?.baseUrl);
+  if (!proxyBacked || credential.type !== "oauth") return credential;
+  if (typeof credential.access !== "string" || !credential.access) {
+    throw new Error(`proxy-backed provider ${base} has no access token to materialize as API key`);
+  }
+  return { type: "api_key", key: credential.access };
+}
+
 /**
  * Write a single-provider auth/model configuration into a provisioned child agent dir.
  *
@@ -67,8 +97,9 @@ export function writeScopedChildAuth({ agentDir, provider, parentAgentDir } = {}
     throw new Error(`Scoped child auth agent dir does not exist: ${resolvedAgentDir}`);
   }
 
-  // 1. Credential: exactly the leased provider's entry, verbatim. Missing means the child
-  //    cannot authenticate as the leased account at all — deny rather than launch broken.
+  // 1. Credential: exactly the leased provider's entry, shaped so a `--no-extensions` Pi can
+  //    actually use it. Missing means the child cannot authenticate as the leased account at
+  //    all — deny rather than launch broken.
   const auth = readJson(join(parentAgentDir, "auth.json"));
   const credential = auth[provider];
   if (!credential || typeof credential !== "object" || typeof credential.type !== "string") {
@@ -79,15 +110,16 @@ export function writeScopedChildAuth({ agentDir, provider, parentAgentDir } = {}
   // `anthropic-account-2` et al. A one-credential agent dir makes the canonical name safe:
   // `anthropic` here can only authenticate as this leased account, never the parent's base one.
   const base = baseProviderFor(provider);
-  writeOwnerOnly(join(resolvedAgentDir, "auth.json"), { [base]: credential });
+  const store = readJson(join(parentAgentDir, "models-store.json"));
+  const modelsConfig = readJson(join(parentAgentDir, "models.json"));
+  const providerConfig = modelsConfig.providers?.[provider] ?? modelsConfig.providers?.[base];
+  const childCredential = credentialForIsolatedChild(base, credential, providerConfig);
+  writeOwnerOnly(join(resolvedAgentDir, "auth.json"), { [base]: childCredential });
 
   // 2. Model catalog: the provider's own entry, else the base provider's (multi-account
   //    inheritance), else whatever the endpoint config already lists. Model entries are
   //    self-describing (api + baseUrl), so a provider the child's Pi has never heard of is
   //    still fully defined by this file alone.
-  const store = readJson(join(parentAgentDir, "models-store.json"));
-  const modelsConfig = readJson(join(parentAgentDir, "models.json"));
-  const providerConfig = modelsConfig.providers?.[provider] ?? modelsConfig.providers?.[base];
   let models;
   let modelsSource;
   if (Array.isArray(store[provider]?.models) && store[provider].models.length > 0) {
@@ -130,7 +162,7 @@ export function writeScopedChildAuth({ agentDir, provider, parentAgentDir } = {}
     // fresh Pi must use a different canonical id to represent that exact scoped credential.
     provider,
     ...(base === provider ? {} : { runtimeProvider: base }),
-    credentialType: credential.type,
+    credentialType: childCredential.type,
     modelCount: scopedModels.length,
     modelsSource,
   });

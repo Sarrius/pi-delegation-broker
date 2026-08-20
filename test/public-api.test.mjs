@@ -49,6 +49,7 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "baseProviderFor",
     "buildAnthropicMessagesRequest",
     "buildCurrencyMap",
+    "canonicalDeclaredToolName",
     "capabilityTierId",
     "captureProviderContext",
     "catalogToBrokerRegistry",

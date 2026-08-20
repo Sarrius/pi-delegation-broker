@@ -512,9 +512,14 @@ export class SqliteLeaseBroker {
 
   heartbeat(leaseId, fencingToken, now, ttlMs = 30_000) {
     return this.#transaction(() => {
+      const expiresAt = now + ttlMs;
       const update = this.#db.prepare("UPDATE leases SET expires_at = ? WHERE lease_id = ? AND fencing_token = ? AND expires_at > ?")
-        .run(now + ttlMs, leaseId, fencingToken, now);
+        .run(expiresAt, leaseId, fencingToken, now);
       if (update.changes !== 1) return { status: "denied_lease" };
+      // The IPC token copies expires_at at issue time. If only the lease row moves, a child
+      // that heartbeated still gets unauthorized the moment the original snapshot lapses.
+      this.#db.prepare("UPDATE lease_capabilities SET expires_at = ? WHERE lease_id = ? AND fencing_token = ?")
+        .run(expiresAt, leaseId, fencingToken);
       const lease = asLease(this.#db.prepare("SELECT * FROM leases WHERE lease_id = ?").get(leaseId));
       this.#record(now, "LeaseHeartbeated", { leaseId, fencingToken, expiresAt: lease.expiresAt });
       return { status: "leased", lease };

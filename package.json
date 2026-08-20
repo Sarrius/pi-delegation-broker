@@ -4,6 +4,11 @@
   "description": "Non-production, single-host reference broker for capability-scoped Pi child delegation.",
   "type": "module",
   "main": "./src/index.mjs",
+  "pi": {
+    "extensions": [
+      "./extensions/pi-delegation-broker.ts"
+    ]
+  },
   "exports": {
     ".": "./src/index.mjs",
     "./testing": "./src/testing.mjs"

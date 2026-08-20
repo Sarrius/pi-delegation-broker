@@ -27,6 +27,10 @@ The [source-repository-only reference patch](https://github.com/Sarrius/pi-deleg
 
 Do not pass `*-account-N/model` to a fresh isolated Pi child and do not solve this by loading the parent's entire multi-account extension: either choice breaks the scoped-credential boundary. Regression coverage lives in `test/scoped-child-auth.test.mjs` and `test/child-launcher.test.mjs`.
 
+### Proxy-backed OAuth (Cursor)
+
+pi-multi-account provisions Cursor into `models.json` as `http://127.0.0.1:<port>/v1`. A bare `--no-extensions` child cannot run Cursor's OAuth handler. `writeScopedChildAuth` therefore writes that slot's access token as `type: api_key`; the shared local proxy reads `Authorization` and uses that token as the leased account. The placeholder `cursor-proxy` is not an identity. Native OAuth (Anthropic, Codex) is still copied verbatim. Copying Cursor oauth unchanged made Pi throw `No API key found for cursor`, which used to become an unhandledRejection and kill the parent interactive session. Regression coverage: `test/scoped-child-auth.test.mjs`, `test/child-rpc.test.mjs`.
+
 Hermes is a distinct integration: its review subprocess intentionally runs against the parent agent directory, but it too uses `--no-extensions`. If Hermes follows the active chat model and that model is an account alias, configure its **single trusted provider extension** explicitly:
 
 ```json

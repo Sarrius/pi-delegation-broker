@@ -19,3 +19,35 @@ test("orchestrator runs independent work in parallel and blocks dependents after
     assert.ok(seen.includes("research-a") && seen.includes("research-b"));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("orchestrator keeps per-node tier and capabilities for the runner", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-tier-"));
+  const seen = [];
+  try {
+    const o = new TaskOrchestrator({
+      path: join(root, "tasks.json"),
+      concurrency: 2,
+      run: async (node) => {
+        seen.push({ id: node.id, tier: node.tier, capabilities: node.capabilities });
+        return { status: "completed" };
+      },
+    });
+    o.initialize([
+      { id: "read", task: "summarize", tier: "cheap", capabilities: ["text_generation"] },
+      { id: "hard", task: "reason", tier: "frontier" },
+    ]);
+    const state = await o.execute();
+    assert.equal(state.nodes.every((node) => node.state === "completed"), true);
+    assert.deepEqual(seen.find((node) => node.id === "read"), { id: "read", tier: "cheap", capabilities: ["text_generation"] });
+    assert.equal(seen.find((node) => node.id === "hard").tier, "frontier");
+    assert.equal(state.nodes.find((node) => node.id === "read").tier, "cheap");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("orchestrator rejects an invalid tier before any work starts", () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-bad-tier-"));
+  try {
+    const o = new TaskOrchestrator({ path: join(root, "tasks.json"), run: async () => ({ status: "completed" }) });
+    assert.throws(() => o.initialize([{ id: "x", task: "t", tier: "premium" }]), /tier is invalid/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

@@ -110,6 +110,37 @@ test("dynamic provider watcher discovers pi-multi-account providers from auth.js
   }
 });
 
+test("auth-only provider with models.json models registers THOSE models, not a placeholder", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dpw-cfgmodels-"));
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  // No models-store entry for this provider: only auth + models.json endpoint config,
+  // exactly what multi-account provisions for cursor / kimi-coding-account-N slots.
+  writeFileSync(join(agentDir, "auth.json"), JSON.stringify(authJson(["cursor"])), { mode: 0o600 });
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({
+    providers: {
+      cursor: {
+        api: "openai-completions",
+        baseUrl: "http://127.0.0.1:41999/v1",
+        models: ["cursor-grok-4.6", { id: "composer-2.5", contextWindow: 200000, maxTokens: 64000 }],
+      },
+    },
+  }), { mode: 0o600 });
+  try {
+    const broker = new SqliteLeaseBroker({ path: join(root, "broker.sqlite"), registry: fixtureRegistry() });
+    const watcher = new DynamicProviderWatcher({ agentDir, broker });
+    await watcher.refresh();
+    const resources = watcher.currentRegistry().resources;
+    assert.ok(resources["cursor/cursor-grok-4.6"], "real model from models.json must be routable");
+    assert.ok(resources["cursor/composer-2.5"], "object-form model entries must register too");
+    assert.equal(resources["cursor/default"], undefined, "placeholder must not appear when real models exist");
+    watcher.stop();
+    broker.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("dynamic provider watcher reads the live Pi agent dir", () => {
   const agentDir = join(homedir(), ".pi", "agent");
   const root = mkdtempSync(join(tmpdir(), "dpw-live-"));

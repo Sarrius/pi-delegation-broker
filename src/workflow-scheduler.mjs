@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+const TIER = new Set(["cheap", "standard", "frontier"]);
 function fail(message) { throw new Error(`task orchestrator: ${message}`); }
 function save(path, state) { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); writeFileSync(path, `${JSON.stringify(state)}\n`, { mode: 0o600 }); }
 
@@ -23,7 +24,21 @@ export class TaskOrchestrator {
       if (ids.has(node.id)) fail("node ids must be unique"); ids.add(node.id);
       const dependsOn = node.dependsOn ?? [];
       if (!Array.isArray(dependsOn) || dependsOn.some((id) => !ID.test(id)) || new Set(dependsOn).size !== dependsOn.length) fail("dependencies are invalid");
-      return { id: node.id, task: node.task, dependsOn, state: "pending" };
+      if (node.tier !== undefined && !TIER.has(node.tier)) fail("tier is invalid");
+      const capabilities = node.capabilities;
+      if (capabilities !== undefined) {
+        if (!Array.isArray(capabilities) || capabilities.length > 16
+          || capabilities.some((capability) => typeof capability !== "string" || !capability || capability.length > 64)
+          || new Set(capabilities).size !== capabilities.length) fail("capabilities are invalid");
+      }
+      return {
+        id: node.id,
+        task: node.task,
+        dependsOn,
+        state: "pending",
+        ...(node.tier !== undefined ? { tier: node.tier } : {}),
+        ...(capabilities !== undefined ? { capabilities: [...capabilities] } : {}),
+      };
     });
     for (const node of normalized) if (node.dependsOn.some((id) => !ids.has(id) || id === node.id)) fail("dependency is unknown or self-referential");
     const state = { schemaVersion: 1, nodes: normalized }; save(this.#path, state); return state;

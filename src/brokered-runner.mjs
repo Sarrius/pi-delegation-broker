@@ -18,7 +18,7 @@ const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
  */
 const FAILURE_SIGNATURES = Object.freeze([
   Object.freeze({ kind: "rate_limited", pattern: /\b(rate[ _-]?limit|too many requests|429|quota exceeded|overloaded|capacity)\b/i }),
-  Object.freeze({ kind: "auth_fatal", pattern: /\b(401|403|unauthorized|forbidden|invalid[ _-]?api[ _-]?key|authentication|expired token|revoked)\b/i }),
+  Object.freeze({ kind: "auth_fatal", pattern: /\b(401|403|unauthorized|forbidden|invalid[ _-]?api[ _-]?key|authentication|expired token|revoked|no api key found)\b/i }),
   Object.freeze({ kind: "context_exhausted", pattern: /\b(context[ _-]?(window|length|limit)|prompt is too long|maximum context|token limit)\b/i }),
   // Capability/organization policy rejection is route-specific: the same task can run on
   // another account/model, so quarantine this resource and let controller failover continue.
@@ -28,14 +28,11 @@ const FAILURE_SIGNATURES = Object.freeze([
   // Reasoning-mode refusals are route-specific policy, not a dead task: another route accepts it.
   Object.freeze({ kind: "unavailable", pattern: /reasoning is mandatory|cannot be disabled|always engages in thinking/i }),
   // Exhausted credit/balance is this account's problem, not the task's: cool it and move on.
-  // Spent balance belongs to the whole account, not one of its models, so it cools the capacity
-  // group like a throttle does and recovers through the broker's existing half-open probe.
   Object.freeze({ kind: "account_exhausted", pattern: /\b402\b|requires more credits|insufficient (credits|balance)|purchase credits|upgrade to a paid account|third-party apps now draw from your extra usage|claude\.ai\/settings\/usage/i }),
-  // A spent subscription/plan allowance reports no HTTP status through some CLIs ("Codex error:
-  // The usage limit has been reached"). Unclassified it reads as fatal and kills failover for a
-  // task that any other account could still finish.
   Object.freeze({ kind: "account_exhausted", pattern: /usage limit (has been )?reached|plan usage limit|usage limit exceeded/i }),
   Object.freeze({ kind: "unavailable", pattern: /\b(50[0234]|service unavailable|bad gateway|upstream|connection (refused|reset)|econnrefused|etimedout|network)\b/i }),
+  // A child that settles with no answer (expired lease IPC, empty final text) is a dead route.
+  Object.freeze({ kind: "unavailable", pattern: /child completed without a result|controller lease heartbeat failed|broker behavioral monitor is unavailable/i }),
 ]);
 
 export function classifyChildFailure(text) {
@@ -363,27 +360,33 @@ export class BrokeredChildRunner {
       await this.#promptWithDeadline(session, spec.prompt ?? "");
       const message = session.latestAssistantMessage;
       const usage = session.usage;
-      if (message?.stopReason === "error") {
+      const text = assistantText(message);
+      const worktreeResult = worktree ? await this.#collectWorktree(worktree) : undefined;
+      const answered = text.trim().length > 0 || Boolean(worktreeResult?.patch);
+      if (message?.stopReason === "error" || !answered) {
         result = {
           id: handle.id,
           status: "failed",
-          text: assistantText(message),
-          error: message.errorMessage ?? "Child model request failed",
+          text,
+          error: message?.stopReason === "error"
+            ? (message.errorMessage ?? "Child model request failed")
+            : "child completed without a result",
           usage,
           resolved: handle.resolved,
           resource: handle.resource,
           ...(handle.selection ? { selection: handle.selection } : {}),
+          ...(worktreeResult ?? {}),
         };
       } else {
         result = {
           id: handle.id,
           status: "completed",
-          text: assistantText(message),
+          text,
           usage,
           resolved: handle.resolved,
           resource: handle.resource,
           ...(handle.selection ? { selection: handle.selection } : {}),
-          ...(worktree ? await this.#collectWorktree(worktree) : {}),
+          ...(worktreeResult ?? {}),
         };
       }
     } catch (error) {
