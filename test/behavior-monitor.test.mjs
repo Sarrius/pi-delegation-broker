@@ -142,3 +142,18 @@ test("canonical behavior hashing is independent of object key insertion order", 
   });
   assert.equal(verdict.status, "allowed");
 });
+
+test("args declared as a JSON string match the object form at invocation", () => {
+  const monitor = new BehavioralRunMonitor({ doneWhen: ["inspect"] });
+  monitor.declareAction({
+    stepId: "stringified",
+    toolName: "read",
+    args: '{"path":"/tmp/x","limit":5}',
+  });
+  const verdict = monitor.authorizeAction({
+    stepId: "stringified",
+    toolName: "read",
+    args: { path: "/tmp/x", limit: 5 },
+  });
+  assert.equal(verdict.status, "allowed");
+});

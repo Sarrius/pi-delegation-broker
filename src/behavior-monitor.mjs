@@ -12,7 +12,13 @@ function requireAction(input) {
   if (!input || !STEP_ID.test(input.stepId ?? "") || !TOOL_NAME.test(input.toolName ?? "") || !Object.hasOwn(input, "args")) {
     throw new Error("behavior action requires bounded stepId, toolName, and args");
   }
-  const captured = captureLosslessJson({ toolName: input.toolName, args: input.args });
+  // A model may declare args as a JSON string and then invoke the tool with the object form.
+  // Same intent, different representation — normalize before hashing or the declaration and
+  // the invocation never match (live: every cursor/claude-4.6-opus-* child died exactly here).
+  const args = typeof input.args === "string"
+    ? (() => { try { const parsed = JSON.parse(input.args); return parsed && typeof parsed === "object" ? parsed : input.args; } catch { return input.args; } })()
+    : input.args;
+  const captured = captureLosslessJson({ toolName: input.toolName, args });
   return Object.freeze({
     stepId: input.stepId,
     toolName: captured.value.toolName,
