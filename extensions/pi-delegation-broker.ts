@@ -441,11 +441,22 @@ export default function piDelegationBroker(pi: any) {
     return starting;
   };
 
+  const stopBroker = async () => {
+    const current = runtime;
+    runtime = undefined;
+    starting = undefined;
+    if (!current) return;
+    current.stopCurrencyRefresh();
+    await current.runner.dispose().catch(() => undefined);
+    await current.supervisor.stop().catch(() => undefined);
+  };
+
   pi.on("session_start", (_event: any, ctx: any) => {
     lastCtx = ctx;
     try { pruneReports(REPORTS_DIR); } catch { /* pruning is best effort */ }
     try { notifiedUnread = seedNotifiedUnread(unreadReports(REPORTS_DIR)); } catch { notifiedUnread = new Set(); }
-    ensureBroker().catch(() => undefined);
+    // Activation is explicit: a stopped broker stays stopped across sessions.
+    if (enabled) ensureBroker().catch(() => undefined);
   });
 
   // Newly settled reports go through systemPrompt, never `{ message }`. Pi converts custom
@@ -466,13 +477,7 @@ export default function piDelegationBroker(pi: any) {
   });
 
   pi.on("session_shutdown", async () => {
-    const current = runtime;
-    runtime = undefined;
-    starting = undefined;
-    if (!current) return;
-    current.stopCurrencyRefresh();
-    await current.runner.dispose().catch(() => undefined);
-    await current.supervisor.stop().catch(() => undefined);
+    await stopBroker();
   });
 
   pi.registerCommand("delegation-broker", {
@@ -490,7 +495,8 @@ export default function piDelegationBroker(pi: any) {
       if (action === "stop") {
         enabled = false;
         writeEnabled(false);
-        ctx.ui.notify("Delegation broker stopped: no new children will launch; running children may finish", "info");
+        await stopBroker();
+        ctx.ui.notify("Delegation broker stopped and shut down. Run /delegation-broker start to activate it again.", "info");
         return;
       }
       if (action === "status") {

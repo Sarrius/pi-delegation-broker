@@ -4,6 +4,8 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## Unreleased
 
+- **`/delegation-broker stop` is a real deactivation now.** The command used to only set a flag: the broker process kept running, held the lock and socket, and auto-started again on the next session regardless. `stop` now shuts the supervisor down (lock and socket released), and a stopped broker no longer auto-starts on `session_start`. `start` activates it again.
+
 - **A declaration written as a JSON string no longer blocks the invocation.** Cursor's `claude-4.6-opus-*` children declared `read` with args as a JSON-encoded string, then invoked it with the object form. The behavioral monitor hashed both literally, called the invocation "differs from declared action", blocked every tool, and all four Cursor routes settled with empty text. `requireAction` now parses a stringified-JSON args payload before hashing; a string that is not JSON stays verbatim.
 
 - **A heartbeat no longer leaves the child unauthorized.** `heartbeat` used to extend only `leases.expires_at`. The IPC token copies expiry at issue time, and `leaseForCapability` requires **both** rows to be live. Live canary `workflow-mt166q44-1-pkg-name` heartbeated the Cursor lease and still got `unauthorized` 655ms after the original 30s snapshot, then settled with empty text which the runner treated as `completed`. Heartbeat now updates `lease_capabilities.expires_at` too. An observe child that settles with no answer is `unavailable` and fails over. `mcp_pi_read` declared for allowed `read` is the same tool.
