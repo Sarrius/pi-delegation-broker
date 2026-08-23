@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fixtureRegistry, SqliteLeaseBroker } from "../src/broker.mjs";
-import { DynamicProviderWatcher, modelRegistryToProviderCatalog } from "../src/dynamic-provider-watcher.mjs";
+import { activeAuthorizedProviders, DynamicProviderWatcher, modelRegistryToProviderCatalog } from "../src/dynamic-provider-watcher.mjs";
 
 function modelsStore(providers) {
   const store = {};
@@ -25,6 +25,19 @@ function authJson(providers) {
   for (const p of providers) auth[p] = { type: "api-key", key: "test" };
   return auth;
 }
+
+test("credential preflight excludes expired OAuth before child launch and re-admits refreshed auth", () => {
+  const now = 1_000_000;
+  const auth = {
+    api: { type: "api_key", key: "secret" },
+    current: { type: "oauth", access: "access", refresh: "refresh", expires: now + 60_000 },
+    expired: { type: "oauth", access: "access", refresh: "bad", expires: now - 1 },
+    unknown: { type: "oauth", access: "access", refresh: "refresh" },
+  };
+  assert.deepEqual([...activeAuthorizedProviders(auth, now)].sort(), ["api", "current"]);
+  auth.expired.expires = now + 120_000;
+  assert.ok(activeAuthorizedProviders(auth, now).includes("expired"));
+});
 
 test("live model registry preserves per-account model availability", async () => {
   const models = [

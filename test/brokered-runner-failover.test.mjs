@@ -78,6 +78,10 @@ function runnerWith(resolver, spawnChild) {
   return { runner, root };
 }
 
+test("plain provider connection errors are failover-eligible route failures", () => {
+  assert.equal(classifyChildFailure("Connection error."), "unavailable");
+});
+
 test("a provider rate limit is classified as a routing fact, not a child failure", () => {
   assert.equal(classifyChildFailure("HTTP 429 Too Many Requests"), "rate_limited");
   assert.equal(classifyChildFailure("rate limit reached for this account"), "rate_limited");

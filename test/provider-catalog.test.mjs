@@ -13,6 +13,7 @@ test("catalog converts provider entries into a broker registry with derived prof
   // A resource is one concrete (account, model) pair — the unit a lease can route to.
   assert.ok(registry.resources["fake-anthropic/claude-fake-1"]);
   assert.ok(registry.resources["fake-codex/gpt-fake-1"]);
+  assert.equal(registry.resources["fake-codex/gpt-fake-1"].provenance.providerClass, "unknown");
   // A capacity group is the account: every one of its models draws on the same quota.
   assert.ok(registry.capacityGroups["G-fake-anthropic"]);
   assert.ok(registry.capacityGroups["G-fake-codex"]);
@@ -98,6 +99,20 @@ test("catalog model supports are derived from model capabilities", () => {
   assert.ok(strong.supports.includes("vision_input"));
   assert.ok(strong.supports.includes("large_context"));
   assert.ok(strong.supports.includes("text_generation"));
+});
+
+test("catalog attaches credential-free route provenance to real provider classes", () => {
+  const registry = catalogToBrokerRegistry([{
+    provider: "cursor",
+    baseUrl: "https://cursor.example",
+    api: "openai-completions",
+    models: [
+      { id: "cursor-grok-4.6", name: "Grok", contextWindow: 200_000, maxTokens: 8_000, reasoning: true, input: ["text"] },
+      { id: "claude-opus-5", name: "Claude", contextWindow: 200_000, maxTokens: 8_000, reasoning: true, input: ["text"] },
+    ],
+  }], { confidence: "observed" });
+  assert.equal(registry.resources["cursor/cursor-grok-4.6"].provenance.billingPool, "native_subscription");
+  assert.equal(registry.resources["cursor/claude-opus-5"].provenance.billingPool, "third_party_subscription");
 });
 
 test("catalog respects controller overrides for capacity and confidence", () => {

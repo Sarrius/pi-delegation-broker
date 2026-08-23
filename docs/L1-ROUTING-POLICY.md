@@ -1,6 +1,19 @@
 # L1 routing policy: when the parent delegates, and to whom
 
-Status: **live enough to use, with remaining liveness bugs being fixed from canaries.**
+> **Superseded operationally on 2026-08-23.** The historical decision below explains why
+> delegation guidance lives in tool text, but its model-pool and synchronous-workflow claims
+> no longer describe the implementation. Current behavior is:
+>
+> - `delegate_workflow` is parent-free by default and returns a durable job id;
+> - status/list/collect/cancel form the lifecycle API;
+> - automatic routing is current-only and subscription-native;
+> - Cursor Grok/Composer is its native billing pool; Cursor third-party models are explicit-only;
+> - aggregators are explicit user allowlists; an unavailable pool denies rather than broad auto;
+> - provider/account health and receipt-backed learning rank only inside the hard eligible set.
+>
+> Canonical design and evidence: `~/.pi/research/delegation-doctrine/async-native-routing-research/REPORT.md`.
+
+Status: **historical rationale; implementation claims below are preserved for provenance.**
 The tool-description policy is already on `delegate` / `delegate_workflow`. Execution-layer
 fixes from this document landed. Live proof 2026-08-20:
 

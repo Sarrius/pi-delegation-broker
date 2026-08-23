@@ -7,11 +7,9 @@ export const MODEL_PREFERENCE_TIERS = Object.freeze([...TIERS]);
 const MODEL_ID = /^[A-Za-z0-9~][A-Za-z0-9._/:~-]{0,159}$/;
 const PROVIDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\*?$/;
 
-export const DEFAULT_MODEL_PREFERENCES = Object.freeze({
+const LEGACY_SEEDED_MODEL_PREFERENCES = Object.freeze({
   schemaVersion: 1,
   tiers: Object.freeze({
-    // User-curated backbone. `via` is policy about economic/account routes, not an assertion
-    // that the model is available today; unavailable entries fall back to controller auto mode.
     frontier: Object.freeze([
       Object.freeze({ model: "gpt-5.6-sol", via: Object.freeze(["openai-codex*"]) }),
       Object.freeze({ model: "kimi-k3", via: Object.freeze(["kimi-coding", "ollama"]) }),
@@ -24,7 +22,30 @@ export const DEFAULT_MODEL_PREFERENCES = Object.freeze({
   }),
 });
 
+export const DEFAULT_MODEL_PREFERENCES = Object.freeze({
+  schemaVersion: 1,
+  // Empty means strict automatic subscription-native/current-only selection. Entries are
+  // explicit allowlists and may intentionally admit an aggregator or mixed-provider route.
+  tiers: Object.freeze({
+    frontier: Object.freeze([]),
+    standard: Object.freeze([]),
+    cheap: Object.freeze([]),
+  }),
+});
+
 function clone(value) { return JSON.parse(JSON.stringify(value)); }
+
+function isLegacySeed(value) {
+  if (!value || value.schemaVersion !== 1 || !value.tiers || !Array.isArray(value.tiers.frontier)
+    || (value.tiers.standard?.length ?? 0) !== 0 || (value.tiers.cheap?.length ?? 0) !== 0) return false;
+  const key = (entry) => `${entry?.model ?? ""}|${Array.isArray(entry?.via) ? entry.via.join(",") : ""}`;
+  const required = new Set(LEGACY_SEEDED_MODEL_PREFERENCES.tiers.frontier.map(key));
+  const actual = new Set(value.tiers.frontier.map(key));
+  if ([...required].some((entry) => !actual.has(entry))) return false;
+  return value.tiers.frontier.every((entry) => required.has(key(entry))
+    || (/^(cursor-grok-|grok-(4\.5|4\.6)|composer-)/.test(entry?.model ?? "")
+      && Array.isArray(entry?.via) && entry.via.every((provider) => /^cursor\*?$/.test(provider))));
+}
 
 function normalizeEntry(entry, label) {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`${label} must be an object`);
@@ -52,7 +73,14 @@ export function normalizeModelPreferences(value) {
 
 export function loadModelPreferences(path) {
   if (!existsSync(path)) return normalizeModelPreferences(clone(DEFAULT_MODEL_PREFERENCES));
-  return normalizeModelPreferences(JSON.parse(readFileSync(path, "utf8")));
+  const parsed = JSON.parse(readFileSync(path, "utf8"));
+  // The original shipped seed included aggregator routes. It was a product default, not a
+  // conscious user allowlist, so migrate that exact document to strict automatic mode. Any
+  // edited v1 document remains an explicit user policy.
+  if (isLegacySeed(parsed)) {
+    return normalizeModelPreferences(clone(DEFAULT_MODEL_PREFERENCES));
+  }
+  return normalizeModelPreferences(parsed);
 }
 
 export function writeModelPreferences(path, preferences) {

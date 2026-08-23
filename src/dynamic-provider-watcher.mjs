@@ -4,6 +4,19 @@ import { catalogToBrokerRegistry } from "./provider-catalog.mjs";
 
 const WATCH_DEBOUNCE_MS = 2_000;
 
+/** Credential-free admission preflight. Expired OAuth must not reach a child and discover a
+ * dead refresh token after launch; a later auth-file refresh naturally re-admits the route. */
+export function activeAuthorizedProviders(auth, now = Date.now()) {
+  if (!auth || typeof auth !== "object" || Array.isArray(auth)) return Object.freeze([]);
+  return Object.freeze(Object.entries(auth).flatMap(([provider, credential]) => {
+    if (!credential || typeof credential !== "object" || Array.isArray(credential)) return [];
+    if ((credential.type === "api_key" || credential.type === "api-key") && typeof credential.key === "string" && credential.key.length > 0) return [provider];
+    if (credential.type === "oauth" && typeof credential.access === "string" && credential.access.length > 0
+      && Number.isSafeInteger(credential.expires) && credential.expires > now + 30_000) return [provider];
+    return [];
+  }));
+}
+
 /**
  * Read Pi's models-store.json, models.json, and auth.json and merge them
  * into a complete broker catalog. Covers:
@@ -22,6 +35,7 @@ function readPiCatalog(agentDir) {
   if (!modelsConfig || typeof modelsConfig !== "object" || Array.isArray(modelsConfig)) modelsConfig = {};
   if (!auth || typeof auth !== "object" || Array.isArray(auth)) auth = {};
   const providersConfig = modelsConfig.providers ?? {};
+  const authorized = new Set(activeAuthorizedProviders(auth));
 
   const catalog = [];
   const seen = new Set();
@@ -31,7 +45,7 @@ function readPiCatalog(agentDir) {
   // credential for that exact provider. Otherwise a selector can lease an
   // apparently live model which scoped child auth cannot provision.
   for (const [provider, entry] of Object.entries(store)) {
-    if (!auth[provider] || !entry?.models || !Array.isArray(entry.models)) continue;
+    if (!authorized.has(provider) || !entry?.models || !Array.isArray(entry.models)) continue;
     if (seen.has(provider)) continue;
     seen.add(provider);
     const cfg = providersConfig[provider] ?? {};
@@ -51,7 +65,7 @@ function readPiCatalog(agentDir) {
   // 2. Providers in auth.json that are NOT in models-store.
   //    This covers pi-multi-account accounts (openai-codex-account-N) and
   //    any provider the user logged into but Pi hasn't fetched models for yet.
-  for (const provider of Object.keys(auth)) {
+  for (const provider of authorized) {
     if (seen.has(provider)) continue;
     seen.add(provider);
     const cfg = providersConfig[provider] ?? {};

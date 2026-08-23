@@ -73,6 +73,82 @@ test("every attempt is tracked while its lease lives, but only a completed one i
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("real progress resets the watchdog while the absolute attempt ceiling stays separate", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-progress-"));
+  let listener;
+  const resolver = {
+    async resolve() {
+      return {
+        action: "allow", resource: { id: "provider/model" }, resolvedModel: MODEL,
+        policy: {
+          policyId: "lease", agentDir: root, environment: {},
+          async onChildSessionOpened() {}, async onBeforeChildAbandoned() {},
+          async onChildSessionClosed() { return { status: "released" }; },
+        },
+      };
+    },
+  };
+  const spawnChild = async () => ({
+    resolved: MODEL,
+    session: {
+      usage: { input: 1, output: 1 },
+      latestAssistantMessage: { stopReason: "stop", content: [{ type: "text", text: "done" }] },
+      subscribe(fn) { listener = fn; return () => { listener = undefined; }; },
+      async prompt() {
+        await new Promise((resolve) => setTimeout(resolve, 600)); listener?.({ type: "message_update" });
+        await new Promise((resolve) => setTimeout(resolve, 600)); listener?.({ type: "tool_execution_update" });
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      },
+      async abort() {}, async dispose() {},
+    },
+  });
+  try {
+    const runner = new BrokeredChildRunner({
+      resolver, sessionsRoot: join(root, "sessions"), spawnChild,
+      noProgressTimeoutMs: 1_000, attemptMaxRunMs: 2_500,
+    });
+    const result = await runner.run({ childId: "progress-task", promptDigest: "a".repeat(64), model: MODEL, cwd: root, prompt: "work", maxAttempts: 1 });
+    assert.equal(result.status, "completed");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("no-progress deadline aborts a silent route and reports it failover-eligible", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-no-progress-"));
+  let aborted = 0;
+  const resolver = {
+    async resolve() {
+      return {
+        action: "allow", resource: { id: "provider/model" }, resolvedModel: MODEL,
+        policy: {
+          policyId: "lease", agentDir: root, environment: {},
+          async onChildSessionOpened() {}, async onBeforeChildAbandoned() {},
+          async onChildSessionClosed() { return { status: "released" }; },
+        },
+      };
+    },
+    async reportProviderUnavailable() {},
+  };
+  const spawnChild = async () => ({
+    resolved: MODEL,
+    session: {
+      usage: { input: 0, output: 0 }, latestAssistantMessage: undefined,
+      async prompt() { return new Promise(() => {}); },
+      async abort() { aborted += 1; }, async dispose() {},
+    },
+  });
+  try {
+    const runner = new BrokeredChildRunner({
+      resolver, sessionsRoot: join(root, "sessions"), spawnChild,
+      noProgressTimeoutMs: 1_000, attemptMaxRunMs: 2_000,
+    });
+    const result = await runner.run({ childId: "silent-task", promptDigest: "a".repeat(64), model: MODEL, cwd: root, prompt: "work", maxAttempts: 1 });
+    assert.equal(result.status, "failed");
+    assert.match(result.error, /no-progress deadline/);
+    assert.equal(result.route[0].outcome, "unavailable");
+    assert.equal(aborted, 1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("the account that fails on the final attempt is still reported as cooled", async () => {
   const root = mkdtempSync(join(tmpdir(), "runner-final-health-"));
   const cooled = [];

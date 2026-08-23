@@ -7,17 +7,21 @@
  * still override it; learned affinities can only reorder resources already above this floor.
  */
 const RULES = Object.freeze([
-  // Cursor subscription: same researched families behind the cursor proxy. Model ids carry
-  // thinking/fast suffixes (cursor-grok-4.6-xhigh, claude-opus-5-max-fast); regexes are prefix
-  // matches, so the family rule covers every tier variant.
-  { provider: /^cursor(-account-\d+)?$/, model: /^(cursor-grok-4\.6|claude-opus-5|claude-4\.6-opus|gpt-5\.6-(sol|terra|luna))/, quality: "frontier" },
-  { provider: /^cursor(-account-\d+)?$/, model: /^(claude-sonnet-5|cursor-grok-4\.5|glm-5\.2|gpt-5\.[45])/, quality: "standard" },
-  { provider: /^cursor(-account-\d+)?$/, model: /^gemini-3(\.\d+)?-flash/, quality: "cheap" },
+  // Cursor's own subscription billing pool is separate from third-party Claude/GPT/Gemini
+  // routes. Provenance enforcement is the hard gate; these rules only assign quality inside it.
+  { provider: /^cursor(-account-\d+)?$/, model: /^(cursor-grok-4\.6|grok-4\.6|composer-2\.5)/, quality: "frontier" },
+  { provider: /^cursor(-account-\d+)?$/, model: /^(cursor-grok-4\.5|grok-4\.5|composer-2(?:-|$))/, quality: "standard" },
   // Direct subscription/API routes
-  { provider: /^openai-codex/, model: /^gpt-5\.(6-(sol|terra|luna)|5|4)/, quality: "frontier" },
-  { provider: /^openai$/, model: /^gpt-5\.(6-(sol|terra|luna)|5|4)/, quality: "standard" },
+  { provider: /^openai-codex/, model: /^gpt-5\.6-sol/, quality: "frontier" },
+  { provider: /^openai-codex/, model: /^gpt-5\.6-terra/, quality: "standard" },
+  { provider: /^openai-codex/, model: /^gpt-5\.6-luna/, quality: "cheap" },
+  { provider: /^openai-codex/, model: /^gpt-5\.(5|4)(?!-(mini|nano))/, quality: "frontier" },
+  { provider: /^openai$/, model: /^gpt-5\.6-sol/, quality: "frontier" },
+  { provider: /^openai$/, model: /^gpt-5\.6-terra/, quality: "standard" },
+  { provider: /^openai$/, model: /^gpt-5\.6-luna/, quality: "cheap" },
+  { provider: /^openai$/, model: /^gpt-5\.(5|4)(?!-(mini|nano))/, quality: "standard" },
   { provider: /^openai$/, model: /^gpt-5\.(4-(mini|nano)|3-codex)/, quality: "cheap" },
-  { provider: /^kimi-coding$/, model: /^(k3|k3-256k|kimi-for-coding-highspeed)$/, quality: "frontier" },
+  { provider: /^kimi-coding$/, model: /^(k3|k3-256k)$/, quality: "frontier" },
   { provider: /^anthropic(-account-\d+)?$/, model: /^claude-opus-5/, quality: "frontier" },
   { provider: /^anthropic(-account-\d+)?$/, model: /^claude-sonnet-5/, quality: "standard" },
   { provider: /^anthropic(-account-\d+)?$/, model: /^claude-haiku-5/, quality: "cheap" },

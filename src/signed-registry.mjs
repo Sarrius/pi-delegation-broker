@@ -109,14 +109,15 @@ function normalizedBrokerRegistry(registry) {
   const resources = {};
   for (const [id, resource] of Object.entries(registry.resources)) {
     requireResourceIdentifier(id, `resource ${id}`);
-    // catalogToBrokerRegistry carries controller-side identity/metadata (`model`, `catalog`)
-    // so the selector can map a lease back to a concrete model. The broker persists neither;
-    // permit and deliberately strip both while normalizing the signed registry. Unknown fields
-    // still fail closed.
+    // catalogToBrokerRegistry carries controller-side identity/metadata (`model`, `catalog`,
+    // `provenance`) so the selector can map and govern a lease. The broker persists none of
+    // them; permit their closed schemas and deliberately strip them while normalizing the signed
+    // registry. Unknown fields still fail closed.
     const keys = [
       "capacityGroup", "profile", "confidence", "enforcement",
       ...(resource.model !== undefined ? ["model"] : []),
       ...(resource.catalog !== undefined ? ["catalog"] : []),
+      ...(resource.provenance !== undefined ? ["provenance"] : []),
     ];
     ownKeysExactly(resource, keys, `resource ${id}`);
     requireIdentifier(resource.capacityGroup, `resource ${id} capacityGroup`);
@@ -132,6 +133,16 @@ function normalizedBrokerRegistry(registry) {
         throw new Error(`resource ${id} model modelId is not a bounded string`);
       }
       model = { provider: resource.model.provider, modelId: resource.model.modelId };
+    }
+    if (resource.provenance !== undefined) {
+      ownKeysExactly(resource.provenance, [
+        "providerClass", "modelDeveloper", "routeProvider", "baseProvider",
+        "billingPool", "nativeToRoute", "source",
+      ], `resource ${id} provenance`);
+      for (const field of ["providerClass", "modelDeveloper", "routeProvider", "baseProvider", "billingPool", "source"]) {
+        requireIdentifier(resource.provenance[field], `resource ${id} provenance ${field}`);
+      }
+      if (typeof resource.provenance.nativeToRoute !== "boolean") throw new Error(`resource ${id} provenance nativeToRoute must be boolean`);
     }
     // Cost was a historic policy field. Accept an old signed input shape only to migrate it,
     // then strip it before signing/persisting: spend is not synchronously observable and is no

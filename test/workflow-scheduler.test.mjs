@@ -55,6 +55,68 @@ test("orchestrator keeps per-node tier and capabilities for the runner", async (
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("declared dependency inputs carry only completed predecessor result references", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-inputs-"));
+  const seen = [];
+  try {
+    const o = new TaskOrchestrator({
+      root,
+      jobId: "workflow-inputs",
+      concurrency: 1,
+      run: async (node) => {
+        seen.push({ id: node.id, inputResults: node.inputResults });
+        return { status: "completed", reportTaskId: `report-${node.id}` };
+      },
+    });
+    o.initialize([
+      { id: "research", task: "research" },
+      { id: "synthesis", task: "synthesize", dependsOn: ["research"], inputs: ["research"] },
+    ]);
+    const state = await o.execute();
+    assert.equal(state.status, "completed");
+    assert.deepEqual(seen.find((entry) => entry.id === "research").inputResults, []);
+    assert.deepEqual(seen.find((entry) => entry.id === "synthesis").inputResults, [{
+      fromNode: "research",
+      result: { status: "completed", reportTaskId: "report-research" },
+    }]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("controller cancellation pauses in-flight nodes and settles the workflow cancelled", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-cancel-"));
+  const controller = new AbortController();
+  try {
+    const o = new TaskOrchestrator({
+      root,
+      jobId: "workflow-cancel",
+      run: async () => new Promise((resolve) => setTimeout(() => resolve({ status: "completed" }), 10)),
+    });
+    o.initialize([{ id: "slow", task: "wait" }]);
+    const pending = o.execute({ signal: controller.signal });
+    controller.abort("cancel");
+    const state = await pending;
+    assert.equal(state.status, "cancelled");
+    assert.equal(state.nodes[0].state, "pending");
+    assert.equal(Number.isSafeInteger(state.completedAt), true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("workflow validation rejects cycles and undeclared dependency inputs", () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-graph-"));
+  try {
+    const cycle = new TaskOrchestrator({ root, jobId: "workflow-cycle", run: async () => ({ status: "completed" }) });
+    assert.throws(() => cycle.initialize([
+      { id: "a", task: "a", dependsOn: ["b"] },
+      { id: "b", task: "b", dependsOn: ["a"] },
+    ]), /cycle/);
+    const input = new TaskOrchestrator({ root, jobId: "workflow-input", run: async () => ({ status: "completed" }) });
+    assert.throws(() => input.initialize([
+      { id: "a", task: "a" },
+      { id: "b", task: "b", inputs: ["a"] },
+    ]), /input must also be a dependency/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("workflow failure summary exposes the terminal reason and route instead of only a count", () => {
   const text = formatWorkflowSummary("workflow-diagnostic", {
     nodes: [{

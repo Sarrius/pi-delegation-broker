@@ -6,7 +6,8 @@ import { effectiveThinkingLevel } from "./model-thinking-policy.mjs";
 import { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionError } from "./worktree.mjs";
 
 const SETTLE_GRACE_MS = 15_000;
-const DEFAULT_PROMPT_TIMEOUT_MS = 180_000;
+const DEFAULT_NO_PROGRESS_TIMEOUT_MS = 180_000;
+const DEFAULT_ATTEMPT_MAX_RUN_MS = 15 * 60_000;
 const MAX_ROUTE_ATTEMPTS = 8;
 const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
 
@@ -27,13 +28,13 @@ const FAILURE_SIGNATURES = Object.freeze([
   // and launch; its 404 is a stale route and must fail over, not kill otherwise valid work.
   Object.freeze({ kind: "unavailable", pattern: /\bmodel\b[^\n]{0,200}\bnot found\b|\b404\b[^\n]{0,300}\bnot_found_error\b/i }),
   // A child that never answers is a dead route, not a dead task: fail over instead of hanging.
-  Object.freeze({ kind: "unavailable", pattern: /\bcontroller prompt deadline\b/i }),
+  Object.freeze({ kind: "unavailable", pattern: /\bcontroller (prompt|no-progress|attempt) deadline\b/i }),
   // Reasoning-mode refusals are route-specific policy, not a dead task: another route accepts it.
   Object.freeze({ kind: "unavailable", pattern: /reasoning is mandatory|cannot be disabled|always engages in thinking/i }),
   // Exhausted credit/balance is this account's problem, not the task's: cool it and move on.
   Object.freeze({ kind: "account_exhausted", pattern: /\b402\b|requires more credits|insufficient (credits|balance)|purchase credits|upgrade to a paid account|third-party apps now draw from your extra usage|claude\.ai\/settings\/usage/i }),
   Object.freeze({ kind: "account_exhausted", pattern: /usage limit (has been )?reached|plan usage limit|usage limit exceeded/i }),
-  Object.freeze({ kind: "unavailable", pattern: /\b(50[0234]|service unavailable|bad gateway|upstream|connection (refused|reset)|econnrefused|etimedout|network)\b/i }),
+  Object.freeze({ kind: "unavailable", pattern: /\b(50[0234]|service unavailable|bad gateway|upstream|connection (error|refused|reset)|econnrefused|etimedout|network)\b/i }),
   // A child that settles with no answer (expired lease IPC, empty final text) is a dead route.
   Object.freeze({ kind: "unavailable", pattern: /child completed without a result|controller lease heartbeat failed|broker behavioral monitor is unavailable/i }),
 ]);
@@ -72,19 +73,29 @@ export class BrokeredChildRunner {
   #delay;
   #sessionsRoot;
   #spawnChild;
-  #promptTimeoutMs;
+  #noProgressTimeoutMs;
+  #attemptMaxRunMs;
   #handles = new Map();
 
-  constructor({ resolver, semaphore = new Semaphore(4), sessionsRoot, delay = defaultDelay, spawnChild = spawnBrokeredChild, promptTimeoutMs = DEFAULT_PROMPT_TIMEOUT_MS }) {
+  constructor({
+    resolver, semaphore = new Semaphore(4), sessionsRoot, delay = defaultDelay,
+    spawnChild = spawnBrokeredChild, promptTimeoutMs,
+    noProgressTimeoutMs = promptTimeoutMs ?? DEFAULT_NO_PROGRESS_TIMEOUT_MS,
+    attemptMaxRunMs = DEFAULT_ATTEMPT_MAX_RUN_MS,
+  }) {
     if (!resolver || typeof resolver.resolve !== "function") throw new Error("BrokeredChildRunner requires a BrokeredLaunchResolver");
     if (!(semaphore instanceof Semaphore)) throw new Error("BrokeredChildRunner requires a Semaphore");
     if (typeof sessionsRoot !== "string") throw new Error("BrokeredChildRunner requires sessionsRoot");
     if (typeof delay !== "function") throw new Error("BrokeredChildRunner requires a delay function");
     if (typeof spawnChild !== "function") throw new Error("BrokeredChildRunner spawnChild must be a function");
-    if (!Number.isSafeInteger(promptTimeoutMs) || promptTimeoutMs < 1_000 || promptTimeoutMs > 3_600_000) {
-      throw new Error("BrokeredChildRunner promptTimeoutMs must be between 1000 and 3600000");
+    if (!Number.isSafeInteger(noProgressTimeoutMs) || noProgressTimeoutMs < 1_000 || noProgressTimeoutMs > 3_600_000) {
+      throw new Error("BrokeredChildRunner noProgressTimeoutMs must be between 1000 and 3600000");
     }
-    this.#promptTimeoutMs = promptTimeoutMs;
+    if (!Number.isSafeInteger(attemptMaxRunMs) || attemptMaxRunMs < noProgressTimeoutMs || attemptMaxRunMs > 24 * 60 * 60_000) {
+      throw new Error("BrokeredChildRunner attemptMaxRunMs must be at least noProgressTimeoutMs and at most 24 hours");
+    }
+    this.#noProgressTimeoutMs = noProgressTimeoutMs;
+    this.#attemptMaxRunMs = attemptMaxRunMs;
     this.#resolver = resolver;
     this.#semaphore = semaphore;
     this.#sessionsRoot = sessionsRoot;
@@ -344,24 +355,45 @@ export class BrokeredChildRunner {
   }
 
   /**
-   * A provider can accept a prompt and never settle it. Recovery is the controller's job, so
-   * bound the wait here: the attempt fails with a route-specific reason and run() fails over.
+   * Timeout is controller safety, not parent waiting. Real child progress resets the watchdog;
+   * a separate absolute attempt ceiling prevents an endlessly chatty child from living forever.
    */
   async #promptWithDeadline(session, prompt) {
-    let timer;
+    let progressTimer;
+    let attemptTimer;
+    let unsubscribe;
+    let rejectDeadline;
+    const deadline = new Promise((_, reject) => { rejectDeadline = reject; });
+    const abortFor = (message) => {
+      void Promise.resolve(session.abort?.()).catch(() => undefined);
+      rejectDeadline(new Error(message));
+    };
+    const resetProgress = () => {
+      if (progressTimer) clearTimeout(progressTimer);
+      progressTimer = setTimeout(
+        () => abortFor(`controller no-progress deadline exceeded after ${this.#noProgressTimeoutMs}ms`),
+        this.#noProgressTimeoutMs,
+      );
+    };
     try {
-      await Promise.race([
-        session.prompt(prompt),
-        new Promise((_, reject) => {
-          timer = setTimeout(
-            () => reject(new Error(`controller prompt deadline exceeded after ${this.#promptTimeoutMs}ms`)),
-            this.#promptTimeoutMs,
-          );
-          timer.unref?.();
-        }),
-      ]);
+      if (typeof session.subscribe === "function") {
+        unsubscribe = session.subscribe((event) => {
+          if ([
+            "message_update", "message_end", "tool_execution_start", "tool_execution_update",
+            "tool_execution_end", "auto_retry_start", "auto_retry_end", "bash_execution_update",
+          ].includes(event?.type)) resetProgress();
+        });
+      }
+      resetProgress();
+      attemptTimer = setTimeout(
+        () => abortFor(`controller attempt deadline exceeded after ${this.#attemptMaxRunMs}ms`),
+        this.#attemptMaxRunMs,
+      );
+      await Promise.race([session.prompt(prompt), deadline]);
     } finally {
-      if (timer) clearTimeout(timer);
+      if (progressTimer) clearTimeout(progressTimer);
+      if (attemptTimer) clearTimeout(attemptTimer);
+      try { unsubscribe?.(); } catch { /* event observation is best effort */ }
     }
   }
 

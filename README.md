@@ -24,7 +24,8 @@ Validated locally on Node 26 with deterministic fake transport, mocked raw-Anthr
 - Contract admission requires child-facing `doneWhen`, exact prompt-digest binding and a positive latency budget.
 - A controller-owned behavioral monitor for typed action reconciliation and no-progress detection. The lease durably binds one effective capability; lease-scoped IPC retrieves it and centrally gates declaration, authorization and completed-tool observation. An effect-capable child receives only a restricted `propose_patch` tool, which applies a validated Git diff only to a disposable worktree; the controller re-applies and checks it in a separate scratch worktree before returning an unapplied patch. Attestation, worktree isolation and controller acceptance checks are mandatory.
 - Registry-defined inventory confidence, pessimistic cooldown policy and one half-open probe per group. Recent credential-free provider listings persist across restart with a bounded TTL; an owner-only routing audit journal records route/failover/legacy transitions and observed token efficiency without prompts, credentials or price data.
-- Capability-aware model selection over a provider set that changes while work runs. A catalog maps to one resource per `(provider, model)`, one capacity group per account (a rate limit cools every model of that account) and one profile per capability tier shared across providers — so a contract pins a *class*, and any live provider in that class can serve it. `selectModelForTask` takes the closest sufficient quality class, escalates only upward, and never uses provider price as policy. User tier policy wins; receipt-backed learning then ranks routes by verified reliability plus observed tokens, latency and attempts. `updateRegistry` applies newly authenticated accounts immediately and drains withdrawn ones instead of deleting them under a live lease; `BrokeredChildRunner.run` classifies a provider rate limit or outage as a routing fact, reports it, and finishes the task on another account.
+- Capability-aware model selection over a provider set that changes while work runs. A catalog maps to one resource per `(provider, model)`, one capacity group per account and one profile per capability tier shared across providers. Before ranking, production extension routing applies hard provenance gates: automatic routes must be current and belong to a native first-party/mixed-subscription billing pool; Cursor's own Grok/Composer pool is distinct from its third-party catalog; OpenRouter/Ollama/opencode aggregators are default-deny and require an exact user tier allowlist. Previous/deprecated/unknown generations never enter autonomous routing, and an unavailable explicit pool denies rather than silently broadening to the catalog. Receipt-backed learning can reorder only the already eligible set.
+- Parent-free durable workflow jobs. `delegate_workflow` submits atomically and returns a workflow id by default; `delegate_status`, `delegate_list`, `delegate_collect` and `delegate_cancel` operate on the durable lifecycle. Read-only workflows recover after controller restart, cancellation is idempotent, dependency reports are passed only through explicit `inputs`, and submission acknowledgement, no-progress watchdog, absolute attempt ceiling and whole-workflow deadline are separate controls.
 - Persistent content-addressed, redacted controller evidence with command/file/test/URL semantic recapture comparators and explicit retention/pruning; self-reported evidence cannot satisfy acceptance. `ControllerAcceptanceVerifier` runs a fixed controller-owned command/test plan serially; `ControllerVerificationAuthority` retains a receipt bound to exact task/lease/fence, and `ControllerQueuedTaskVerifier` alone connects close→verify→terminal finalization.
 - SHA-256-hashed lease capabilities for owner-only Unix-socket IPC.
 - Signed Ed25519 capability-registry verification before supervisor startup.
@@ -87,7 +88,20 @@ The parent extension exposes controller-owned policy controls; they edit only `~
 /delegation-broker tier standard remove glm-5.3 zai
 ```
 
-`models` reports catalog/live broker health without credentials. Delegation results and `status` show tier, decision source (`user`, `learned`, or `auto`), actual leased account, legacy exclusion/fallback and any failover hops. `delegate` also accepts `proposeChangesIn` plus controller acceptance checks for the restricted, unapplied patch workflow.
+`models` reports catalog/live broker health and credential-free provenance (`providerClass/billingPool/modelDeveloper`). Empty tier lists mean strict automatic subscription-native/current-only selection. Adding an exact model/provider entry is an explicit allowlist and is how an aggregator route is enabled. An unavailable explicit tier denies; it never falls back to the whole catalog. Delegation results show the policy fingerprint, tier, decision source, actual leased account, billing pool, freshness and failover trail. `delegate` also accepts `proposeChangesIn` plus controller acceptance checks for the restricted, unapplied patch workflow.
+
+Read-only `delegate` and `delegate_workflow` are asynchronous by default:
+
+```text
+delegate({ task, tier?, idempotencyKey?, deadlineMs? }) -> task id
+delegate_workflow({ nodes, concurrency?, idempotencyKey?, deadlineMs? }) -> workflow id
+delegate_status({ id })
+delegate_list({ states? })
+delegate_collect({ taskId: id })
+delegate_cancel({ id, reason? })
+```
+
+Set `wait: true` only for compatibility with a short synchronous caller. The workflow deadline remains controller safety; it does not make the parent wait.
 
 ## Minimal API shape
 

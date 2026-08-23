@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -27,32 +27,54 @@ function registry() {
     { provider: "zai", api: "openai-completions", baseUrl: "https://x", models: [model("glm-5.3", "zai")] },
   ], { confidence: "observed" });
 }
-function select(preferences, constraints = {}) {
-  return selectModelForTask({ taskDescription: "implement a small feature", registry: registry(), preferences, constraints: { taskId: "preference-test", promptDigest: digest, ...constraints } });
+function currentCurrency(reg = registry()) {
+  return Object.fromEntries(Object.keys(reg.resources).map((id) => [id, { generation: 0, listed: true, legacy: false }]));
+}
+function select(preferences, constraints = {}, currency = currentCurrency()) {
+  return selectModelForTask({
+    taskDescription: "implement a small feature",
+    registry: registry(),
+    preferences,
+    currency,
+    enforceQuality: true,
+    enforceProvenance: true,
+    constraints: { taskId: "preference-test", promptDigest: digest, ...constraints },
+  });
 }
 
-test("default policy has curated frontier and deliberately empty standard/cheap", () => {
+test("default policy uses automatic subscription-native pools for every tier", () => {
   const preferences = normalizeModelPreferences(DEFAULT_MODEL_PREFERENCES);
-  assert.equal(preferences.tiers.frontier.length, 5);
+  assert.deepEqual(preferences.tiers.frontier, []);
   assert.deepEqual(preferences.tiers.standard, []);
   assert.deepEqual(preferences.tiers.cheap, []);
-  assert.equal(preferenceMatches(preferences.tiers.frontier, { provider: "openai-codex-account-2", modelId: "gpt-5.6-sol" }), true);
-  assert.equal(preferenceMatches(preferences.tiers.frontier, { provider: "openrouter", modelId: "gpt-5.6-sol" }), false, "subscription route is allowed, pay-per-token route is not");
 });
 
-test("user frontier choice wins when a permitted route is live", () => {
+test("automatic frontier selection chooses a current first-party subscription route", () => {
   const result = select(DEFAULT_MODEL_PREFERENCES, { modelTier: "frontier" });
   assert.equal(result.action, "allow");
   assert.deepEqual(result.expectedModel, { provider: "openai-codex-account-2", modelId: "gpt-5.6-sol" });
-  assert.equal(result.selection.preferenceSource, "user");
-  assert.equal(result.selection.modelTier, "frontier");
+  assert.equal(result.selection.preferenceSource, "auto");
+  assert.equal(result.selection.billingPool, "native_subscription");
+  assert.equal(result.selection.freshness, "current");
+  assert.match(result.selection.policyGeneration, /^[a-f0-9]{64}$/);
 });
 
-test("unservable user tier falls back to controller auto-selection rather than blocking work", () => {
+test("an unavailable explicit pool denies instead of silently broadening to auto", () => {
   const preferences = { schemaVersion: 1, tiers: { frontier: [{ model: "claude-opus-5", via: ["openrouter"] }], standard: [], cheap: [] } };
   const result = select(preferences, { modelTier: "frontier" });
-  assert.equal(result.action, "allow");
-  assert.equal(result.selection.preferenceSource, "auto_user_tier_unavailable");
+  assert.equal(result.action, "deny");
+  assert.match(result.reason, /explicit model pool/);
+});
+
+test("an explicit current aggregator allowlist is honored but previous generations stay denied", () => {
+  const preferences = { schemaVersion: 1, tiers: { frontier: [{ model: "grok-4.6", via: ["openrouter"] }], standard: [], cheap: [] } };
+  const current = select(preferences, { modelTier: "frontier" });
+  assert.equal(current.action, "allow");
+  assert.deepEqual(current.expectedModel, { provider: "openrouter", modelId: "grok-4.6" });
+  const currency = currentCurrency();
+  currency["openrouter/grok-4.6"] = { generation: 1, listed: true, legacy: false };
+  const previous = select(preferences, { modelTier: "frontier" }, currency);
+  assert.equal(previous.action, "deny");
 });
 
 test("task levels default from capability but caller may override", () => {
@@ -72,6 +94,28 @@ test("policy mutations merge provider routes and remove only what the user names
   const removed = removeModelPreference(partial, { tier: "standard", model: "glm-5.3" });
   assert.deepEqual(removed.tiers.standard, []);
   assert.throws(() => addModelPreference(seeded, { tier: "not-a-tier", model: "glm-5.3", via: ["zai"] }), /tier/);
+});
+
+test("the exact legacy shipped seed migrates to strict automatic mode", () => {
+  const root = mkdtempSync(join(tmpdir(), "prefs-legacy-"));
+  const path = join(root, "preferences.json");
+  try {
+    const legacy = {
+      schemaVersion: 1,
+      tiers: {
+        frontier: [
+          { model: "gpt-5.6-sol", via: ["openai-codex*"] },
+          { model: "kimi-k3", via: ["kimi-coding", "ollama"] },
+          { model: "glm-5.3", via: ["zai", "opencode-go-api"] },
+          { model: "grok-4.6", via: ["openrouter"] },
+          { model: "claude-opus-5", via: ["openrouter"] },
+        ],
+        standard: [], cheap: [],
+      },
+    };
+    writeFileSync(path, `${JSON.stringify(legacy)}\n`);
+    assert.deepEqual(loadModelPreferences(path), normalizeModelPreferences(DEFAULT_MODEL_PREFERENCES));
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("preferences persist owner-side and reject invalid provider routes", () => {

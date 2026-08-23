@@ -151,7 +151,7 @@ function listingModelIds(listing) {
  * signal. Providers absent from the map contribute no listing fact rather than being punished
  * for a probe outage.
  */
-export function buildCurrencyMap({ resources, liveListings } = {}) {
+export function buildCurrencyMap({ resources, liveListings, evaluatedAt } = {}) {
   if (!Array.isArray(resources)) throw new Error("buildCurrencyMap requires resources");
   const allIds = resources.map((resource) => resource.modelId);
   // The live listing matters even for models the user has not configured. If their stale Pi
@@ -198,6 +198,8 @@ export function buildCurrencyMap({ resources, liveListings } = {}) {
     currency[`${provider}/${modelId}`] = Object.freeze({
       generation,
       listed,
+      source: listed === null ? "catalog_generation" : "provider_listing",
+      ...(Number.isSafeInteger(evaluatedAt) ? { evaluatedAt } : {}),
       ...(Number.isSafeInteger(createdAt) ? { createdAt } : {}),
       ...(staleByDate ? { staleByDate: true } : {}),
       legacy: generation >= LEGACY_GENERATION,

@@ -23,6 +23,7 @@
 
 import { preferenceMatches, taskModelTier } from "./model-preferences.mjs";
 import { meetsQualityFloor, qualityForModel, QUALITY_TIERS } from "./model-quality-catalog.mjs";
+import { evaluateRouteEligibility, modelPolicyGeneration } from "./model-provenance-policy.mjs";
 
 const CONFIDENCE_RANK = Object.freeze({ measured: 0, observed: 1, assumed: 2 });
 const OPERATION_CLASSES = Object.freeze(new Set(["observe", "propose_patch", "apply", "external_write"]));
@@ -236,7 +237,7 @@ function requiresHardBudget(budget) {
  * `{action:"deny", reason}`. `alternatives` lists the remaining ranked classes so a caller that
  * hits `denied_capacity` can retry one tier up without re-deriving the requirement.
  */
-export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, currency, preferences, learnedRanker, enforceQuality = false, now } = {}) {
+export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, currency, preferences, learnedRanker, enforceQuality = false, enforceProvenance = false, now } = {}) {
   if (!registry?.profiles || !registry?.resources) throw new Error("selectModelForTask requires a broker registry");
   if (constraints !== undefined && (typeof constraints !== "object" || constraints === null || Array.isArray(constraints))) {
     throw new Error("selectModelForTask constraints must be an object");
@@ -267,12 +268,24 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         if (excluded.has(id)) continue;
         if (allowedProviders && !allowedProviders.has(resource.model?.provider ?? id)) continue;
         const identity = resource.model ?? parseResourceModel(id);
-        if (userOnly && (!identity || !preferenceMatches(preferenceEntries, identity))) continue;
+        const explicitlyAllowed = Boolean(userOnly && identity && preferenceMatches(preferenceEntries, identity));
+        if (userOnly && !explicitlyAllowed) continue;
         // Empty user tiers mean controller auto mode, not "any model the aggregator happens
         // to list". Require the researched quality floor before efficiency ranking can participate.
-        if (enforceQuality && !userOnly && (!identity || !meetsQualityFloor(identity, modelTier))) continue;
+        const meetsQuality = Boolean(identity && meetsQualityFloor(identity, modelTier));
+        if (enforceQuality && !userOnly && !meetsQuality) continue;
         const fact = currencyLookup.get(id);
-        if (fact?.legacy === true) {
+        let provenance;
+        if (enforceProvenance) {
+          const eligibility = evaluateRouteEligibility({
+            identity, resource, currencyFact: fact, explicitlyAllowed, requestedTier: modelTier, meetsQuality,
+          });
+          if (!eligibility.eligible) {
+            if (eligibility.provenance.freshness !== "current") sawLegacy = true;
+            continue;
+          }
+          provenance = eligibility.provenance;
+        } else if (fact?.legacy === true) {
           if (!includeLegacy) { sawLegacy = true; continue; }
         }
         const group = registry.capacityGroups?.[resource.capacityGroup];
@@ -282,7 +295,7 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
           resourceConfidence: resource.confidence,
           groupConfidence: group?.confidence,
         })) continue;
-        entries.push({ id, resource, generation: fact?.generation });
+        entries.push({ id, resource, generation: fact?.generation, provenance });
       }
       if (entries.length === 0) continue;
       tiers.push(Object.freeze({
@@ -297,6 +310,7 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
           confidence: entry.resource.confidence,
           ...(entry.generation !== undefined ? { generation: entry.generation } : {}),
           ...(entry.resource.model ? { model: Object.freeze({ ...entry.resource.model }) } : {}),
+          ...(entry.provenance ? { provenance: Object.freeze({ ...entry.provenance }) } : {}),
         }))),
       }));
     }
@@ -310,12 +324,12 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
   // fall back to automatic selection rather than stranding work on a user preference.
   let preferenceSource = preferenceEntries.length > 0 ? "user" : "auto";
   let tiers = buildTiers(false, preferenceEntries.length > 0);
-  if (tiers.length === 0 && preferenceEntries.length > 0) {
+  if (tiers.length === 0 && preferenceEntries.length > 0 && !enforceProvenance) {
     preferenceSource = "auto_user_tier_unavailable";
     tiers = buildTiers(false);
   }
   let legacyFallback = false;
-  if (tiers.length === 0 && sawLegacy) {
+  if (tiers.length === 0 && sawLegacy && !enforceProvenance) {
     // Last resort, and visible: the whole current fleet is unusable, so history gets one
     // chance — marked, so the route trail shows the harness ran on a stale model knowingly.
     preferenceSource = "legacy_emergency";
@@ -324,6 +338,8 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
   }
 
   if (tiers.length === 0) {
+    if (enforceProvenance && preferenceEntries.length > 0) return deny("explicit model pool has no current eligible route");
+    if (enforceProvenance) return deny("no current subscription native resource serves the required capabilities");
     return deny(hardBudget
       ? "no live resource with measured or observed inventory serves the required capabilities"
       : "no live resource serves the required capabilities");
@@ -363,6 +379,16 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
       capacityGroupCount: chosen.capacityGroups.length,
       modelTier,
       preferenceSource,
+      policyGeneration: modelPolicyGeneration(preferences ?? { schemaVersion: 0 }),
+      ...(preferred.provenance ? {
+        providerClass: preferred.provenance.providerClass,
+        modelDeveloper: preferred.provenance.modelDeveloper,
+        billingPool: preferred.provenance.billingPool,
+        nativeToRoute: preferred.provenance.nativeToRoute,
+        freshness: preferred.provenance.freshness,
+        freshnessSource: preferred.provenance.freshnessSource,
+        ...(preferred.provenance.freshnessEvaluatedAt ? { freshnessEvaluatedAt: preferred.provenance.freshnessEvaluatedAt } : {}),
+      } : {}),
       // Inform the controller that at least one otherwise compatible route was deliberately
       // excluded for currency. This is diagnostic provenance, never a reason to revive it.
       ...(sawLegacy ? { legacyExcluded: true } : {}),
@@ -453,7 +479,7 @@ function defaultDoneWhen(operationClass) {
  * The callback reads only `request.capabilityRequest`, never a prompt: the resolver contract is
  * that a launch request carries no raw task text.
  */
-export function createSelectContract({ registry, availability, currency, preferences, learnedRanker, enforceQuality = false, constraints = {}, now = () => Date.now() } = {}) {
+export function createSelectContract({ registry, availability, currency, preferences, learnedRanker, enforceQuality = false, enforceProvenance = false, constraints = {}, now = () => Date.now() } = {}) {
   if (registry === undefined) throw new Error("createSelectContract requires a registry or a registry provider");
   const readRegistry = typeof registry === "function" ? registry : () => registry;
   const readAvailability = typeof availability === "function" ? availability : () => availability;
@@ -477,6 +503,7 @@ export function createSelectContract({ registry, availability, currency, prefere
       preferences: readPreferences(),
       learnedRanker,
       enforceQuality,
+      enforceProvenance,
       constraints: merged,
       now: now(),
     });

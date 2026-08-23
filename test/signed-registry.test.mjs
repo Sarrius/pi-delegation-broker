@@ -53,6 +53,25 @@ test("valid Ed25519 registry has a deterministic fingerprint and frozen broker p
   assert.equal(verified.brokerRegistry.resources.R1.profile, "reasoning-high/v1");
 });
 
+test("closed controller provenance metadata can be signed but is stripped from broker authority", () => {
+  const registry = registryPayload();
+  registry.resources.R1.provenance = {
+    providerClass: "first_party_subscription",
+    modelDeveloper: "openai",
+    routeProvider: "openai-codex",
+    baseProvider: "openai-codex",
+    billingPool: "native_subscription",
+    nativeToRoute: true,
+    source: "subscription-native-current-only/v1",
+  };
+  const { envelope, trustedKeys } = signedEnvelopeWithKey(registry);
+  const verified = verifySignedRegistry(envelope, { trustedKeys, now: NOW });
+  assert.equal(verified.brokerRegistry.resources.R1.provenance, undefined);
+  const malformed = registryPayload();
+  malformed.resources.R1.provenance = { unexpected: true };
+  assert.throws(() => signedRegistryMessage({ schemaVersion: 2, keyId: "release-2026", registry: malformed }), /provenance.*unsupported/);
+});
+
 test("signature, trust key and validity interval are fail-closed", () => {
   const { envelope, trustedKeys } = signedEnvelopeWithKey();
   const altered = structuredClone(envelope);

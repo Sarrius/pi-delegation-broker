@@ -13,6 +13,8 @@
  * The broker trusts the snapshot, not the extension.
  */
 
+import { deriveModelProvenance } from "./model-provenance-policy.mjs";
+
 const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 // A model id may carry a vendor path, a variant suffix and a rolling-alias marker —
 // `anthropic/claude-opus-5:batch`, `cohere/north-mini-code:free`, `~openai/gpt-latest`. Those
@@ -178,6 +180,7 @@ export function catalogToBrokerRegistry(catalog, options = {}) {
         confidence,
         enforcement: Object.freeze({ input: "hard", output: "hard" }),
         model: Object.freeze({ provider: entry.provider, modelId: model.id }),
+        provenance: deriveModelProvenance({ provider: entry.provider, modelId: model.id }),
         catalog: Object.freeze({
           name: model.name,
           contextWindow: model.contextWindow,
