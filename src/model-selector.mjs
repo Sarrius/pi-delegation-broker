@@ -272,9 +272,9 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         if (userOnly && !explicitlyAllowed) continue;
         // Empty user tiers mean controller auto mode, not "any model the aggregator happens
         // to list". Require the researched quality floor before efficiency ranking can participate.
-        const meetsQuality = Boolean(identity && meetsQualityFloor(identity, modelTier));
-        if (enforceQuality && !userOnly && !meetsQuality) continue;
         const fact = currencyLookup.get(id);
+        const meetsQuality = Boolean(identity && meetsQualityFloor({ ...identity, generation: fact?.generation }, modelTier));
+        if (enforceQuality && !userOnly && !meetsQuality) continue;
         let provenance;
         if (enforceProvenance) {
           const eligibility = evaluateRouteEligibility({

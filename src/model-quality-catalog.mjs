@@ -5,7 +5,13 @@
  * aggregator can publish a brand-new tiny/free model beside a current frontier model. This
  * controller policy admits only researched current families to automatic routing. User tiers
  * still override it; learned affinities can only reorder resources already above this floor.
+ *
+ * First-party/mixed native routes that a live `/models` listing ranks as generation 0/1
+ * are admitted even before the regex table is edited. Aggregators stay allow-listed:
+ * a brand-new listing there is not proof of quality.
  */
+import { providerClassFor } from "./model-provenance-policy.mjs";
+
 const RULES = Object.freeze([
   // Cursor's own subscription billing pool is separate from third-party Claude/GPT/Gemini
   // routes. Provenance enforcement is the hard gate; these rules only assign quality inside it.
@@ -37,10 +43,15 @@ const RULES = Object.freeze([
 ]);
 const RANK = Object.freeze({ cheap: 0, standard: 1, frontier: 2 });
 
-export function qualityForModel({ provider, modelId } = {}) {
+export function qualityForModel({ provider, modelId, generation } = {}) {
   if (typeof provider !== "string" || typeof modelId !== "string" || /:free\b/i.test(modelId)) return undefined;
   const match = RULES.find((rule) => rule.provider.test(provider) && rule.model.test(modelId));
-  return match?.quality;
+  if (match) return match.quality;
+  const providerClass = providerClassFor(provider);
+  if (providerClass !== "first_party_subscription" && providerClass !== "mixed_subscription") return undefined;
+  if (generation === 0) return "frontier";
+  if (generation === 1) return "standard";
+  return undefined;
 }
 
 /** A model may serve its own quality tier and less demanding automatic tiers. */
