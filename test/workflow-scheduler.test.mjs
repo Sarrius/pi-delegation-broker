@@ -3,7 +3,18 @@ import test from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { TaskOrchestrator } from "../src/workflow-scheduler.mjs";
+import { TaskOrchestrator, formatWorkflowSummary, workflowObserveCapabilityRequest } from "../src/workflow-scheduler.mjs";
+
+test("workflow stages stay read-only even when their prompt says do not modify files", () => {
+  const request = workflowObserveCapabilityRequest({
+    task: "Audit the repository. Do not modify files or create a report on disk.",
+    tier: "frontier",
+    capabilities: ["large_context"],
+  }, "workflow-safe-read");
+  assert.equal(request.operationClass, "observe");
+  assert.equal(request.modelTier, "frontier");
+  assert.deepEqual(request.requiredCapabilities, ["large_context"]);
+});
 
 test("orchestrator runs independent work in parallel and blocks dependents after failure", async () => {
   const root = mkdtempSync(join(tmpdir(), "orchestrator-"));
@@ -42,6 +53,22 @@ test("orchestrator keeps per-node tier and capabilities for the runner", async (
     assert.equal(seen.find((node) => node.id === "hard").tier, "frontier");
     assert.equal(state.nodes.find((node) => node.id === "read").tier, "cheap");
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("workflow failure summary exposes the terminal reason and route instead of only a count", () => {
+  const text = formatWorkflowSummary("workflow-diagnostic", {
+    nodes: [{
+      id: "research",
+      state: "failed",
+      result: {
+        status: "failed",
+        error: "controller prompt deadline exceeded",
+        route: [{ resourceId: "openai-codex/gpt-5.6-sol", outcome: "unavailable" }],
+      },
+    }],
+  });
+  assert.match(text, /research: failed — controller prompt deadline exceeded/);
+  assert.match(text, /openai-codex\/gpt-5\.6-sol:unavailable/);
 });
 
 test("orchestrator rejects an invalid tier before any work starts", () => {

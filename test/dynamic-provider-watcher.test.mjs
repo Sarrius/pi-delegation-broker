@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fixtureRegistry, SqliteLeaseBroker } from "../src/broker.mjs";
-import { DynamicProviderWatcher } from "../src/dynamic-provider-watcher.mjs";
+import { DynamicProviderWatcher, modelRegistryToProviderCatalog } from "../src/dynamic-provider-watcher.mjs";
 
 function modelsStore(providers) {
   const store = {};
@@ -25,6 +25,32 @@ function authJson(providers) {
   for (const p of providers) auth[p] = { type: "api-key", key: "test" };
   return auth;
 }
+
+test("live model registry preserves per-account model availability", async () => {
+  const models = [
+    { provider: "openai-codex", id: "gpt-5.6-sol", api: "openai-codex-responses", baseUrl: "https://chatgpt.com/backend-api/codex", input: ["text"], reasoning: true },
+    { provider: "openai-codex-account-5", id: "gpt-5.6-terra", api: "openai-codex-responses", baseUrl: "https://chatgpt.com/backend-api/codex", input: ["text"], reasoning: true },
+  ];
+  const catalog = modelRegistryToProviderCatalog(models, {
+    authorizedProviders: ["openai-codex", "openai-codex-account-5"],
+  });
+  assert.deepEqual(catalog.find((entry) => entry.provider === "openai-codex").models.map((model) => model.id), ["gpt-5.6-sol"]);
+  assert.deepEqual(catalog.find((entry) => entry.provider === "openai-codex-account-5").models.map((model) => model.id), ["gpt-5.6-terra"]);
+
+  const root = mkdtempSync(join(tmpdir(), "dpw-runtime-"));
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  try {
+    const broker = new SqliteLeaseBroker({ path: join(root, "broker.sqlite"), registry: fixtureRegistry() });
+    const watcher = new DynamicProviderWatcher({ agentDir, broker, readCatalog: () => catalog });
+    await watcher.refresh();
+    const resources = watcher.currentRegistry().resources;
+    assert.ok(resources["openai-codex/gpt-5.6-sol"]);
+    assert.ok(resources["openai-codex-account-5/gpt-5.6-terra"]);
+    assert.equal(resources["openai-codex-account-5/gpt-5.6-sol"], undefined);
+    watcher.stop(); broker.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test("dynamic provider watcher reloads broker registry when catalog changes", async () => {
   const root = mkdtempSync(join(tmpdir(), "dpw-"));

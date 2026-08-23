@@ -23,6 +23,9 @@ const FAILURE_SIGNATURES = Object.freeze([
   // Capability/organization policy rejection is route-specific: the same task can run on
   // another account/model, so quarantine this resource and let controller failover continue.
   Object.freeze({ kind: "unavailable", pattern: /\b(unsupported_value|reasoning summaries|organization must be verified|model is not supported)\b/i }),
+  // Provider catalogs are observations, not authority. A model can disappear between discovery
+  // and launch; its 404 is a stale route and must fail over, not kill otherwise valid work.
+  Object.freeze({ kind: "unavailable", pattern: /\bmodel\b[^\n]{0,200}\bnot found\b|\b404\b[^\n]{0,300}\bnot_found_error\b/i }),
   // A child that never answers is a dead route, not a dead task: fail over instead of hanging.
   Object.freeze({ kind: "unavailable", pattern: /\bcontroller prompt deadline\b/i }),
   // Reasoning-mode refusals are route-specific policy, not a dead task: another route accepts it.

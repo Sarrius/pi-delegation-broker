@@ -84,6 +84,7 @@ test("a provider rate limit is classified as a routing fact, not a child failure
   assert.equal(classifyChildFailure("No API key found for cursor."), "auth_fatal");
   assert.equal(classifyChildFailure("prompt is too long for the context window"), "context_exhausted");
   assert.equal(classifyChildFailure("503 service unavailable"), "unavailable");
+  assert.equal(classifyChildFailure(`404: {"message":"model 'deepseek-v4-pro:0813' not found","type":"not_found_error"}`), "unavailable");
   assert.equal(classifyChildFailure("the tests did not pass"), "fatal");
   assert.equal(classifyChildFailure("child completed without a result"), "unavailable");
   assert.equal(classifyChildFailure("controller lease heartbeat failed"), "unavailable");
@@ -152,6 +153,26 @@ test("a context overflow re-routes without blaming the provider", async () => {
     assert.equal(result.status, "completed");
     assert.equal(result.route[0].outcome, "context_exhausted");
     assert.deepEqual(resolver.reports, [], "the account is healthy; only this route was wrong");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a stale catalog model 404 is quarantined and retried on another route", async () => {
+  const resolver = fakeResolver({ resources: [{ id: "ollama/stale" }, { id: "cursor/live" }] });
+  const { runner, root } = runnerWith(resolver, scriptedSpawn([
+    { error: `404: {"message":"model 'stale' not found","type":"not_found_error"}` },
+    { text: "done" },
+  ]));
+
+  try {
+    const result = await runner.run({ childId: "job-stale-model", promptDigest: "c".repeat(64), cwd: root, prompt: "x" });
+    assert.equal(result.status, "completed");
+    assert.deepEqual(result.route.map((attempt) => [attempt.resourceId, attempt.outcome]), [
+      ["ollama/stale", "unavailable"],
+      ["cursor/live", "completed"],
+    ]);
+    assert.deepEqual(resolver.reports.map((report) => [report.resourceId, report.kind]), [["ollama/stale", "unavailable"]]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

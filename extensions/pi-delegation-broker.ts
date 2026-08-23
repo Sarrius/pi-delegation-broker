@@ -41,12 +41,16 @@ import {
   RoutingBoard,
   RoutingAuditJournal,
   TaskOrchestrator,
+  formatWorkflowSummary,
+  workflowObserveCapabilityRequest,
   SingleHostBrokerSupervisor,
   buildCurrencyMap,
+  catalogToBrokerRegistry,
   createSelectContract,
   createControllerVerifierRunId,
   DEFAULT_MODEL_PREFERENCES,
   loadModelPreferences,
+  modelRegistryToProviderCatalog,
   qualityForModel,
   parseResourceModel,
   probeProviderModels,
@@ -83,6 +87,8 @@ const REPORTS_DIR = join(STATE_DIR, "reports");
 const REGISTRY_KEY_ID = "controller";
 const CURRENCY_REFRESH_MS = 15 * 60 * 1_000;
 const CURRENCY_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
+const MODEL_CATALOG_REQUEST_EVENT = "pi:model-catalog:request:v1";
+const MODEL_CATALOG_SNAPSHOT_EVENT = "pi:model-catalog:snapshot:v1";
 
 const CAPABILITIES = ["text_generation", "code_reasoning", "large_context", "vision_input"] as const;
 
@@ -257,10 +263,22 @@ function probeRoutes(registry: any) {
   return routes;
 }
 
-async function startBroker(): Promise<BrokerRuntime> {
+function liveProviderCatalog(ctx: any, supplementalModels: any[] = []) {
+  const runtimeModels = ctx?.modelRegistry?.getAll?.() ?? ctx?.modelRegistry?.getAvailable?.();
+  if (!Array.isArray(runtimeModels)) throw new Error("Pi live model registry is unavailable");
+  const suppliedProviders = new Set(supplementalModels.map((model) => model?.provider).filter(Boolean));
+  const merged = [
+    ...runtimeModels.filter((model: any) => !suppliedProviders.has(model?.provider)),
+    ...supplementalModels,
+  ];
+  const auth = readJson(join(PARENT_AGENT_DIR, "auth.json"));
+  return modelRegistryToProviderCatalog(merged, { authorizedProviders: Object.keys(auth) });
+}
+
+async function startBroker(ctx: any, getSupplementalModels: () => any[]): Promise<BrokerRuntime> {
   if (!existsSync(PREFERENCES_PATH)) writeModelPreferences(PREFERENCES_PATH, DEFAULT_MODEL_PREFERENCES);
   const keys = loadOrCreateRegistryKeys();
-  const registry = readProviderRegistry(PARENT_AGENT_DIR);
+  const registry = catalogToBrokerRegistry(liveProviderCatalog(ctx, getSupplementalModels()), { confidence: "observed" });
   const now = Date.now();
   const payload = {
     registryVersion: `session-${now}`,
@@ -289,6 +307,7 @@ async function startBroker(): Promise<BrokerRuntime> {
     signedRegistry,
     trustedRegistryKeys: { [REGISTRY_KEY_ID]: keys.publicKey },
     dynamicProviders: true,
+    dynamicProviderCatalog: () => liveProviderCatalog(ctx, getSupplementalModels()),
     sweepIntervalMs: 1_000,
   });
   await supervisor.start();
@@ -432,10 +451,19 @@ export default function piDelegationBroker(pi: any) {
   // Task ids already surfaced, or already sitting unread when this session started.
   // Seeded on session_start so a restart cannot dump yesterday's inbox onto the first prompt.
   let notifiedUnread = new Set<string>();
+  let supplementalModels: any[] = [];
 
-  const ensureBroker = (): Promise<BrokerRuntime> => {
+  pi.events?.on?.(MODEL_CATALOG_SNAPSHOT_EVENT, (payload: any) => {
+    if (payload?.schemaVersion !== 1 || !Array.isArray(payload.models) || payload.models.length > 10_000) return;
+    const valid = payload.models.filter((model: any) => model && typeof model.provider === "string" && typeof model.id === "string");
+    supplementalModels = valid.map((model: any) => ({ ...model }));
+    runtime?.supervisor?.providerWatcher?.refresh?.().catch(() => undefined);
+  });
+
+  const ensureBroker = (ctx: any = lastCtx): Promise<BrokerRuntime> => {
     if (runtime) return Promise.resolve(runtime);
-    starting ??= startBroker()
+    if (!ctx) return Promise.reject(new Error("delegation broker has no active Pi context"));
+    starting ??= startBroker(ctx, () => supplementalModels)
       .then((started) => { runtime = started; return started; })
       .catch((error) => { starting = undefined; throw error; });
     return starting;
@@ -453,10 +481,11 @@ export default function piDelegationBroker(pi: any) {
 
   pi.on("session_start", (_event: any, ctx: any) => {
     lastCtx = ctx;
+    pi.events?.emit?.(MODEL_CATALOG_REQUEST_EVENT, { schemaVersion: 1 });
     try { pruneReports(REPORTS_DIR); } catch { /* pruning is best effort */ }
     try { notifiedUnread = seedNotifiedUnread(unreadReports(REPORTS_DIR)); } catch { notifiedUnread = new Set(); }
     // Activation is explicit: a stopped broker stays stopped across sessions.
-    if (enabled) ensureBroker().catch(() => undefined);
+    if (enabled) ensureBroker(ctx).catch(() => undefined);
   });
 
   // Newly settled reports go through systemPrompt, never `{ message }`. Pi converts custom
@@ -488,7 +517,7 @@ export default function piDelegationBroker(pi: any) {
       if (action === "start") {
         enabled = true;
         writeEnabled(true);
-        await ensureBroker().catch(() => undefined);
+        await ensureBroker(ctx).catch(() => undefined);
         ctx.ui.notify("Delegation broker enabled", "info");
         return;
       }
@@ -595,7 +624,7 @@ export default function piDelegationBroker(pi: any) {
       lastCtx = ctx;
       let broker: BrokerRuntime;
       try {
-        broker = await ensureBroker();
+        broker = await ensureBroker(ctx);
       } catch (error) {
         return {
           content: [{ type: "text", text: `Delegation unavailable: broker failed to start (${(error as Error).message})` }],
@@ -822,22 +851,24 @@ export default function piDelegationBroker(pi: any) {
     parameters: WORKFLOW_PARAMS,
     async execute(_id: string, params: { nodes: any[]; concurrency?: number }, _signal: AbortSignal, onUpdate: any, ctx: any) {
       if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
-      const broker = await ensureBroker();
+      lastCtx = ctx;
+      const broker = await ensureBroker(ctx);
       const workflowId = `workflow-${Date.now().toString(36)}-${++counter}`;
       const orchestrator = new TaskOrchestrator({
         path: join(STATE_DIR, "workflows", `${workflowId}.json`), concurrency: params.concurrency ?? 4,
         run: async (node: any) => {
           const task = node.task;
           onUpdate?.({ content: [{ type: "text", text: `Running workflow stage ${node.id}…` }] });
-          return broker.runner.run({ childId: `${workflowId}-${node.id}`, prompt: task, cwd: ctx.cwd, thinkingLevel: "off",
+          const childId = `${workflowId}-${node.id}`;
+          return broker.runner.run({ childId, prompt: task, cwd: ctx.cwd, thinkingLevel: "off",
             promptDigest: createHash("sha256").update(task).digest("hex"),
-            capabilityRequest: { taskDescription: task, ...(node.capabilities?.length ? { requiredCapabilities: node.capabilities } : {}), ...(node.tier ? { modelTier: node.tier } : {}) } });
+            capabilityRequest: workflowObserveCapabilityRequest(node, childId) });
         },
       });
       orchestrator.initialize(params.nodes);
       const state = await orchestrator.execute();
       const incomplete = state.nodes.filter((node: any) => node.state !== "completed");
-      return { content: [{ type: "text", text: incomplete.length ? `Workflow ${workflowId} has ${incomplete.length} failed/blocked stages.` : `Workflow ${workflowId} completed.` }], isError: incomplete.length > 0, details: state };
+      return { content: [{ type: "text", text: formatWorkflowSummary(workflowId, state) }], isError: incomplete.length > 0, details: state };
     },
   });
 }

@@ -2,9 +2,48 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$/;
 const TIER = new Set(["cheap", "standard", "frontier"]);
 function fail(message) { throw new Error(`task orchestrator: ${message}`); }
 function save(path, state) { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); writeFileSync(path, `${JSON.stringify(state)}\n`, { mode: 0o600 }); }
+function oneLine(value, max = 500) {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const text = value.replace(/\s+/g, " ").trim();
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/** Human-readable terminal summary. Failures must carry their controller-owned reason in the
+ * tool text: callers often do not render the structured details object, and an opaque count
+ * turns a recoverable route failure into an eight-minute blind retry. */
+export function formatWorkflowSummary(workflowId, state) {
+  if (typeof workflowId !== "string" || !TASK_ID.test(workflowId)) fail("workflow id is invalid");
+  if (!state || !Array.isArray(state.nodes)) fail("workflow state is invalid");
+  const incomplete = state.nodes.filter((node) => node.state !== "completed");
+  if (!incomplete.length) return `Workflow ${workflowId} completed.`;
+  const lines = incomplete.map((node) => {
+    const dependency = node.state === "blocked" ? `dependency failed: ${(node.dependsOn ?? []).join(", ") || "unknown"}` : undefined;
+    const reason = oneLine(node.error) ?? oneLine(node.result?.error) ?? dependency ?? "no terminal reason recorded";
+    const route = Array.isArray(node.result?.route) && node.result.route.length
+      ? ` [route: ${node.result.route.map((attempt) => `${attempt.resourceId ?? "unassigned"}:${attempt.outcome ?? "unknown"}`).join(" → ")}]`
+      : "";
+    return `- ${node.id}: ${node.state} — ${reason}${route}`;
+  });
+  return `Workflow ${workflowId} has ${incomplete.length} failed/blocked stages:\n${lines.join("\n")}`;
+}
+
+/** Workflow nodes are read-only by contract. Pin the operation class instead of letting
+ * keyword inference misread negations such as "do not modify files" as a patch request. */
+export function workflowObserveCapabilityRequest(node, taskId) {
+  if (!node || typeof node !== "object" || typeof node.task !== "string" || !node.task.trim()) fail("node is invalid");
+  if (typeof taskId !== "string" || !TASK_ID.test(taskId)) fail("task id is invalid");
+  return Object.freeze({
+    taskId,
+    taskDescription: node.task,
+    operationClass: "observe",
+    ...(node.capabilities?.length ? { requiredCapabilities: Object.freeze([...node.capabilities]) } : {}),
+    ...(node.tier ? { modelTier: node.tier } : {}),
+  });
+}
 
 /** Durable dependency scheduler. It owns ordering and concurrency; a supplied controller-owned
  * runner owns model routing, child launches, verification, and terminal acceptance. */

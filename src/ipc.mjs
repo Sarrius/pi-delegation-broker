@@ -100,6 +100,10 @@ export class BrokerIpcServer {
       this.#server.listen(this.#socketPath);
     });
     chmodSync(this.#socketPath, 0o600);
+    // The controller socket is a background facility, not a reason for one-shot `pi -p` or
+    // `pi --mode json` processes to stay alive after their answer is complete. Interactive and
+    // RPC hosts have their own referenced handles; shutdown still closes this server explicitly.
+    this.#server.unref?.();
     return { socketPath: this.#socketPath };
   }
 

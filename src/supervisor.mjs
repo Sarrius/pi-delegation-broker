@@ -85,6 +85,7 @@ export class SingleHostBrokerSupervisor {
   #resourceRanker;
   #behavioralEnforcement;
   #dynamicProviders;
+  #dynamicProviderCatalog;
   #providerWatcher;
   #sweepIntervalMs;
   #shutdownDrainMs;
@@ -114,6 +115,7 @@ export class SingleHostBrokerSupervisor {
     sweepIntervalMs = 1_000,
     shutdownDrainMs = 2_000,
     dynamicProviders = false,
+    dynamicProviderCatalog,
   }) {
     if (signedRegistry !== undefined && registry !== undefined) {
       throw new Error("Broker supervisor accepts either signedRegistry or unsigned fixture registry, not both");
@@ -167,8 +169,12 @@ export class SingleHostBrokerSupervisor {
     // stays an explicit claim by the host rather than something the supervisor assumes.
     this.#behavioralEnforcement = behavioralEnforcement;
     this.#sweepIntervalMs = sweepIntervalMs;
+    if (dynamicProviderCatalog !== undefined && typeof dynamicProviderCatalog !== "function") {
+      throw new Error("Broker supervisor dynamicProviderCatalog must be a function");
+    }
     this.#shutdownDrainMs = shutdownDrainMs;
     this.#dynamicProviders = dynamicProviders;
+    this.#dynamicProviderCatalog = dynamicProviderCatalog;
   }
 
   get stateDir() { return this.#stateDir; }
@@ -251,6 +257,7 @@ export class SingleHostBrokerSupervisor {
           agentDir: join(homedir(), ".pi", "agent"),
           broker: this.#broker,
           onReload: () => { /* provider set changed; broker registry updated */ },
+          ...(this.#dynamicProviderCatalog ? { readCatalog: this.#dynamicProviderCatalog } : {}),
         });
         this.#providerWatcher.start();
       }

@@ -52,7 +52,7 @@ export { captureProviderContext } from "./provider-context.mjs";
 export { QUALITY_TIERS, meetsQualityFloor, qualityForModel } from "./model-quality-catalog.mjs";
 export { effectiveThinkingLevel, requiresReasoning } from "./model-thinking-policy.mjs";
 export { ModelAffinityJournal } from "./model-affinity-journal.mjs";
-export { TaskOrchestrator } from "./workflow-scheduler.mjs";
+export { TaskOrchestrator, formatWorkflowSummary, workflowObserveCapabilityRequest } from "./workflow-scheduler.mjs";
 export {
   DEFAULT_MODEL_PREFERENCES,
   MODEL_PREFERENCE_TIERS,
@@ -80,7 +80,7 @@ export { ArtifactPipeline } from "./artifact-pipeline.mjs";
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";
 export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
 export { BrokeredLaunchResolver } from "./trusted-launch-resolver.mjs";
-export { DynamicProviderWatcher, readProviderRegistry } from "./dynamic-provider-watcher.mjs";
+export { DynamicProviderWatcher, modelRegistryToProviderCatalog, readProviderRegistry } from "./dynamic-provider-watcher.mjs";
 export { BrokeredChildRunner, classifyChildFailure } from "./brokered-runner.mjs";
 export { spawnBrokeredChild } from "./child-launcher.mjs";
 export { Semaphore } from "./semaphore.mjs";

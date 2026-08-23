@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { lstatSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -41,6 +42,25 @@ async function reserveCapability(server, taskId, maxOutputTokens = 100, contract
   assert.equal(issued.status, "issued");
   return { reservation, issued };
 }
+
+test("an idle controller socket does not keep a one-shot parent process alive", () => {
+  const directory = mkdtempSync(join(tmpdir(), "delegation-broker-ipc-unref-"));
+  const socketPath = join(directory, "broker.sock");
+  const moduleUrl = new URL("../src/ipc.mjs", import.meta.url).href;
+  const script = `import { BrokerIpcServer } from ${JSON.stringify(moduleUrl)}; const server = new BrokerIpcServer({ broker: {}, socketPath: process.env.TEST_SOCKET }); await server.start(); console.log("ready");`;
+  try {
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      env: { ...process.env, TEST_SOCKET: socketPath },
+      encoding: "utf8",
+      timeout: 3_000,
+    });
+    assert.equal(child.error, undefined, child.error?.message);
+    assert.equal(child.status, 0, child.stderr);
+    assert.match(child.stdout, /ready/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("IPC gives child only a lease-scoped capability, not controller authority", async () => {
   const { directory, broker, server } = createServer();

@@ -103,6 +103,43 @@ function readPiCatalog(agentDir) {
   return catalog;
 }
 
+/** Convert Pi's live ModelRegistry surface into the broker's credential-free catalog.
+ * This preserves per-account model availability registered at runtime by any provider
+ * extension instead of incorrectly cloning one base provider's models onto every alias. */
+export function modelRegistryToProviderCatalog(models, { authorizedProviders } = {}) {
+  if (!Array.isArray(models)) throw new Error("model registry snapshot must be an array");
+  const allowed = authorizedProviders === undefined ? undefined : new Set(authorizedProviders);
+  const grouped = new Map();
+  for (const model of models) {
+    if (!model || typeof model !== "object" || typeof model.provider !== "string" || typeof model.id !== "string") continue;
+    if (!model.provider || !model.id || (allowed && !allowed.has(model.provider))) continue;
+    const current = grouped.get(model.provider) ?? [];
+    current.push(model);
+    grouped.set(model.provider, current);
+  }
+  return [...grouped]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([provider, providerModels]) => {
+      const first = providerModels[0];
+      return {
+        provider,
+        baseUrl: first.baseUrl ?? `https://${provider}.example`,
+        api: first.api ?? "openai-completions",
+        models: providerModels
+          .slice()
+          .sort((left, right) => left.id.localeCompare(right.id))
+          .map((model) => ({
+            id: model.id,
+            name: model.name ?? model.id,
+            contextWindow: model.contextWindow ?? 200_000,
+            maxTokens: model.maxTokens ?? 8_000,
+            reasoning: model.reasoning !== false,
+            input: Array.isArray(model.input) ? model.input : ["text"],
+          })),
+      };
+    });
+}
+
 /**
  * Build a broker registry directly from a Pi agent dir, without a broker. The controller
  * uses this to sign the supervisor's initial registry; the watcher then keeps it hot.
@@ -131,15 +168,18 @@ export class DynamicProviderWatcher {
   #debounceTimer;
   #lastCatalogFingerprint;
   #lastRegistry;
+  #readCatalog;
   #running = false;
 
-  constructor({ agentDir, broker, onReload } = {}) {
+  constructor({ agentDir, broker, onReload, readCatalog } = {}) {
     if (typeof agentDir !== "string") throw new Error("DynamicProviderWatcher requires agentDir");
     if (!broker || typeof broker.reloadRegistry !== "function") throw new Error("DynamicProviderWatcher requires a broker with reloadRegistry");
     if (onReload !== undefined && typeof onReload !== "function") throw new Error("DynamicProviderWatcher onReload must be a function");
+    if (readCatalog !== undefined && typeof readCatalog !== "function") throw new Error("DynamicProviderWatcher readCatalog must be a function");
     this.#agentDir = agentDir;
     this.#broker = broker;
     this.#onReload = onReload;
+    this.#readCatalog = readCatalog ?? (() => readPiCatalog(this.#agentDir));
   }
 
   /**
@@ -147,7 +187,7 @@ export class DynamicProviderWatcher {
    * reload. Returns { status, providerCount } or { status, reason }.
    */
   async refresh() {
-    const catalog = readPiCatalog(this.#agentDir);
+    const catalog = this.#readCatalog();
     if (catalog.length === 0) return this.#report({ status: "skipped", reason: "empty catalog" });
     // Fingerprint the models too, not just the provider names: a provider that gains or
     // loses a model is a different routing surface, and name-only fingerprinting reported
@@ -223,7 +263,7 @@ export class DynamicProviderWatcher {
 
   /** Current provider names from the last catalog read. */
   providers() {
-    const catalog = readPiCatalog(this.#agentDir);
+    const catalog = this.#readCatalog();
     return Object.freeze(catalog.map((e) => e.provider));
   }
 
@@ -234,7 +274,7 @@ export class DynamicProviderWatcher {
    */
   currentRegistry() {
     if (this.#lastRegistry === undefined) {
-      const catalog = readPiCatalog(this.#agentDir);
+      const catalog = this.#readCatalog();
       if (catalog.length === 0) throw new Error("DynamicProviderWatcher has no provider catalog to build a registry from");
       this.#lastRegistry = catalogToBrokerRegistry(catalog, { confidence: "observed" });
     }
