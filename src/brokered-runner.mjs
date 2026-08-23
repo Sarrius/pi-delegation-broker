@@ -18,7 +18,7 @@ const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
  */
 const FAILURE_SIGNATURES = Object.freeze([
   Object.freeze({ kind: "rate_limited", pattern: /\b(rate[ _-]?limit|too many requests|429|quota exceeded|overloaded|capacity)\b/i }),
-  Object.freeze({ kind: "auth_fatal", pattern: /\b(401|403|unauthorized|forbidden|invalid[ _-]?api[ _-]?key|authentication|expired token|revoked|no api key found)\b/i }),
+  Object.freeze({ kind: "auth_fatal", pattern: /\b(401|403|unauthorized|forbidden|invalid[ _-]?api[ _-]?key|invalid_grant|refresh token not found|authentication|expired token|revoked|no api key found)\b/i }),
   Object.freeze({ kind: "context_exhausted", pattern: /\b(context[ _-]?(window|length|limit)|prompt is too long|maximum context|token limit)\b/i }),
   // Capability/organization policy rejection is route-specific: the same task can run on
   // another account/model, so quarantine this resource and let controller failover continue.
@@ -112,6 +112,7 @@ export class BrokeredChildRunner {
 
     const excludeResources = [...(spec.capabilityRequest?.excludeResources ?? [])];
     const route = [];
+    const unavailableByCapacityGroup = new Map();
     let requiredCapabilities = spec.capabilityRequest?.requiredCapabilities;
     let lastResult;
 
@@ -180,7 +181,15 @@ export class BrokeredChildRunner {
         // A revoked/expired credential belongs to the account, not the model: condemning only
         // this resource makes the next hop retry a sibling model on the same dead credential.
         else if (kind === "auth_fatal") await this.#reportUnavailable(resourceId, "provider auth_fatal", "capacity_group");
-        else if (kind === "unavailable") await this.#reportUnavailable(resourceId, "provider unavailable", "resource");
+        else if (kind === "unavailable") {
+          const capacityGroup = handle.resource?.capacityGroup;
+          const failures = capacityGroup ? (unavailableByCapacityGroup.get(capacityGroup) ?? 0) + 1 : 1;
+          if (capacityGroup) unavailableByCapacityGroup.set(capacityGroup, failures);
+          // One model can be stale while its account remains healthy. Two independent route
+          // failures on the same account are account-level evidence: quarantine the group so a
+          // catalog with many aliases cannot consume every bounded attempt before failover.
+          await this.#reportUnavailable(resourceId, "provider unavailable", failures >= 2 ? "capacity_group" : "resource");
+        }
         // A context overflow leaves the provider healthy — only this route is wrong.
         if (kind !== "context_exhausted") excludeResources.push(resourceId);
       }

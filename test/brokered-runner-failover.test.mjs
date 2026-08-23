@@ -20,7 +20,8 @@ function fakeResolver({ resources, health = [] }) {
     async resolve(request) {
       // Honour the exclusions the runner threads through: that is the contract under test.
       const excluded = new Set(request.capabilityRequest?.excludeResources ?? []);
-      const resource = resources.find((entry) => !excluded.has(entry.id));
+      const deadGroups = new Set(health.filter((report) => report.scope === "capacity_group").map((report) => report.resourceId.split("/")[0]));
+      const resource = resources.find((entry) => !excluded.has(entry.id) && !deadGroups.has(entry.id.split("/")[0]));
       if (!resource) return { action: "deny", reason: "no compatible broker capacity" };
       return {
         action: "allow",
@@ -39,8 +40,8 @@ function fakeResolver({ resources, health = [] }) {
     async reportProviderRateLimited(resourceId, retryAfterMs) {
       health.push({ resourceId, kind: "rate_limited", retryAfterMs, excluded: true });
     },
-    async reportProviderUnavailable(resourceId, reason) {
-      health.push({ resourceId, kind: "unavailable", reason, excluded: true });
+    async reportProviderUnavailable(resourceId, reason, scope) {
+      health.push({ resourceId, kind: "unavailable", reason, scope, excluded: true });
     },
   };
 }
@@ -82,6 +83,7 @@ test("a provider rate limit is classified as a routing fact, not a child failure
   assert.equal(classifyChildFailure("rate limit reached for this account"), "rate_limited");
   assert.equal(classifyChildFailure("401 Unauthorized"), "auth_fatal");
   assert.equal(classifyChildFailure("No API key found for cursor."), "auth_fatal");
+  assert.equal(classifyChildFailure('OAuth refresh failed: invalid_grant; Refresh token not found or invalid'), "auth_fatal");
   assert.equal(classifyChildFailure("prompt is too long for the context window"), "context_exhausted");
   assert.equal(classifyChildFailure("503 service unavailable"), "unavailable");
   assert.equal(classifyChildFailure(`404: {"message":"model 'deepseek-v4-pro:0813' not found","type":"not_found_error"}`), "unavailable");
@@ -173,6 +175,29 @@ test("a stale catalog model 404 is quarantined and retried on another route", as
       ["cursor/live", "completed"],
     ]);
     assert.deepEqual(resolver.reports.map((report) => [report.resourceId, report.kind]), [["ollama/stale", "unavailable"]]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("two unavailable models on one account quarantine its capacity group before attempts are exhausted", async () => {
+  const resolver = fakeResolver({ resources: [
+    { id: "cursor/model-a" },
+    { id: "cursor/model-b" },
+    { id: "cursor/model-c" },
+    { id: "openrouter/live" },
+  ] });
+  const { runner, root } = runnerWith(resolver, scriptedSpawn([
+    { error: "child completed without a result" },
+    { error: "child completed without a result" },
+    { text: "done elsewhere" },
+  ]));
+
+  try {
+    const result = await runner.run({ childId: "job-dead-group", promptDigest: "c".repeat(64), cwd: root, prompt: "x" });
+    assert.equal(result.status, "completed");
+    assert.deepEqual(result.route.map((attempt) => attempt.resourceId), ["cursor/model-a", "cursor/model-b", "openrouter/live"]);
+    assert.deepEqual(resolver.reports.map((report) => report.scope), ["resource", "capacity_group"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
