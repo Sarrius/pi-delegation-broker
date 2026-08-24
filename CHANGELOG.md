@@ -4,6 +4,8 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## Unreleased
 
+- **Read-only children no longer spend a model turn declaring every observation.** The child guard now declares and authorizes the closed `read`/`grep`/`ls`/`find`/`test` set automatically, while effect tools still require the model's exact prior `broker_declare_action`. This removes repeated declaration/read protocol loops that exhausted Cursor child turns and produced `incomplete` failovers. Fresh live observe and effect canaries both pass.
+
 - **Live delegation recovers and drains.** Unknown routes get bounded probes, busy accounts queue without spending attempts, incomplete tool turns are not success, and settled parents reap orphan RPC children. Live canaries: `LIVE2_OK`, `UNKNOWN_LIVE_OK`, `CAPACITY_PROTOCOL_OK`.
 
 - **`/delegation-broker stop` is a real deactivation now.** The command used to only set a flag: the broker process kept running, held the lock and socket, and auto-started again on the next session regardless. `stop` now shuts the supervisor down (lock and socket released), and a stopped broker no longer auto-starts on `session_start`. `start` activates it again.

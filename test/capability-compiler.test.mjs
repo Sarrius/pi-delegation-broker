@@ -4,6 +4,7 @@ import {
   createEffectiveChildCapability,
   compileEffectiveChildCapability,
   canonicalDeclaredToolName,
+  isImplicitlyDeclaredObserveTool,
 } from "../src/capability-compiler.mjs";
 import { BehavioralRunMonitor } from "../src/behavior-monitor.mjs";
 
@@ -51,8 +52,9 @@ test("capability compiler generates prompt rules and authorization policy from o
   assert.equal(typeof promptRules, "string");
   assert.ok(promptRules.includes("allowed_tools: read, grep, ls"));
   assert.ok(promptRules.includes("never the mcp_pi_ prefix"));
-  assert.ok(promptRules.includes("broker_declare_action"));
-  assert.ok(promptRules.includes("wait for that declaration to succeed"));
+  assert.ok(promptRules.includes("Invoke read-only observe tools directly"));
+  assert.ok(promptRules.includes("declares and authorizes those read-only actions automatically"));
+  assert.ok(!promptRules.includes("Before EVERY allowed tool call"));
   assert.ok(promptRules.includes("operation_class: observe"));
   assert.ok(promptRules.includes("capability_fingerprint:"));
 
@@ -61,17 +63,22 @@ test("capability compiler generates prompt rules and authorization policy from o
   assert.equal(authorizationPolicy.operationClass, "observe");
   assert.ok(authorizationPolicy.allowedTools.has("read"));
   assert.ok(!authorizationPolicy.allowedTools.has("bash"));
+  assert.equal(isImplicitlyDeclaredObserveTool("read"), true);
+  assert.equal(isImplicitlyDeclaredObserveTool("grep"), true);
+  assert.equal(isImplicitlyDeclaredObserveTool("propose_patch"), false);
 });
 
 test("effect-capable capability requires blocking monitor in prompt rules", () => {
   const cap = createEffectiveChildCapability(capabilityInput({
     operationClass: "propose_patch",
     behavioralEnforcement: "blocking_monitor",
+    allowedTools: ["read", "grep", "ls", "propose_patch"],
   }));
   const { promptRules, authorizationPolicy } = compileEffectiveChildCapability(cap);
   assert.equal(authorizationPolicy.effectCapable, true);
   assert.equal(authorizationPolicy.requiresBehavioralMonitor, true);
   assert.ok(promptRules.includes("behavioral_enforcement: blocking_monitor"));
+  assert.ok(promptRules.includes("broker_declare_action immediately before every effect-capable tool"));
   assert.ok(!promptRules.includes("WARNING"));
 });
 

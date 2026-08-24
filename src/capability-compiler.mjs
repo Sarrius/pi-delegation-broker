@@ -37,6 +37,11 @@ const CAPABILITY_FIELDS = [
 ];
 
 const OBSERVE_TOOLS = Object.freeze(["read", "grep", "ls", "find", "test"]);
+const OBSERVE_TOOL_SET = Object.freeze(new Set(OBSERVE_TOOLS));
+
+export function isImplicitlyDeclaredObserveTool(toolName) {
+  return typeof toolName === "string" && OBSERVE_TOOL_SET.has(toolName);
+}
 
 /**
  * Derive a default allowed-tools set from the operation class. The observe set
@@ -148,15 +153,21 @@ export function compileEffectiveChildCapability(cap) {
   const effectCapable = EFFECT_CAPABLE.has(cap.operationClass);
   const requiresBehavioralMonitor = effectCapable && cap.behavioralEnforcement === "blocking_monitor";
 
+  const effectTools = cap.allowedTools.filter((tool) => EFFECT_CAPABLE.has(tool));
   const lines = [
     "## Brokered child capability",
     `operation_class: ${cap.operationClass}`,
     `admission_class: ${cap.admissionClass}`,
     `allowed_tools: ${cap.allowedTools.join(", ")}`,
-    "Declare and invoke those tools by the names above, never the mcp_pi_ prefix.",
-    "Before EVERY allowed tool call, call broker_declare_action with that exact tool name and exact arguments.",
-    "After calling it, wait for that declaration to succeed; only then invoke the declared tool in the next step, never in the same response.",
-    "If a tool is blocked for a missing declaration, correct the protocol by declaring it before retrying.",
+    "Invoke tools by the names above, never the mcp_pi_ prefix.",
+    "Invoke read-only observe tools directly; the broker declares and authorizes those read-only actions automatically.",
+    ...(effectTools.length > 0 ? [
+      `effect_tools_requiring_explicit_declaration: ${effectTools.join(", ")}`,
+      "Call broker_declare_action immediately before every effect-capable tool, with that exact tool name and exact arguments.",
+      "After calling it, wait for that declaration to succeed; only then invoke the declared effect tool in the next step, never in the same response.",
+    ] : [
+      "No effect-capable tools are allowed. Do not call broker_declare_action; invoke observe tools directly.",
+    ]),
     `done_when:`,
     ...cap.doneWhen.map((c) => `  - ${c}`),
     `latency_budget_ms: ${cap.latencyBudgetMs}`,

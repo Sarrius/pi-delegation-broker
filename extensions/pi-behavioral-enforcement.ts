@@ -12,7 +12,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { captureLosslessJson } from "../src/lossless-json.mjs";
 import { requestBrokerIpc } from "../src/ipc.mjs";
-import { canonicalDeclaredToolName } from "../src/capability-compiler.mjs";
+import {
+  canonicalDeclaredToolName,
+  isImplicitlyDeclaredObserveTool,
+} from "../src/capability-compiler.mjs";
 
 const DECLARATION_TOOL = "broker_declare_action";
 const MAX_RESULT_BYTES = 128 * 1024;
@@ -96,10 +99,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: DECLARATION_TOOL,
     label: "Declare Brokered Action",
-    description: "Declare exactly one next broker-authorized tool action before invoking it.",
-    promptSnippet: "Declare the exact next tool action before every other tool call in this brokered child",
+    description: "Declare exactly one next effect-capable broker action before invoking it; observe tools are automatic.",
+    promptSnippet: "Declare effect-capable actions; invoke read-only observe tools directly",
     promptGuidelines: [
-      "Use broker_declare_action immediately before every non-broker tool call, with the same tool name and exact arguments."
+      "Use broker_declare_action immediately before an effect-capable tool call; do not use it for read-only observe tools."
     ],
     parameters: Type.Object({
       toolName: Type.String({ minLength: 1, maxLength: 128 }),
@@ -155,17 +158,44 @@ export default function (pi: ExtensionAPI) {
     if (event.toolName === DECLARATION_TOOL) return undefined;
     if (!runtime || runtime.failed) return failClosed(runtime?.failed ?? "broker behavioral monitor was not initialized");
     const pending = runtime.pending;
+    if (!pending && isImplicitlyDeclaredObserveTool(event.toolName)) {
+      let actual;
+      try { actual = captureLosslessJson(event.input, { maxBytes: 256 * 1024, maxDepth: 32, maxNodes: 10_000 }).value; }
+      catch { return failClosed("observe tool arguments cannot be represented by the broker behavioral protocol"); }
+      const stepId = `step-${++runtime.step}`;
+      try {
+        const declared = await controller<{ status?: string }>("declareBehavioralAction", {
+          stepId, toolName: event.toolName, args: actual,
+        });
+        if (declared.status !== "declared") return failClosed("controller rejected automatic observe declaration");
+        const decision = await controller<{ status?: string; block?: boolean; terminate?: boolean; cause?: string }>("authorizeBehavioralAction", {
+          stepId, toolName: event.toolName, args: actual,
+        });
+        if (decision.status === "allowed" && decision.block !== true) {
+          runtime.undeclaredBlocks = 0;
+          runtime.executing.set(event.toolCallId, { stepId, toolName: event.toolName, args: actual });
+          return undefined;
+        }
+        return {
+          block: true,
+          terminate: decision.terminate === true,
+          reason: safeReason(decision.cause, "broker behavioral monitor rejected this observe action"),
+        };
+      } catch {
+        return failClosed("controller automatic observe authorization was unavailable");
+      }
+    }
     if (!pending) {
       runtime.undeclaredBlocks += 1;
       if (runtime.undeclaredBlocks === 1) {
-        // The blocked call had no effect; allow one protocol correction.
+        // The blocked call had no effect; allow one protocol correction for effects.
         return {
           block: true,
           terminate: false,
-          reason: "tool blocked: call broker_declare_action with this exact tool name and arguments, wait for it to succeed, then retry",
+          reason: "effect tool blocked: call broker_declare_action with this exact tool name and arguments, wait for it to succeed, then retry",
         };
       }
-      return failClosed("repeated tool invocation without broker_declare_action");
+      return failClosed("repeated effect invocation without broker_declare_action");
     }
     let actual;
     try { actual = captureLosslessJson(event.input, { maxBytes: 256 * 1024, maxDepth: 32, maxNodes: 10_000 }).value; }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,8 +15,16 @@ import { BrokeredChildRunner } from "../src/brokered-runner.mjs";
 
 const CONTROLLER_TOKEN = "l".repeat(48);
 const SHIM_PATH = new URL("../extensions/child-shim.ts", import.meta.url).pathname;
+const ENFORCEMENT_PATH = new URL("../extensions/pi-behavioral-enforcement.ts", import.meta.url).pathname;
 const PARENT_AGENT_DIR = join(homedir(), ".pi", "agent");
-const PROMPT = "Reply with exactly one word: hello";
+const PROMPT = "Use the read tool to read observation.txt, then reply with exactly its contents and nothing else";
+
+function filesUnder(root) {
+  return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(root, entry.name);
+    return entry.isDirectory() ? filesUnder(path) : [path];
+  });
+}
 
 function signedSupervisor(root, registry) {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -36,6 +44,7 @@ test("live: spawn Pi child, send prompt, get real response, verify, close", { sk
   const root = mkdtempSync(join(tmpdir(), "live-"));
   let supervisor;
   try {
+    writeFileSync(join(root, "observation.txt"), "automatic-observe-ok\n");
     const registry = readProviderRegistry(PARENT_AGENT_DIR);
     supervisor = signedSupervisor(root, registry);
     await supervisor.start();
@@ -45,7 +54,12 @@ test("live: spawn Pi child, send prompt, get real response, verify, close", { sk
       socketPath: supervisor.socketPath,
       controllerToken: supervisor.controllerToken,
       agentRoot: join(root, "child-agents"),
-      extensionPaths: [SHIM_PATH],
+      extensionPaths: [SHIM_PATH, ENFORCEMENT_PATH],
+      launcherAttestationConfig: {
+        behavioralExtensionPath: ENFORCEMENT_PATH,
+        trustedExtensionDigests: [SHIM_PATH, ENFORCEMENT_PATH]
+          .map((path) => createHash("sha256").update(readFileSync(path)).digest("hex")),
+      },
       offline: false,
       selectContract: createSelectContract({
         registry,
@@ -71,12 +85,27 @@ test("live: spawn Pi child, send prompt, get real response, verify, close", { sk
       cwd: root,
       thinkingLevel: "off",
       prompt: PROMPT,
+      capabilityRequest: {
+        taskDescription: "read one exact local file and return its contents",
+        operationClass: "observe",
+        budget: { maxInputTokens: 20_000, maxOutputTokens: 1_024 },
+      },
     });
 
     assert.equal(result.status, "completed", `child should complete, got: ${result.error ?? result.text}`);
     assert.ok(result.route.length >= 1, "dynamic runner must record its selected/failover route");
-    assert.ok(result.text.length > 0, "child must return non-empty text");
-    assert.match(result.text.toLowerCase(), /hello/, `response should contain "hello", got: ${result.text}`);
+    assert.equal(result.text.trim(), "automatic-observe-ok");
+    const sessionFiles = filesUnder(join(root, "sessions"))
+      .filter((path) => path.endsWith(".jsonl") && statSync(path).isFile());
+    assert.ok(sessionFiles.length > 0, "live child must persist a session for protocol inspection");
+    const toolNames = sessionFiles.flatMap((sessionFile) =>
+      readFileSync(sessionFile, "utf8").trim().split("\n")
+        .map((line) => JSON.parse(line))
+        .flatMap((entry) => entry.type === "message" && entry.message?.role === "assistant"
+          ? entry.message.content.filter((block) => block.type === "toolCall").map((block) => block.name)
+          : []));
+    assert.ok(toolNames.includes("read"), `child should invoke read directly, got ${toolNames.join(",")}`);
+    assert.ok(!toolNames.includes("broker_declare_action"), "observe tools must not spend a model turn on declaration");
 
     await runner.dispose();
     assert.equal(supervisor.auditSnapshot().leases.length, 0, "no leases leaked");
