@@ -158,8 +158,7 @@ export default function (pi: ExtensionAPI) {
     if (!pending) {
       runtime.undeclaredBlocks += 1;
       if (runtime.undeclaredBlocks === 1) {
-        // Nothing executed, so one correction is safe: block this call, keep the capability
-        // live, and let the model declare before retrying. A repeated omission terminates.
+        // The blocked call had no effect; allow one protocol correction.
         return {
           block: true,
           terminate: false,

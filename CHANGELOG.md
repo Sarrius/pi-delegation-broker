@@ -4,9 +4,7 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## Unreleased
 
-- **Parallel workflows wait for scarce live capacity.** Contention does not spend attempts; blocked or truncated tool turns are not success. Cursor concurrency-2 live test: `CAPACITY_PROTOCOL_OK`.
-
-- **Live providers recover.** Success precedes lease release; unknown routes get one delayed probe. Live tests: ZAI/Claude→Cursor `LIVE2_OK`; poisoned Cursor→`UNKNOWN_LIVE_OK`.
+- **Live delegation recovers and drains.** Unknown routes get bounded probes, busy accounts queue without spending attempts, incomplete tool turns are not success, and settled parents reap orphan RPC children. Live canaries: `LIVE2_OK`, `UNKNOWN_LIVE_OK`, `CAPACITY_PROTOCOL_OK`.
 
 - **`/delegation-broker stop` is a real deactivation now.** The command used to only set a flag: the broker process kept running, held the lock and socket, and auto-started again on the next session regardless. `stop` now shuts the supervisor down (lock and socket released), and a stopped broker no longer auto-starts on `session_start`. `start` activates it again.
 

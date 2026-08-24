@@ -17,6 +17,25 @@ const PROMPT_ACK_TIMEOUT_MS = 60_000;
 const DISPOSE_KILL_GRACE_MS = 2_000;
 const IMMEDIATE_COMPLETION_POLL_MS = 60;
 const IMMEDIATE_COMPLETION_MAX_POLLS = 40;
+const ACTIVE_RPCS = new Set();
+
+async function terminateRpc(rpc) {
+  rpc.kill("SIGTERM");
+  let timer;
+  const timedOut = await Promise.race([
+    Promise.resolve(rpc.exited).then(() => false, () => false),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(true), DISPOSE_KILL_GRACE_MS); }),
+  ]);
+  if (timer) clearTimeout(timer);
+  if (timedOut) {
+    rpc.kill("SIGKILL");
+    await Promise.resolve(rpc.exited).catch(() => undefined);
+  }
+}
+
+export async function disposeBrokeredChildProcesses() {
+  await Promise.allSettled([...ACTIVE_RPCS].map(terminateRpc));
+}
 
 function resolveChildPiEntry() {
   // We are already running inside Pi. The global pi binary is the correct
@@ -189,12 +208,7 @@ class RpcChildSession {
 
   async dispose() {
     if (this.#disposal) return this.#disposal;
-    this.#disposal = Promise.resolve().then(async () => {
-      this.#rpc.kill("SIGTERM");
-      const escalate = setTimeout(() => this.#rpc.kill("SIGKILL"), DISPOSE_KILL_GRACE_MS);
-      escalate.unref?.();
-      try { await this.#rpc.exited; } finally { clearTimeout(escalate); }
-    });
+    this.#disposal = Promise.resolve().then(() => terminateRpc(this.#rpc));
     return this.#disposal;
   }
 
@@ -326,7 +340,9 @@ export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPi
     throw error;
   }
 
-  void rpc.exited.then(() => {
+  ACTIVE_RPCS.add(rpc);
+  void Promise.resolve(rpc.exited).finally(() => {
+    ACTIVE_RPCS.delete(rpc);
     rmSync(specPath, { force: true });
     rmSync(toolReportPath, { force: true });
   }).catch(() => undefined);

@@ -103,7 +103,7 @@ export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
 export { BrokeredLaunchResolver } from "./trusted-launch-resolver.mjs";
 export { DynamicProviderWatcher, activeAuthorizedProviders, modelRegistryToProviderCatalog, readProviderRegistry } from "./dynamic-provider-watcher.mjs";
 export { BrokeredChildRunner, classifyChildFailure } from "./brokered-runner.mjs";
-export { spawnBrokeredChild } from "./child-launcher.mjs";
+export { spawnBrokeredChild, disposeBrokeredChildProcesses } from "./child-launcher.mjs";
 export { Semaphore } from "./semaphore.mjs";
 export { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionError } from "./worktree.mjs";
 export { verifyProposedPatch, spawnControllerArgv, EffectVerificationError } from "./effect-verification.mjs";

@@ -75,6 +75,7 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "deriveModelProvenance",
     "deriveModelSupports",
     "deriveTaskRequirement",
+    "disposeBrokeredChildProcesses",
     "effectiveThinkingLevel",
     "evaluateRouteEligibility",
     "freshnessForCurrency",

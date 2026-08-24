@@ -31,6 +31,7 @@ import { fileURLToPath } from "node:url";
 import {
   BrokeredChildRunner,
   BrokeredLaunchResolver,
+  disposeBrokeredChildProcesses,
   addModelPreference,
   activeAuthorizedProviders,
   ControllerAcceptanceVerifier,
@@ -849,6 +850,12 @@ export default function piDelegationBroker(pi: any) {
     notifiedUnread = planned.notifiedIds;
     if (!planned.inject) return;
     return { systemPrompt: planned.systemPrompt };
+  });
+
+  pi.on("agent_settled", async () => {
+    if (activeTasks.size === 0 && activeWorkflows.size === 0) {
+      await disposeBrokeredChildProcesses();
+    }
   });
 
   pi.on("session_shutdown", async () => {

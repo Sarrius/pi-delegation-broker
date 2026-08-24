@@ -20,8 +20,6 @@ const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
  * the last group is a genuine end of the road.
  */
 const FAILURE_SIGNATURES = Object.freeze([
-  // A child can stop at a blocked tool request or an output boundary without producing its
-  // promised result. That is retryable model/protocol non-completion, not provider downtime.
   Object.freeze({ kind: "incomplete", pattern: /child stopped with an unresolved tool request|child output ended before completion/i }),
   Object.freeze({ kind: "rate_limited", pattern: /\b(rate[ _-]?limit|too many requests|429|quota exceeded|overloaded|capacity)\b/i }),
   Object.freeze({ kind: "auth_fatal", pattern: /\b(401|403|unauthorized|forbidden|invalid[ _-]?api[ _-]?key|invalid_grant|refresh token not found|authentication|expired token|revoked|no api key found)\b/i }),
@@ -166,9 +164,7 @@ export class BrokeredChildRunner {
       try {
         handle = await this.spawn({ ...spec, childId: attemptId, capabilityRequest, attempts: attempt, deferClosePolicy: true });
       } catch (error) {
-        // A compatible account being busy is not the same as no route existing. Workflows can
-        // deliberately ask for more parallel nodes than the one currently healthy account can
-        // run. Wait boundedly for its lease instead of terminally denying those teammates.
+        // Busy live capacity waits; it is not a spent provider attempt.
         if (isTemporaryCapacityDenial(error)) {
           const now = this.#now();
           capacityWaitDeadline ??= now + this.#capacityWaitMs;
@@ -496,10 +492,7 @@ export class BrokeredChildRunner {
         ...(handle.selection ? { selection: handle.selection } : {}),
       };
     } finally {
-      // Direct-provider children do not stream through broker IPC, so provider success is not
-      // observed anywhere else. Report it before dispose: the child shutdown hook releases the
-      // lease, and a later success receipt would be rejected as stale. This is what lets a
-      // successful half-open probe close its breaker for the next task.
+      // Success must precede dispose, whose shutdown hook releases the lease.
       if (result?.status === "completed") {
         try { await policy.onProviderSucceeded?.(); }
         catch { /* health recovery is best effort; the verified child result still stands */ }
