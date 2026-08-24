@@ -130,9 +130,14 @@ function usable(resourceId, live, { now, requiresHardBudget, resourceConfidence,
   if (requiresHardBudget && (resourceConfidence === "assumed" || groupConfidence === "assumed")) return false;
   if (live === undefined) return true;
   if (live.retiring === true || live.retiring === 1) return false;
-  if (live.state !== undefined && live.state !== "healthy") return false;
+  if (live.state !== undefined && live.state !== "healthy" && live.state !== "unknown") return false;
   if (Number.isFinite(live.cooldownUntil) && Number.isFinite(now) && live.cooldownUntil > now) return false;
+  // Unknown means the last observation failed, not that the credential can never recover.
+  // Once its bounded retry delay expires the broker may admit exactly one half-open probe for
+  // the capacity group. Do not select another sibling while that probe is already in flight.
+  if (live.state === "unknown" && live.probeLeaseId) return false;
   if (live.breakerState === "cooling_down" && Number.isFinite(live.groupCooldownUntil) && Number.isFinite(now) && live.groupCooldownUntil > now) return false;
+  if (live.breakerState === "cooling_down" && live.probeLeaseId) return false;
   return true;
 }
 

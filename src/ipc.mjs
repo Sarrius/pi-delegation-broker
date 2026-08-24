@@ -19,7 +19,7 @@ const CHILD_METHODS = new Set([
 ]);
 const CONTROLLER_METHODS = new Set([
   "reserve", "submit", "dispatchPending", "pendingTasks", "queueWaitMetrics", "readyTasks", "claimReadyTask", "trackLeasedTask", "abandonClaimedTask", "releaseClaimedTaskForVerification", "finalizeVerifiedTask", "reschedulePending", "finishPending",
-  "issueLeaseCapability", "bindEffectiveChildCapability", "markRateLimited", "markUnknown", "markHealthy", "release", "configureFakeProvider",
+  "issueLeaseCapability", "bindEffectiveChildCapability", "markRateLimited", "markUnknown", "markHealthy", "markProviderSucceeded", "release", "configureFakeProvider",
 ]);
 
 function sameSecret(left, right) {
@@ -207,6 +207,7 @@ export class BrokerIpcServer {
       if (method === "markRateLimited") return this.#broker.markRateLimited(params.resourceId, params.retryAfterMs, now);
       if (method === "markUnknown") return this.#broker.markUnknown(params.resourceId, now, params.reason, params.scope);
       if (method === "markHealthy") return this.#broker.markHealthy(params.resourceId, now);
+      if (method === "markProviderSucceeded") return this.#broker.markProviderSucceeded(params.leaseId, params.fencingToken, now);
       if (method === "release") return this.#broker.release(params.leaseId, params.fencingToken, "controller release", now);
       if (method === "configureFakeProvider") {
         if (!this.#fakeProvider) throw new Error("fake_provider_unavailable");

@@ -308,6 +308,9 @@ export class BrokeredLaunchResolver {
           },
           onBeforeChildAbandoned: async () => this.releaseUnhanded(request.childId),
           onChildSessionOpened: async () => this.markChildHanded(request.childId),
+          // A completed direct-provider child is evidence that the exact leased route is live.
+          // Report it while the lease still exists so a half-open probe can close its breaker.
+          onProviderSucceeded: async () => this.markHandedProviderSucceeded(request.childId),
           // The runner calls this only after its final successful route is known. Tracking an
           // earlier failover attempt would let a verifier accept stale work or lose the final
           // route's efficiency observation.
@@ -338,9 +341,10 @@ export class BrokeredLaunchResolver {
   }
 
   /**
-   * Report that a provider is not usable for a reason a cooldown will not fix — a revoked or
-   * expired credential. Unlike a rate limit this does not recover by waiting, so the resource
-   * stays out until a controller explicitly repairs it.
+   * Report that a provider/model is currently unusable. The broker quarantines the proven
+   * scope, then permits one registry-bounded half-open probe after its retry interval. This
+   * avoids hot-looping a revoked credential while still letting a refreshed credential or
+   * repaired proxy recover without manual database surgery.
    */
   async reportProviderUnavailable(resourceId, reason, scope = "resource") {
     if (scope !== "resource" && scope !== "capacity_group") throw new Error("provider unavailable scope must be resource or capacity_group");
@@ -358,6 +362,17 @@ export class BrokeredLaunchResolver {
     if (!admission) return { status: "already_released" };
     if (admission.phase === "pending_handoff") admission.phase = "handed";
     return { status: admission.phase };
+  }
+
+  /** Record provider success against the exact still-live lease, not an unauthenticated id. */
+  async markHandedProviderSucceeded(childId) {
+    const admission = this.#admissions.get(childId);
+    if (!admission) return { status: "already_released" };
+    if (admission.phase !== "handed") return { status: "denied_policy", reason: `admission_phase_${admission.phase}` };
+    return this.#controller("markProviderSucceeded", {
+      leaseId: admission.lease.leaseId,
+      fencingToken: admission.lease.fencingToken,
+    });
   }
 
   /**

@@ -714,24 +714,41 @@ export class SqliteLeaseBroker {
   /**
    * `scope` distinguishes what the failure actually proves. A model-specific refusal condemns
    * only that route, but a revoked or expired credential is a property of the account: every
-   * resource in the capacity group shares it, so leaving the siblings healthy makes the broker
-   * spend its remaining failover attempts re-proving the same dead credential.
+   * resource in the capacity group shares it. Unknown is nevertheless recoverable: after the
+   * registry-defined probe interval one bounded half-open attempt may prove the route live again.
    */
   markUnknown(resourceId, now, reason = "unknown", scope = "resource") {
     if (scope !== "resource" && scope !== "capacity_group") throw new Error("markUnknown scope must be resource or capacity_group");
     return this.#transaction(() => {
-      const update = this.#db.prepare("UPDATE resources SET state = 'unknown' WHERE id = ?").run(resourceId);
-      if (update.changes !== 1) throw new Error(`Unknown resource ${resourceId}`);
+      const resource = this.#db.prepare(`
+        SELECT r.capacity_group, g.probe_interval_ms
+        FROM resources r JOIN capacity_groups g ON g.id = r.capacity_group
+        WHERE r.id = ?
+      `).get(resourceId);
+      if (!resource) throw new Error(`Unknown resource ${resourceId}`);
+      const retryAt = now + resource.probe_interval_ms;
+      this.#db.prepare(`
+        UPDATE resources SET state = 'unknown', cooldown_until = MAX(cooldown_until, ?)
+        WHERE id = ?
+      `).run(retryAt, resourceId);
       if (scope === "capacity_group") {
-        const group = this.#db.prepare("SELECT capacity_group FROM resources WHERE id = ?").get(resourceId).capacity_group;
-        const siblings = this.#db.prepare("UPDATE resources SET state = 'unknown' WHERE capacity_group = ? AND state != 'unknown'").run(group);
-        this.#record(now, "CapacityGroupUnknown", { resourceId, capacityGroup: group, reason, alsoAffected: siblings.changes });
-        return { status: "unknown", resourceId, capacityGroup: group, alsoAffected: siblings.changes };
+        const siblings = this.#db.prepare(`
+          UPDATE resources SET state = 'unknown', cooldown_until = MAX(cooldown_until, ?)
+          WHERE capacity_group = ? AND id != ?
+        `).run(retryAt, resource.capacity_group, resourceId);
+        this.#record(now, "CapacityGroupUnknown", {
+          resourceId, capacityGroup: resource.capacity_group, reason,
+          alsoAffected: siblings.changes, retryAt,
+        });
+        return {
+          status: "unknown", resourceId, capacityGroup: resource.capacity_group,
+          alsoAffected: siblings.changes, retryAt,
+        };
       }
-      this.#record(now, "ResourceUnknown", { resourceId, reason });
+      this.#record(now, "ResourceUnknown", { resourceId, reason, retryAt });
       // Return an explicit receipt: a void result is indistinguishable from "no reply" to a
       // controller waiting on the IPC response.
-      return { status: "unknown", resourceId };
+      return { status: "unknown", resourceId, retryAt };
     });
   }
 
@@ -741,7 +758,7 @@ export class SqliteLeaseBroker {
         .get(leaseId, fencingToken, now);
       if (!lease) return { status: "denied_lease" };
       const group = this.#db.prepare("SELECT breaker_state, probe_lease_id FROM capacity_groups WHERE id = ?").get(lease.capacity_group);
-      this.#db.prepare("UPDATE resources SET state = 'healthy' WHERE id = ?").run(lease.resource_id);
+      this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0 WHERE id = ?").run(lease.resource_id);
       if (group.breaker_state === "cooling_down" && (lease.is_probe !== 1 || group.probe_lease_id !== lease.lease_id)) {
         this.#record(now, "ProviderSuccessObserved", { leaseId, capacityGroup: lease.capacity_group, breakerClosed: false });
         return { status: "observed", capacityGroup: lease.capacity_group, breakerClosed: false };
@@ -760,7 +777,7 @@ export class SqliteLeaseBroker {
     return this.#transaction(() => {
       const resource = this.#db.prepare("SELECT capacity_group FROM resources WHERE id = ?").get(resourceId);
       if (!resource) throw new Error(`Unknown resource ${resourceId}`);
-      this.#db.prepare("UPDATE resources SET state = 'healthy' WHERE id = ?").run(resourceId);
+      this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0 WHERE id = ?").run(resourceId);
       this.#db.prepare(`
         UPDATE capacity_groups SET breaker_state = 'healthy', cooldown_until = 0, probe_lease_id = NULL
         WHERE id = ?
@@ -812,7 +829,7 @@ export class SqliteLeaseBroker {
         r.id, r.capacity_group, r.profile, r.state, r.retiring, r.cooldown_until,
         r.inventory_confidence AS resource_confidence, r.enforcement,
         g.inventory_confidence AS group_confidence, g.max_concurrent,
-        g.cooldown_until AS group_cooldown_until, g.breaker_state
+        g.cooldown_until AS group_cooldown_until, g.breaker_state, g.probe_lease_id
       FROM resources r JOIN capacity_groups g ON g.id = r.capacity_group
       ORDER BY r.id
     `).all();
@@ -831,6 +848,7 @@ export class SqliteLeaseBroker {
       cooldownUntil: row.cooldown_until,
       groupCooldownUntil: row.group_cooldown_until,
       breakerState: row.breaker_state,
+      probeLeaseId: row.probe_lease_id,
       confidence: row.resource_confidence,
       groupConfidence: row.group_confidence,
       maxConcurrent: row.max_concurrent,
@@ -1372,7 +1390,7 @@ export class SqliteLeaseBroker {
     const requestedProfile = this.#profile(contract.capability.minimumProfile);
     let rows = this.#db.prepare(`
       SELECT
-        r.id, r.capacity_group, r.profile, r.state, r.enforcement,
+        r.id, r.capacity_group, r.profile, r.state, r.cooldown_until AS resource_cooldown_until, r.enforcement,
         r.inventory_confidence AS resource_confidence,
         g.max_concurrent, g.control_reserve, g.verify_reserve,
         g.inventory_confidence AS group_confidence,
@@ -1391,9 +1409,23 @@ export class SqliteLeaseBroker {
         assumedInventoryBlocked = true;
         continue;
       }
-      if (resource.state !== "healthy") continue;
-
       let probe = false;
+      if (resource.state === "unknown") {
+        if (resource.resource_cooldown_until > now) {
+          earliestCompatibleAt = this.#earliest(earliestCompatibleAt, resource.resource_cooldown_until);
+          continue;
+        }
+        if (resource.probe_lease_id) {
+          const activeProbe = this.#db.prepare("SELECT expires_at FROM leases WHERE lease_id = ? AND expires_at > ?")
+            .get(resource.probe_lease_id, now);
+          earliestCompatibleAt = this.#earliest(earliestCompatibleAt, activeProbe?.expires_at ?? now + resource.probe_interval_ms);
+          continue;
+        }
+        probe = true;
+      } else if (resource.state !== "healthy") {
+        continue;
+      }
+
       if (resource.breaker_state === "cooling_down") {
         if (resource.cooldown_until > now) {
           earliestCompatibleAt = this.#earliest(earliestCompatibleAt, resource.cooldown_until);

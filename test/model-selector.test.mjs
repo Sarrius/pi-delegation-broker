@@ -134,16 +134,40 @@ test("a class weaker than required is never selected, even as the only survivor"
   assert.match(selected.reason, /no (approved profile|live resource)/);
 });
 
-test("when nothing at all is alive the denial is explicit rather than a silent weak pick", () => {
+test("when every unknown route is still inside its retry delay the denial is explicit", () => {
   const registry = registryOf([account("solo")]);
-  const availability = Object.keys(registry.resources).map((resourceId) => ({ resourceId, state: "unknown" }));
+  const availability = Object.keys(registry.resources).map((resourceId) => ({
+    resourceId,
+    state: "unknown",
+    cooldownUntil: 2_000,
+  }));
   const selected = selectModelForTask({
     taskDescription: "read a file",
     registry,
     availability,
     constraints: baseConstraints(),
+    now: 1_000,
   });
   assert.equal(selected.action, "deny");
+});
+
+test("an unknown authenticated route becomes eligible for one half-open recovery probe", () => {
+  const registry = registryOf([account("solo")]);
+  const availability = Object.keys(registry.resources).map((resourceId) => ({
+    resourceId,
+    state: "unknown",
+    cooldownUntil: 999,
+    probeLeaseId: null,
+  }));
+  const selected = selectModelForTask({
+    taskDescription: "audit the entire repository",
+    registry,
+    availability,
+    constraints: baseConstraints(),
+    now: 1_000,
+  });
+  assert.equal(selected.action, "allow");
+  assert.equal(selected.expectedModel.modelId, "strong");
 });
 
 test("hard-budget work refuses assumed inventory the way the broker does", () => {

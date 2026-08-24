@@ -435,6 +435,35 @@ test("cooldown default comes from registry and only one half-open probe is admit
   }, registry);
 });
 
+test("an unknown route receives one delayed half-open probe and success restores it", () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R1_ALIAS;
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  registry.capacityGroups["G-shared"].cooldown = { defaultMs: 10_000, probeIntervalMs: 2_000 };
+  withBroker((broker) => {
+    const unknown = broker.markUnknown("R1", 1_000, "temporary provider failure", "resource");
+    assert.equal(unknown.retryAt, 3_000);
+    const blocked = broker.reserve(fixtureContract({ taskId: "unknown-too-early" }), 2_999);
+    assert.equal(blocked.status, "denied_capacity");
+    assert.equal(blocked.earliestCompatibleAt, 3_000);
+
+    const probe = broker.reserve(fixtureContract({ taskId: "unknown-probe" }), 3_000);
+    assert.equal(probe.status, "leased");
+    assert.equal(probe.lease.probe, true);
+    const follower = broker.reserve(fixtureContract({ taskId: "unknown-follower" }), 3_000);
+    assert.equal(follower.status, "denied_capacity");
+    assert.equal(follower.earliestCompatibleAt, probe.lease.expiresAt);
+
+    const recovered = broker.markProviderSucceeded(probe.lease.leaseId, probe.lease.fencingToken, 3_001);
+    assert.equal(recovered.breakerClosed, true);
+    broker.release(probe.lease.leaseId, probe.lease.fencingToken, "probe success", 3_001);
+    const normal = broker.reserve(fixtureContract({ taskId: "unknown-normal" }), 3_001);
+    assert.equal(normal.status, "leased");
+    assert.equal(normal.lease.probe, false);
+  }, registry);
+});
+
 test("a pre-cooldown in-flight success cannot close a breaker opened by another lease", () => {
   const registry = fixtureRegistry();
   registry.capacityGroups["G-shared"] = {

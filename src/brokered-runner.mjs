@@ -445,6 +445,14 @@ export class BrokeredChildRunner {
         ...(handle.selection ? { selection: handle.selection } : {}),
       };
     } finally {
+      // Direct-provider children do not stream through broker IPC, so provider success is not
+      // observed anywhere else. Report it before dispose: the child shutdown hook releases the
+      // lease, and a later success receipt would be rejected as stale. This is what lets a
+      // successful half-open probe close its breaker for the next task.
+      if (result?.status === "completed") {
+        try { await policy.onProviderSucceeded?.(); }
+        catch { /* health recovery is best effort; the verified child result still stands */ }
+      }
       handle.release();
       await session.dispose().catch(() => undefined);
       // Consumption is the measure the controller can actually observe, so it travels with the

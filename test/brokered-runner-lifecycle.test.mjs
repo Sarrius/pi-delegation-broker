@@ -12,6 +12,7 @@ test("every attempt is tracked while its lease lives, but only a completed one i
   const root = mkdtempSync(join(tmpdir(), "runner-lifecycle-"));
   const tracks = [];
   const closes = [];
+  const healthy = [];
   let resolved = 0;
   let spawned = 0;
   const resolver = {
@@ -28,6 +29,7 @@ test("every attempt is tracked while its lease lives, but only a completed one i
           environment: {},
           async onChildSessionOpened() {},
           async onBeforeChildAbandoned() {},
+          async onProviderSucceeded() { healthy.push(`provider/model-${attempt}`); },
           async trackForVerification() { tracks.push(attempt); return { status: "tracked" }; },
           async onChildSessionClosed(result) { closes.push({ attempt, status: result.status, attempts: result.attempts }); return { status: "released" }; },
         },
@@ -70,6 +72,7 @@ test("every attempt is tracked while its lease lives, but only a completed one i
       { attempt: 1, status: "failed", attempts: 1 },
       { attempt: 2, status: "completed", attempts: 2 },
     ]);
+    assert.deepEqual(healthy, ["provider/model-2"], "a completed child must rehabilitate the route it proved live");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
