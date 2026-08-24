@@ -8,7 +8,7 @@ import { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionErr
 const SETTLE_GRACE_MS = 15_000;
 const DEFAULT_NO_PROGRESS_TIMEOUT_MS = 180_000;
 const DEFAULT_ATTEMPT_MAX_RUN_MS = 15 * 60_000;
-const DEFAULT_CAPACITY_WAIT_MS = 5 * 60_000;
+const DEFAULT_CAPACITY_WAIT_MS = 15 * 60_000;
 const DEFAULT_CAPACITY_RETRY_MS = 500;
 const MAX_ROUTE_ATTEMPTS = 32;
 const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
