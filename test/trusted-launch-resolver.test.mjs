@@ -308,7 +308,7 @@ test("controller resolver denies a child prompt not bound to the selected contra
   }
 });
 
-test("controller resolver denies a model mismatch before reservation and capacity exhaustion without a fallback", async () => {
+test("controller resolver denies a model mismatch and reports temporary capacity contention", async () => {
   const root = mkdtempSync(join(tmpdir(), "br-c-"));
   const registry = fixtureRegistry();
   delete registry.resources.R2;
@@ -327,7 +327,7 @@ test("controller resolver denies a model mismatch before reservation and capacit
     const first = await resolver.resolve(request("child_first"));
     assert.equal(first.action, "allow");
     const second = await resolver.resolve(request("child_second"));
-    assert.deepEqual(second, { action: "deny", reason: "no compatible broker capacity" });
+    assert.deepEqual(second, { action: "deny", reason: "compatible broker capacity is temporarily busy" });
     assert.equal(supervisor.auditSnapshot().leases.length, 1);
     await first.policy.onBeforeChildAbandoned("cancelled_before_child");
   } finally {

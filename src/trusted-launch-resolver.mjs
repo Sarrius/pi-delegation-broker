@@ -131,6 +131,7 @@ export class BrokeredLaunchResolver {
     let selection;
     let reservation;
     let queuedTaskId;
+    let sawCapacityContention = false;
     for (let attempt = 1; ; attempt++) {
       selection = await this.#selectContract(Object.freeze({
         ...request,
@@ -139,7 +140,12 @@ export class BrokeredLaunchResolver {
           ...(excludeResources.length > 0 ? { excludeResources: Object.freeze([...excludeResources]) } : {}),
         }),
       }));
-      if (selection?.action === "deny") return { action: "deny", reason: safeReason(selection.reason) };
+      if (selection?.action === "deny") return {
+        action: "deny",
+        reason: sawCapacityContention
+          ? "compatible broker capacity is temporarily busy"
+          : safeReason(selection.reason),
+      };
       if (!selection?.contract) throw new Error("Broker launch selection did not return a contract");
       if (["propose_patch", "apply", "external_write"].includes(selection.contract.operationClass) && !this.#launcherAttestationConfig) {
         return { action: "deny", reason: "effect capable brokered launch requires pinned extension attestation" };
@@ -174,13 +180,16 @@ export class BrokeredLaunchResolver {
       }
       if (reservation?.status === "leased") break;
 
+      if (reservation?.status === "denied_capacity") sawCapacityContention = true;
       const blocked = selection.contract.capability?.allowedResources;
       const canNarrow = reservation?.status === "denied_capacity"
         && Array.isArray(blocked) && blocked.length > 0
         && attempt < 4
         && blocked.some((id) => typeof id === "string" && !excludeResources.includes(id));
       if (!canNarrow) {
-        return { action: "deny", reason: reservation?.status === "denied_capacity" ? "no compatible broker capacity" : "broker policy denied launch" };
+        return { action: "deny", reason: reservation?.status === "denied_capacity"
+          ? "compatible broker capacity is temporarily busy"
+          : "broker policy denied launch" };
       }
       for (const id of blocked) if (typeof id === "string" && !excludeResources.includes(id)) excludeResources.push(id);
     }

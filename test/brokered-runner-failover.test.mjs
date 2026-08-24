@@ -58,7 +58,7 @@ function scriptedSpawn(script) {
         usage: { input: 1, output: 1 },
         latestAssistantMessage: outcome.error
           ? { stopReason: "error", errorMessage: outcome.error, content: [] }
-          : { stopReason: "end_turn", content: [{ type: "text", text: outcome.text ?? "done" }] },
+          : { stopReason: outcome.stopReason ?? "end_turn", content: [{ type: "text", text: outcome.text ?? "done" }] },
         async prompt() {},
         async dispose() {},
         async abort() {},
@@ -95,6 +95,30 @@ test("a provider rate limit is classified as a routing fact, not a child failure
   assert.equal(classifyChildFailure("child completed without a result"), "unavailable");
   assert.equal(classifyChildFailure("controller lease heartbeat failed"), "unavailable");
   assert.equal(classifyChildFailure("broker behavioral monitor is unavailable"), "unavailable");
+  assert.equal(classifyChildFailure("child stopped with an unresolved tool request"), "incomplete");
+});
+
+test("a child stopped at a tool request is retried without blaming provider health", async () => {
+  const resolver = fakeResolver({ resources: [{ id: "cursor/composer" }, { id: "codex/research" }] });
+  const { runner, root } = runnerWith(resolver, scriptedSpawn([
+    { stopReason: "toolUse", text: "I'll start by reading the project instructions." },
+    { text: "Verified findings with source URLs." },
+  ]));
+
+  try {
+    const result = await runner.run({
+      childId: "job-unresolved-tool",
+      promptDigest: "c".repeat(64),
+      cwd: root,
+      prompt: "research and report findings",
+    });
+    assert.equal(result.status, "completed");
+    assert.deepEqual(result.route.map((attempt) => attempt.outcome), ["incomplete", "completed"]);
+    assert.match(result.route[0].error, /unresolved tool request/);
+    assert.deepEqual(resolver.reports, [], "protocol non-completion is not provider downtime");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a rate limit mid-run reports the account, reroutes, and the work still completes", async () => {

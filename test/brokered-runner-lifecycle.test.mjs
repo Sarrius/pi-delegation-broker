@@ -76,6 +76,49 @@ test("every attempt is tracked while its lease lives, but only a completed one i
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("temporary broker capacity waits for the live account instead of consuming an attempt", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-capacity-wait-"));
+  let resolutions = 0;
+  let delays = 0;
+  const resolver = {
+    async resolve() {
+      resolutions += 1;
+      if (resolutions < 3) return { action: "deny", reason: "compatible broker capacity is temporarily busy" };
+      return {
+        action: "allow", resource: { id: "cursor/composer", capacityGroup: "G-cursor" }, resolvedModel: MODEL,
+        policy: {
+          policyId: "lease-capacity", agentDir: root, environment: {},
+          async onChildSessionOpened() {}, async onBeforeChildAbandoned() {},
+          async onChildSessionClosed() { return { status: "released" }; },
+        },
+      };
+    },
+  };
+  const spawnChild = async () => ({
+    resolved: MODEL,
+    session: {
+      usage: { input: 1, output: 1 },
+      latestAssistantMessage: { stopReason: "stop", content: [{ type: "text", text: "capacity recovered" }] },
+      async prompt() {}, async dispose() {},
+    },
+  });
+  try {
+    const runner = new BrokeredChildRunner({
+      resolver, sessionsRoot: join(root, "sessions"), spawnChild,
+      delay: async () => { delays += 1; }, capacityWaitMs: 5_000, capacityRetryMs: 1,
+    });
+    const result = await runner.run({
+      childId: "capacity-task", promptDigest: "a".repeat(64), cwd: root, prompt: "work", maxAttempts: 1,
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.text, "capacity recovered");
+    assert.equal(result.route.length, 1, "capacity contention must not consume route attempts");
+    assert.equal(result.route[0].attempt, 1);
+    assert.equal(resolutions, 3);
+    assert.equal(delays, 2);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("real progress resets the watchdog while the absolute attempt ceiling stays separate", async () => {
   const root = mkdtempSync(join(tmpdir(), "runner-progress-"));
   let listener;

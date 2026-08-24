@@ -34,6 +34,7 @@ type Runtime = {
   pending?: PendingAction;
   executing: Map<string, PendingAction>;
   step: number;
+  undeclaredBlocks: number;
   failed: string | null;
   heartbeat?: ReturnType<typeof setInterval>;
 };
@@ -115,6 +116,7 @@ export default function (pi: ExtensionAPI) {
         stepId, toolName, args: captured.value,
       });
       if (result.status !== "declared") throw new Error("controller rejected behavioral declaration");
+      runtime.undeclaredBlocks = 0;
       runtime.pending = { stepId, toolName: params.toolName, args: captured.value };
       return {
         content: [{ type: "text", text: `Declared ${params.toolName}; invoke that exact action next.` }],
@@ -130,7 +132,7 @@ export default function (pi: ExtensionAPI) {
       || typeof loaded.capability.leaseTtlMs !== "number" || !Number.isSafeInteger(loaded.capability.leaseTtlMs)) {
       throw new Error("controller effective child capability is unavailable or malformed");
     }
-    runtime = { capability: loaded.capability, executing: new Map(), step: 0, failed: null };
+    runtime = { capability: loaded.capability, executing: new Map(), step: 0, undeclaredBlocks: 0, failed: null };
     // Align the model-visible surface with controller policy. The blocking hook
     // remains authoritative if a later trusted extension changes active tools.
     const allowed = new Set(loaded.capability.allowedTools);
@@ -153,7 +155,19 @@ export default function (pi: ExtensionAPI) {
     if (event.toolName === DECLARATION_TOOL) return undefined;
     if (!runtime || runtime.failed) return failClosed(runtime?.failed ?? "broker behavioral monitor was not initialized");
     const pending = runtime.pending;
-    if (!pending) return failClosed("declare the exact next action with broker_declare_action before invoking a tool");
+    if (!pending) {
+      runtime.undeclaredBlocks += 1;
+      if (runtime.undeclaredBlocks === 1) {
+        // Nothing executed, so one correction is safe: block this call, keep the capability
+        // live, and let the model declare before retrying. A repeated omission terminates.
+        return {
+          block: true,
+          terminate: false,
+          reason: "tool blocked: call broker_declare_action with this exact tool name and arguments, wait for it to succeed, then retry",
+        };
+      }
+      return failClosed("repeated tool invocation without broker_declare_action");
+    }
     let actual;
     try { actual = captureLosslessJson(event.input, { maxBytes: 256 * 1024, maxDepth: 32, maxNodes: 10_000 }).value; }
     catch { return failClosed("tool arguments cannot be represented by the broker behavioral protocol"); }

@@ -51,6 +51,8 @@ test("capability compiler generates prompt rules and authorization policy from o
   assert.equal(typeof promptRules, "string");
   assert.ok(promptRules.includes("allowed_tools: read, grep, ls"));
   assert.ok(promptRules.includes("never the mcp_pi_ prefix"));
+  assert.ok(promptRules.includes("broker_declare_action"));
+  assert.ok(promptRules.includes("wait for that declaration to succeed"));
   assert.ok(promptRules.includes("operation_class: observe"));
   assert.ok(promptRules.includes("capability_fingerprint:"));
 

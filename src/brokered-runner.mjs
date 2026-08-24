@@ -8,6 +8,8 @@ import { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionErr
 const SETTLE_GRACE_MS = 15_000;
 const DEFAULT_NO_PROGRESS_TIMEOUT_MS = 180_000;
 const DEFAULT_ATTEMPT_MAX_RUN_MS = 15 * 60_000;
+const DEFAULT_CAPACITY_WAIT_MS = 5 * 60_000;
+const DEFAULT_CAPACITY_RETRY_MS = 500;
 const MAX_ROUTE_ATTEMPTS = 8;
 const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
 
@@ -18,6 +20,9 @@ const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
  * the last group is a genuine end of the road.
  */
 const FAILURE_SIGNATURES = Object.freeze([
+  // A child can stop at a blocked tool request or an output boundary without producing its
+  // promised result. That is retryable model/protocol non-completion, not provider downtime.
+  Object.freeze({ kind: "incomplete", pattern: /child stopped with an unresolved tool request|child output ended before completion/i }),
   Object.freeze({ kind: "rate_limited", pattern: /\b(rate[ _-]?limit|too many requests|429|quota exceeded|overloaded|capacity)\b/i }),
   Object.freeze({ kind: "auth_fatal", pattern: /\b(401|403|unauthorized|forbidden|invalid[ _-]?api[ _-]?key|invalid_grant|refresh token not found|authentication|expired token|revoked|no api key found)\b/i }),
   Object.freeze({ kind: "context_exhausted", pattern: /\b(context[ _-]?(window|length|limit)|prompt is too long|maximum context|token limit)\b/i }),
@@ -49,7 +54,12 @@ const SUBAGENT_FRAMING =
   "You are a subagent: an orchestrating agent spawned you for a single task. Your final message is returned to that agent as a result - it is not shown to a person. Respond with exactly what the task asks for: raw data or findings, no preamble, no markdown code fences unless explicitly requested, no closing questions.";
 
 function defaultDelay(ms) {
-  return new Promise((resolve) => { const t = setTimeout(resolve, ms); t.unref?.(); });
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+function isTemporaryCapacityDenial(error) {
+  return error instanceof Error
+    && error.message === "Broker denied launch: compatible broker capacity is temporarily busy";
 }
 
 function assistantText(message) {
@@ -75,6 +85,9 @@ export class BrokeredChildRunner {
   #spawnChild;
   #noProgressTimeoutMs;
   #attemptMaxRunMs;
+  #capacityWaitMs;
+  #capacityRetryMs;
+  #now;
   #handles = new Map();
 
   constructor({
@@ -82,6 +95,9 @@ export class BrokeredChildRunner {
     spawnChild = spawnBrokeredChild, promptTimeoutMs,
     noProgressTimeoutMs = promptTimeoutMs ?? DEFAULT_NO_PROGRESS_TIMEOUT_MS,
     attemptMaxRunMs = DEFAULT_ATTEMPT_MAX_RUN_MS,
+    capacityWaitMs = DEFAULT_CAPACITY_WAIT_MS,
+    capacityRetryMs = DEFAULT_CAPACITY_RETRY_MS,
+    now = () => Date.now(),
   }) {
     if (!resolver || typeof resolver.resolve !== "function") throw new Error("BrokeredChildRunner requires a BrokeredLaunchResolver");
     if (!(semaphore instanceof Semaphore)) throw new Error("BrokeredChildRunner requires a Semaphore");
@@ -94,8 +110,18 @@ export class BrokeredChildRunner {
     if (!Number.isSafeInteger(attemptMaxRunMs) || attemptMaxRunMs < noProgressTimeoutMs || attemptMaxRunMs > 24 * 60 * 60_000) {
       throw new Error("BrokeredChildRunner attemptMaxRunMs must be at least noProgressTimeoutMs and at most 24 hours");
     }
+    if (!Number.isSafeInteger(capacityWaitMs) || capacityWaitMs < 0 || capacityWaitMs > 60 * 60_000) {
+      throw new Error("BrokeredChildRunner capacityWaitMs must be between 0 and 3600000");
+    }
+    if (!Number.isSafeInteger(capacityRetryMs) || capacityRetryMs < 1 || capacityRetryMs > 60_000) {
+      throw new Error("BrokeredChildRunner capacityRetryMs must be between 1 and 60000");
+    }
+    if (typeof now !== "function") throw new Error("BrokeredChildRunner now must be a function");
     this.#noProgressTimeoutMs = noProgressTimeoutMs;
     this.#attemptMaxRunMs = attemptMaxRunMs;
+    this.#capacityWaitMs = capacityWaitMs;
+    this.#capacityRetryMs = capacityRetryMs;
+    this.#now = now;
     this.#resolver = resolver;
     this.#semaphore = semaphore;
     this.#sessionsRoot = sessionsRoot;
@@ -125,6 +151,7 @@ export class BrokeredChildRunner {
     const route = [];
     const unavailableByCapacityGroup = new Map();
     let requiredCapabilities = spec.capabilityRequest?.requiredCapabilities;
+    let capacityWaitDeadline;
     let lastResult;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -139,8 +166,22 @@ export class BrokeredChildRunner {
       try {
         handle = await this.spawn({ ...spec, childId: attemptId, capabilityRequest, attempts: attempt, deferClosePolicy: true });
       } catch (error) {
-        // A denial is the broker refusing every live resource for this contract; retrying the
-        // same contract cannot change that, so surface it rather than burning attempts.
+        // A compatible account being busy is not the same as no route existing. Workflows can
+        // deliberately ask for more parallel nodes than the one currently healthy account can
+        // run. Wait boundedly for its lease instead of terminally denying those teammates.
+        if (isTemporaryCapacityDenial(error)) {
+          const now = this.#now();
+          capacityWaitDeadline ??= now + this.#capacityWaitMs;
+          if (now < capacityWaitDeadline) {
+            await this.#delay(Math.min(this.#capacityRetryMs, Math.max(1, capacityWaitDeadline - now)));
+            attempt -= 1; // capacity contention did not spend a provider attempt
+            continue;
+          }
+          const message = `compatible broker capacity remained busy for ${this.#capacityWaitMs}ms`;
+          route.push({ attempt, childId: attemptId, outcome: "capacity_wait_timeout", error: message });
+          return Object.freeze({ id: childId, status: "failed", text: "", error: message, route: Object.freeze(route) });
+        }
+        // A policy/capability denial cannot be repaired by replaying the same contract.
         route.push({ attempt, childId: attemptId, outcome: "denied", error: error.message });
         return Object.freeze({ id: childId, status: "failed", text: "", error: error.message, route: Object.freeze(route) });
       }
@@ -187,7 +228,7 @@ export class BrokeredChildRunner {
       // account is an observed fact about the fleet no matter which attempt saw it; reporting
       // it only when a retry follows means the route that fails last is never cooled, and the
       // next task selects that same exhausted account first and burns an attempt re-proving it.
-      if (resourceId !== undefined && kind !== "fatal") {
+      if (resourceId !== undefined && kind !== "fatal" && kind !== "incomplete") {
         if (kind === "rate_limited" || kind === "account_exhausted") await this.#reportRateLimited(resourceId, lastResult.retryAfterMs);
         // A revoked/expired credential belongs to the account, not the model: condemning only
         // this resource makes the next hop retry a sibling model on the same dead credential.
@@ -204,6 +245,7 @@ export class BrokeredChildRunner {
         // A context overflow leaves the provider healthy — only this route is wrong.
         if (kind !== "context_exhausted") excludeResources.push(resourceId);
       }
+      if (resourceId !== undefined && kind === "incomplete") excludeResources.push(resourceId);
       if (kind === "fatal" || attempt === maxAttempts) break;
 
       if (kind === "context_exhausted") {
@@ -407,14 +449,23 @@ export class BrokeredChildRunner {
       const text = assistantText(message);
       const worktreeResult = worktree ? await this.#collectWorktree(worktree) : undefined;
       const answered = text.trim().length > 0 || Boolean(worktreeResult?.patch);
-      if (message?.stopReason === "error" || !answered) {
+      const unresolvedToolRequest = message?.stopReason === "toolUse" || message?.stopReason === "tool_use";
+      const truncated = ["length", "max_tokens", "maxTokens"].includes(message?.stopReason);
+      const aborted = message?.stopReason === "aborted";
+      if (message?.stopReason === "error" || !answered || unresolvedToolRequest || truncated || aborted) {
         result = {
           id: handle.id,
           status: "failed",
           text,
           error: message?.stopReason === "error"
             ? (message.errorMessage ?? "Child model request failed")
-            : "child completed without a result",
+            : unresolvedToolRequest
+              ? "child stopped with an unresolved tool request"
+              : truncated
+                ? "child output ended before completion"
+                : aborted
+                  ? "child was aborted before completion"
+                  : "child completed without a result",
           usage,
           resolved: handle.resolved,
           resource: handle.resource,
