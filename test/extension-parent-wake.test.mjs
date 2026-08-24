@@ -11,6 +11,7 @@ const EXTENSION = fileURLToPath(new URL("../extensions/pi-delegation-broker.ts",
 const PROBE = fileURLToPath(new URL("./fixtures/extension-parent-wake-probe.mjs", import.meta.url));
 const RECOVERY_PROBE = fileURLToPath(new URL("./fixtures/extension-recovered-cancel-wake-probe.mjs", import.meta.url));
 const SYNC_PROBE = fileURLToPath(new URL("./fixtures/extension-sync-workflow-no-wake-probe.mjs", import.meta.url));
+const FLEET_PROBE = fileURLToPath(new URL("./fixtures/extension-fleet-probe.mjs", import.meta.url));
 
 function runProbe(home, probe) {
   return new Promise((resolve, reject) => {
@@ -71,5 +72,10 @@ test("extension parent-wake lifecycle covers background, recovery, and synchrono
     const result = JSON.parse(stdout.trim().split("\n").at(-1));
     assert.equal(result.sends, 0);
     assert.match(result.workflowId, /^workflow-/);
+  });
+  await t.test("the extension renders a bounded fleet widget and terminal route detail", async () => {
+    const { stdout, stderr } = await withProbe("broker-fleet-", FLEET_PROBE);
+    assert.equal(stderr, "");
+    assert.deepEqual(JSON.parse(stdout.trim().split("\n").at(-1)), { widget: true, detail: true, stopped: true });
   });
 });

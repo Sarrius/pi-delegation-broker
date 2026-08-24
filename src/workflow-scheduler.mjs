@@ -1,6 +1,6 @@
 import { basename, dirname, isAbsolute } from "node:path";
 import {
-  isTerminalJobStatus, readJob, submitJob, updateJob, writeJob,
+  isTerminalJobStatus, readJob, submitJob, updateJob,
 } from "./delegation-job-store.mjs";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
@@ -135,13 +135,34 @@ export class TaskOrchestrator {
     if (!state?.nodes || state.kind !== "workflow") fail("not initialized");
     if (isTerminalJobStatus(state.status)) return state;
     const startedAt = state.startedAt ?? this.#now();
-    state = structuredClone(updateJob(this.#root, this.#jobId, (job) => ({ ...job, status: "running", startedAt }), this.#now()));
+    state = structuredClone(updateJob(this.#root, this.#jobId, (job) => job.status === "cancellation_requested"
+      ? job
+      : ({ ...job, status: "running", startedAt }), this.#now()));
     const byId = new Map(state.nodes.map((node) => [node.id, node]));
     const running = new Set();
 
     const persist = () => {
       state.updatedAt = this.#now();
-      writeJob(this.#root, state);
+      const local = structuredClone(state);
+      const persisted = updateJob(this.#root, this.#jobId, (current) => {
+        if (isTerminalJobStatus(current.status)) return current;
+        if (current.status !== "cancellation_requested") return local;
+        if (local.status === "cancelled") return local;
+        const merged = {
+          ...local,
+          status: "cancellation_requested",
+          cancelRequestedAt: current.cancelRequestedAt,
+        };
+        delete merged.completedAt;
+        return merged;
+      }, state.updatedAt);
+      if (!persisted) fail("durable job disappeared during execution");
+      if (persisted.status === "cancellation_requested") {
+        state.status = "cancellation_requested";
+        state.cancelRequestedAt = persisted.cancelRequestedAt;
+        delete state.completedAt;
+      }
+      return persisted;
     };
     const launch = async (node) => {
       node.state = "running";
@@ -213,6 +234,14 @@ export class TaskOrchestrator {
     state.completedAt = this.#now();
     state.terminalReason = incomplete.length ? "one or more workflow nodes failed or were blocked" : "all workflow nodes completed";
     persist();
+    // A cancellation can arrive between the pre-terminal status check and the terminal write.
+    // Preserve it monotonically instead of returning a non-terminal cancellation_requested job.
+    if (state.status === "cancellation_requested") {
+      state.status = "cancelled";
+      state.completedAt = this.#now();
+      state.terminalReason = "cancelled by controller";
+      persist();
+    }
     return Object.freeze(structuredClone(state));
   }
 }

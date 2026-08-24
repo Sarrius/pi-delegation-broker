@@ -3,6 +3,7 @@ import test from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { readJob, requestJobCancellation } from "../src/delegation-job-store.mjs";
 import { TaskOrchestrator, formatWorkflowSummary, workflowObserveCapabilityRequest } from "../src/workflow-scheduler.mjs";
 
 test("workflow stages stay read-only even when their prompt says do not modify files", () => {
@@ -98,6 +99,30 @@ test("controller cancellation pauses in-flight nodes and settles the workflow ca
     assert.equal(state.status, "cancelled");
     assert.equal(state.nodes[0].state, "pending");
     assert.equal(Number.isSafeInteger(state.completedAt), true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a durable cancellation racing node completion cannot be overwritten by stale scheduler state", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-cancel-race-"));
+  let release;
+  let announceStarted;
+  const started = new Promise((resolve) => { announceStarted = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  try {
+    const o = new TaskOrchestrator({
+      root,
+      jobId: "workflow-cancel-race",
+      run: async () => { announceStarted(); await gate; return { status: "completed", reportTaskId: "late-report" }; },
+    });
+    o.initialize([{ id: "slow", task: "wait" }]);
+    const pending = o.execute();
+    await started;
+    assert.equal(requestJobCancellation(root, "workflow-cancel-race", Date.now()).status, "cancellation_requested");
+    release();
+    const state = await pending;
+    assert.equal(state.status, "cancelled");
+    assert.equal(readJob(root, "workflow-cancel-race").status, "cancelled");
+    assert.equal(state.nodes[0].state, "completed", "accepted terminal node work is preserved while the workflow cancels");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

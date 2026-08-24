@@ -25,9 +25,17 @@ function report(taskId, overrides = {}) {
 test("a written report round-trips and starts unread", () => {
   const s = store();
   try {
-    writeReport(s.root, report("delegate-a-1"));
+    writeReport(s.root, report("delegate-a-1", {
+      logicalId: "workflow-1/review", resourceId: "cursor/composer-2.5", provider: "cursor",
+      modelId: "composer-2.5", effectiveThinking: "medium",
+      usage: { input: 12, output: 4, cacheRead: 3, cacheWrite: 0, turns: 1 },
+    }));
     const loaded = readReport(s.root, "delegate-a-1");
     assert.equal(loaded.text, "four");
+    assert.equal(loaded.logicalId, "workflow-1/review");
+    assert.equal(loaded.resourceId, "cursor/composer-2.5");
+    assert.equal(loaded.effectiveThinking, "medium");
+    assert.deepEqual(loaded.usage, { input: 12, output: 4, cacheRead: 3, cacheWrite: 0, turns: 1 });
     assert.equal(loaded.readAt, null);
     assert.equal(loaded.wakeClaimedAt, null);
     assert.equal(loaded.wakeAt, null);
@@ -45,6 +53,36 @@ test("create-once claim and dispatch mark form a durable non-replayable wake out
     assert.equal(markReportWoken(s.root, "delegate-wake-1", 250)?.wakeAt, 250);
     assert.equal(markReportWoken(s.root, "delegate-wake-1", 300)?.wakeAt, 250);
     assert.deepEqual(unreadReports(s.root).map((r) => r.taskId), ["delegate-wake-1"]);
+  } finally { s.done(); }
+});
+
+test("durable sent marker prevents a stale JSON write from resurrecting wake delivery", () => {
+  const s = store();
+  try {
+    writeReport(s.root, report("delegate-sent-race"));
+    assert.ok(claimReportWake(s.root, "delegate-sent-race", 225));
+    const stale = readReport(s.root, "delegate-sent-race");
+    assert.equal(markReportWoken(s.root, "delegate-sent-race", 250)?.wakeAt, 250);
+    writeReport(s.root, { ...stale, wakeAt: null });
+    assert.equal(readReport(s.root, "delegate-sent-race")?.wakeAt, 250);
+    assert.equal(claimReportWake(s.root, "delegate-sent-race", 300), undefined);
+  } finally { s.done(); }
+});
+
+test("a malformed sent marker still fails closed against a duplicate wake", () => {
+  const s = store();
+  try {
+    writeReport(s.root, report("delegate-sent-corrupt"));
+    assert.ok(claimReportWake(s.root, "delegate-sent-corrupt", 225));
+    assert.equal(markReportWoken(s.root, "delegate-sent-corrupt", 250)?.wakeAt, 250);
+    const marker = join(s.root, "delegate-sent-corrupt.json.wake.sent");
+    assert.ok(existsSync(marker));
+    for (const corrupt of ["", "{", '{"wakeAt":"later"}', '{"wakeAt":-1}', '{"wakeAt":1}']) {
+      writeFileSync(marker, corrupt, { mode: 0o600 });
+      const wakeAt = readReport(s.root, "delegate-sent-corrupt")?.wakeAt;
+      assert.ok(Number.isSafeInteger(wakeAt), `corrupt marker ${JSON.stringify(corrupt)} lost durable wake state`);
+      assert.equal(claimReportWake(s.root, "delegate-sent-corrupt", 400), undefined);
+    }
   } finally { s.done(); }
 });
 
@@ -168,6 +206,10 @@ test("path traversal and invalid shapes are rejected at write time", () => {
     assert.throws(() => writeReport(s.root, report("ok", { completedAt: 99 })), /timestamps/);
     assert.throws(() => writeReport(s.root, report("ok", { wakeClaimedAt: 199 })), /wakeClaimedAt/);
     assert.throws(() => writeReport(s.root, report("ok", { wakeAt: 199 })), /wakeAt/);
+    assert.throws(() => writeReport(s.root, report("ok", { logicalId: "x".repeat(321) })), /logicalId/);
+    assert.throws(() => writeReport(s.root, report("ok", {
+      usage: { input: 1, output: -1, cacheRead: 0, cacheWrite: 0, turns: 1 },
+    })), /usage.output/);
     assert.equal(readReport(s.root, "../etc/passwd"), undefined);
   } finally { s.done(); }
 });

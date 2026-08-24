@@ -87,6 +87,15 @@ export class BrokeredChildRunner {
   #capacityRetryMs;
   #now;
   #handles = new Map();
+  #admissions = new Map();
+  #inflightSpawns = new Map();
+  #activeRuns = new Set();
+  #abortedRuns = new Set();
+  #disposed = false;
+  // Volatile controller projection for the live terminal fleet. Durable job/node state remains
+  // in delegation-job-store; this map is deliberately lost on process death and is never
+  // presented as a checkpoint.
+  #attempts = new Map();
 
   constructor({
     resolver, semaphore = new Semaphore(4), sessionsRoot, delay = defaultDelay,
@@ -128,6 +137,44 @@ export class BrokeredChildRunner {
   }
 
   get semaphore() { return this.#semaphore; }
+  get noProgressTimeoutMs() { return this.#noProgressTimeoutMs; }
+
+  activeAttempts() {
+    return [...this.#attempts.values()].map((attempt) => {
+      const handle = this.#handles.get(attempt.attemptId);
+      const usage = handle?.session?.usage ?? attempt.usage ?? {};
+      return Object.freeze({ ...attempt, usage: Object.freeze({ ...usage }) });
+    }).sort((left, right) => left.startedAt - right.startedAt || left.attemptId.localeCompare(right.attemptId));
+  }
+
+  #publishAttempt(attempt) {
+    this.#attempts.set(attempt.attemptId, Object.freeze({ ...attempt }));
+  }
+
+  #updateAttempt(attemptId, patch) {
+    const current = this.#attempts.get(attemptId);
+    if (!current) return;
+    this.#attempts.set(attemptId, Object.freeze({ ...current, ...patch }));
+  }
+
+  #clearAttempt(attemptId) {
+    if (attemptId) this.#attempts.delete(attemptId);
+  }
+
+  #observeAttemptEvent(attemptId, event) {
+    if (!event || typeof event.type !== "string") return;
+    // Keep this list exactly aligned with #promptWithDeadline. Lifecycle chatter such as
+    // agent_start/agent_settled is observed, but it is not proof that useful work progressed.
+    const progress = [
+      "message_update", "message_end", "tool_execution_start", "tool_execution_update",
+      "tool_execution_end", "auto_retry_start", "auto_retry_end", "bash_execution_update",
+    ].includes(event.type);
+    this.#updateAttempt(attemptId, {
+      lastEventAt: this.#now(),
+      lastEventType: event.type,
+      ...(progress ? { lastProgressAt: this.#now() } : {}),
+    });
+  }
 
   /**
    * Run one delegated task to completion across a changing provider set.
@@ -140,20 +187,63 @@ export class BrokeredChildRunner {
    *
    * Returns the terminal child result, plus a `route` trail of every attempt made.
    */
-  async run({ childId, maxAttempts = MAX_ROUTE_ATTEMPTS, trackForVerification = false, ...spec }) {
+  async run({ childId, maxAttempts = MAX_ROUTE_ATTEMPTS, trackForVerification = false, fleet, ...spec }) {
+    if (this.#disposed) throw new Error("BrokeredChildRunner is disposed");
     if (!CHILD_ID.test(childId ?? "")) throw new Error("BrokeredChildRunner requires a valid childId");
     if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) throw new Error("maxAttempts must be a positive safe integer");
     if (typeof trackForVerification !== "boolean") throw new Error("trackForVerification must be boolean");
+    if (fleet !== undefined && (fleet === null || typeof fleet !== "object" || Array.isArray(fleet))) {
+      throw new Error("BrokeredChildRunner fleet metadata must be an object");
+    }
 
+    const fleetMeta = fleet ?? {};
     const excludeResources = [...(spec.capabilityRequest?.excludeResources ?? [])];
     const route = [];
     const unavailableByCapacityGroup = new Map();
     let requiredCapabilities = spec.capabilityRequest?.requiredCapabilities;
     let capacityWaitDeadline;
     let lastResult;
+    let visibleAttemptId;
+    const finish = (value) => {
+      this.#clearAttempt(visibleAttemptId);
+      visibleAttemptId = undefined;
+      this.#activeRuns.delete(childId);
+      this.#abortedRuns.delete(childId);
+      return value;
+    };
+    // Cancellation must reach a run that owns no child process yet. Without this an abort issued
+    // while the route is queued behind live capacity is silently a no-op, and the controller
+    // keeps paying for attempts the operator already cancelled.
+    const abortedEarly = () => this.#disposed || this.#abortedRuns.has(childId);
 
+    this.#abortedRuns.delete(childId);
+    this.#activeRuns.add(childId);
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (abortedEarly()) return finish(Object.freeze({
+        id: childId, status: "aborted", text: "",
+        error: this.#disposed ? "brokered runner disposed" : "aborted before a child was launched",
+        route: Object.freeze(route),
+      }));
       const attemptId = attempt === 1 ? childId : `${childId}-r${attempt}`;
+      visibleAttemptId = attemptId;
+      const attemptStartedAt = this.#now();
+      this.#publishAttempt({
+        attemptId,
+        baseChildId: childId,
+        logicalId: typeof fleetMeta.logicalId === "string" ? fleetMeta.logicalId : childId,
+        rootId: typeof fleetMeta.rootId === "string" ? fleetMeta.rootId : childId,
+        ...(typeof fleetMeta.workflowId === "string" ? { workflowId: fleetMeta.workflowId } : {}),
+        ...(typeof fleetMeta.nodeId === "string" ? { nodeId: fleetMeta.nodeId } : {}),
+        kind: typeof fleetMeta.kind === "string" ? fleetMeta.kind : "task",
+        role: typeof fleetMeta.role === "string" ? fleetMeta.role : "worker",
+        attempt,
+        state: "selecting",
+        requestedThinking: spec.thinkingLevel ?? "off",
+        startedAt: attemptStartedAt,
+        lastEventAt: attemptStartedAt,
+        lastEventType: "selecting",
+        usage: {},
+      });
       const capabilityRequest = {
         ...(spec.capabilityRequest ?? {}),
         ...(excludeResources.length > 0 ? { excludeResources: [...excludeResources] } : {}),
@@ -164,25 +254,61 @@ export class BrokeredChildRunner {
       try {
         handle = await this.spawn({ ...spec, childId: attemptId, capabilityRequest, attempts: attempt, deferClosePolicy: true });
       } catch (error) {
+        if (abortedEarly()) return finish(Object.freeze({
+          id: childId, status: "aborted", text: "",
+          error: this.#disposed ? "brokered runner disposed" : "aborted before a child was launched",
+          route: Object.freeze(route),
+        }));
         // Busy live capacity waits; it is not a spent provider attempt.
         if (isTemporaryCapacityDenial(error)) {
           const now = this.#now();
           capacityWaitDeadline ??= now + this.#capacityWaitMs;
           if (now < capacityWaitDeadline) {
+            this.#updateAttempt(attemptId, {
+              state: "waiting_capacity", lastEventAt: now, lastEventType: "capacity_wait",
+              waitUntil: Math.min(capacityWaitDeadline, now + this.#capacityRetryMs),
+            });
             await this.#delay(Math.min(this.#capacityRetryMs, Math.max(1, capacityWaitDeadline - now)));
             attempt -= 1; // capacity contention did not spend a provider attempt
             continue;
           }
           const message = `compatible broker capacity remained busy for ${this.#capacityWaitMs}ms`;
           route.push({ attempt, childId: attemptId, outcome: "capacity_wait_timeout", error: message });
-          return Object.freeze({ id: childId, status: "failed", text: "", error: message, route: Object.freeze(route) });
+          return finish(Object.freeze({ id: childId, status: "failed", text: "", error: message, route: Object.freeze(route) }));
         }
         // A policy/capability denial cannot be repaired by replaying the same contract.
         route.push({ attempt, childId: attemptId, outcome: "denied", error: error.message });
-        return Object.freeze({ id: childId, status: "failed", text: "", error: error.message, route: Object.freeze(route) });
+        return finish(Object.freeze({ id: childId, status: "failed", text: "", error: error.message, route: Object.freeze(route) }));
+      }
+
+      // Cancellation can land after the semaphore grant but before a handle existed, i.e. while
+      // the resolver was still choosing a route. The child is real now, so stop it through the
+      // normal close path instead of leaving the operator paying for cancelled work.
+      if (abortedEarly()) {
+        await handle.session?.abort?.().catch(() => undefined);
+        const aborted = await handle.result.catch(() => ({ status: "aborted" }));
+        // run() owns lease closure for its attempts (deferClosePolicy), so an early return has
+        // to close it here or the account stays leased for the rest of the session.
+        await this.#closeAttempt(handle, aborted).catch(() => undefined);
+        route.push({ attempt, childId: attemptId, resourceId: handle.resource?.id, outcome: "aborted" });
+        return finish(Object.freeze({
+          id: childId, status: "aborted", text: "",
+          error: this.#disposed ? "brokered runner disposed" : "aborted after launch admission",
+          route: Object.freeze(route),
+        }));
       }
 
       const resourceId = handle.resource?.id;
+      this.#updateAttempt(attemptId, {
+        state: "running",
+        resourceId,
+        provider: handle.model?.provider,
+        modelId: handle.model?.modelId,
+        effectiveThinking: handle.resolved?.thinkingLevel ?? spec.thinkingLevel ?? "off",
+        tier: handle.selection?.modelTier,
+        lastEventAt: this.#now(),
+        lastEventType: "child_started",
+      });
       if (trackForVerification) {
         // The child releases its own lease when its session ends, so durable tracking has to
         // happen while the child is still running. Tracking is not acceptance: a failed attempt
@@ -196,28 +322,30 @@ export class BrokeredChildRunner {
         } catch (error) {
           await this.#closeAttempt(handle, { status: "failed" }).catch(() => undefined);
           route.push({ attempt, childId: attemptId, resourceId, outcome: "controller_track_failed", error: error.message });
-          return Object.freeze({ id: childId, status: "failed", text: "", error: error.message, route: Object.freeze(route) });
+          return finish(Object.freeze({ id: childId, status: "failed", text: "", error: error.message, route: Object.freeze(route) }));
         }
       }
       lastResult = await handle.result;
+      this.#updateAttempt(attemptId, { state: "verifying", lastEventAt: this.#now(), lastEventType: "child_terminal" });
       let closure;
       try {
         closure = await this.#closeAttempt(handle, lastResult);
       } catch (error) {
         route.push({ attempt, childId: attemptId, resourceId, outcome: "controller_close_failed", error: error.message });
-        return Object.freeze({ ...lastResult, id: childId, status: "failed", error: `controller close failed: ${error.message}`, route: Object.freeze(route) });
+        return finish(Object.freeze({ ...lastResult, id: childId, status: "failed", error: `controller close failed: ${error.message}`, route: Object.freeze(route) }));
       }
       if (lastResult.status === "completed") {
         const verification = closure?.verification;
         if (verification?.outcome?.status && verification.outcome.status !== "completed") {
           route.push({ attempt, childId: attemptId, resourceId, outcome: "verification_rejected" });
-          return Object.freeze({ ...lastResult, id: childId, status: "failed", error: "controller acceptance verification rejected the completed child result", verification, route: Object.freeze(route) });
+          return finish(Object.freeze({ ...lastResult, id: childId, status: "failed", error: "controller acceptance verification rejected the completed child result", verification, route: Object.freeze(route) }));
         }
         route.push({ attempt, childId: attemptId, resourceId, outcome: "completed" });
-        return Object.freeze({ ...lastResult, id: childId, ...(verification ? { verification } : {}), route: Object.freeze(route) });
+        return finish(Object.freeze({ ...lastResult, id: childId, ...(verification ? { verification } : {}), route: Object.freeze(route) }));
       }
 
       const kind = lastResult.status === "aborted" ? "fatal" : classifyChildFailure(lastResult.error ?? lastResult.text);
+      this.#updateAttempt(attemptId, { state: "failed", failureKind: kind, lastEventAt: this.#now(), lastEventType: "attempt_failed" });
       route.push({ attempt, childId: attemptId, resourceId, outcome: kind, error: lastResult.error });
 
       // Provider health is reported before deciding whether to continue. A throttled or dead
@@ -244,6 +372,8 @@ export class BrokeredChildRunner {
       if (resourceId !== undefined && kind === "incomplete") excludeResources.push(resourceId);
       if (kind === "fatal" || attempt === maxAttempts) break;
 
+      this.#clearAttempt(attemptId);
+      visibleAttemptId = undefined;
       if (kind === "context_exhausted") {
         const widened = new Set([...(requiredCapabilities ?? []), "large_context"]);
         if (requiredCapabilities && widened.size === requiredCapabilities.length) break;
@@ -252,11 +382,19 @@ export class BrokeredChildRunner {
       }
     }
 
-    return Object.freeze({
+    // An abort that lands on the final attempt is still an abort, not a provider failure.
+    if (abortedEarly() && lastResult?.status !== "completed") {
+      return finish(Object.freeze({
+        id: childId, status: "aborted", text: "",
+        error: this.#disposed ? "brokered runner disposed" : "aborted during the final attempt",
+        route: Object.freeze(route),
+      }));
+    }
+    return finish(Object.freeze({
       ...(lastResult ?? { id: childId, status: "failed", text: "", error: "no attempt produced a result" }),
       id: childId,
       route: Object.freeze(route),
-    });
+    }));
   }
 
   async #reportRateLimited(resourceId, retryAfterMs) {
@@ -286,15 +424,32 @@ export class BrokeredChildRunner {
     });
   }
 
-  async spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, attempts = 1, deferClosePolicy = false }) {
+  /**
+   * Track the whole launch, not just the queue wait: between the semaphore grant and handle
+   * registration there is a window with no admission and no handle, and dispose() must still
+   * be able to wait for it instead of returning while a child is being born.
+   */
+  async spawn(request) {
+    const promise = this.#spawn(request);
+    this.#inflightSpawns.set(promise, request?.childId);
+    try { return await promise; }
+    finally { this.#inflightSpawns.delete(promise); }
+  }
+
+  async #spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, attempts = 1, deferClosePolicy = false }) {
+    if (this.#disposed) throw new Error("BrokeredChildRunner is disposed");
     if (this.#handles.has(childId)) throw new Error(`Duplicate child id: ${childId}`);
     if (!Number.isSafeInteger(attempts) || attempts < 1) throw new Error("brokered child attempt count must be a positive safe integer");
     if (typeof deferClosePolicy !== "boolean") throw new Error("deferClosePolicy must be boolean");
 
     const admission = new AbortController();
-    const release = await this.#semaphore.acquire(admission.signal);
+    this.#admissions.set(admission, this.#attempts.get(childId)?.baseChildId ?? childId);
+    let release;
+    try { release = await this.#semaphore.acquire(admission.signal); }
+    finally { this.#admissions.delete(admission); }
 
     try {
+      if (this.#disposed) throw new Error("BrokeredChildRunner disposed before launch");
       const decision = await this.#resolver.resolve({
         childId,
         promptDigest,
@@ -381,7 +536,20 @@ export class BrokeredChildRunner {
         result: null,
       };
 
+      this.#updateAttempt(childId, {
+        state: "running",
+        resourceId: decision.resource?.id,
+        provider: launchModel.provider,
+        modelId: launchModel.modelId,
+        effectiveThinking: child.resolved?.thinkingLevel ?? childSpec.thinkingLevel,
+        tier: decision.selection?.modelTier,
+        lastEventAt: this.#now(),
+        lastEventType: "child_started",
+      });
       this.#handles.set(childId, handle);
+      if (typeof child.session.subscribe === "function") {
+        handle.fleetUnsubscribe = child.session.subscribe((event) => this.#observeAttemptEvent(childId, event));
+      }
 
       const resultPromise = this.#runAndClose(handle, childSpec);
       handle.result = resultPromise;
@@ -513,6 +681,7 @@ export class BrokeredChildRunner {
         try { await cleanupWorktree(worktree.sourceCwd, worktree.tree.path); }
         catch { /* worktree retained; child work still on disk */ }
       }
+      try { handle.fleetUnsubscribe?.(); } catch { /* fleet observation is best effort */ }
       this.#handles.delete(handle.id);
     }
     return result;
@@ -533,22 +702,43 @@ export class BrokeredChildRunner {
   }
 
   async abort(childId) {
-    const handle = this.#handles.get(childId);
-    if (!handle?.session) return;
-    await handle.session.abort().catch(() => undefined);
+    // Only a live run may be flagged. Recording an abort for a finished id would leak entries
+    // for the session and could pre-kill a later legitimate run that reuses the same id.
+    if (this.#activeRuns.has(childId)) this.#abortedRuns.add(childId);
+    for (const [admission, owner] of this.#admissions) {
+      if (owner === childId) admission.abort("run aborted");
+    }
+    const handles = [...this.#handles.values()].filter((handle) => {
+      if (handle.id === childId) return true;
+      const attempt = this.#attempts.get(handle.id);
+      return attempt?.baseChildId === childId || attempt?.logicalId === childId;
+    });
+    await Promise.allSettled(handles.map((handle) => handle.session?.abort?.()));
   }
 
   async dispose() {
-    const handles = [...this.#handles.values()];
-    for (const handle of handles) {
-      await handle.session.abort().catch(() => undefined);
-    }
-    // Wait for #runAndClose to finish — it calls onChildSessionClosed
-    // which releases the broker lease.
-    await Promise.allSettled(handles.map((h) => h.result));
-    for (const handle of handles) {
-      await handle.session.dispose().catch(() => undefined);
+    this.#disposed = true;
+    for (const admission of this.#admissions.keys()) admission.abort("runner disposed");
+    this.#admissions.clear();
+    // A launch already past admission can still register a handle after this point, so drain
+    // in-flight spawns and newly registered handles until neither remains.
+    for (let pass = 0; pass < 8; pass += 1) {
+      await Promise.allSettled([...this.#inflightSpawns.keys()]);
+      const handles = [...this.#handles.values()];
+      if (handles.length === 0 && this.#inflightSpawns.size === 0) break;
+      // A handle registered microseconds ago may not carry its result promise yet. Awaiting it
+      // would be a no-op, so leave it for the next pass instead of disposing it half-born.
+      const settled = handles.filter((handle) => handle.result);
+      await Promise.allSettled(settled.map((handle) => handle.session?.abort?.()));
+      // Wait for #runAndClose to finish — it calls onChildSessionClosed
+      // which releases the broker lease.
+      await Promise.allSettled(settled.map((h) => h.result));
+      for (const handle of settled) await handle.session.dispose().catch(() => undefined);
+      for (const handle of settled) this.#handles.delete(handle.id);
     }
     this.#handles.clear();
+    this.#attempts.clear();
+    this.#abortedRuns.clear();
+    this.#activeRuns.clear();
   }
 }

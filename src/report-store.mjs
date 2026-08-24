@@ -37,6 +37,25 @@ function readMarkerPath(root, taskId) {
   return `${reportPath(root, taskId)}.read`;
 }
 
+function wakeSentPath(root, taskId) {
+  return `${reportPath(root, taskId)}.wake.sent`;
+}
+
+function readWakeSentMarker(root, taskId, completedAt) {
+  const path = wakeSentPath(root, taskId);
+  if (!existsSync(path)) return undefined;
+  try {
+    const marker = JSON.parse(readFileSync(path, "utf8"));
+    if (!Number.isSafeInteger(marker.wakeAt) || marker.wakeAt < completedAt) throw new Error("malformed wake marker");
+    return marker.wakeAt;
+  } catch {
+    // A malformed sent marker follows an accepted host dispatch. Fail closed
+    // against a duplicate wake by treating its timestamp as durable.
+    try { return Math.max(completedAt, Math.floor(statSync(path).mtimeMs)); }
+    catch { return completedAt; }
+  }
+}
+
 function readReadMarker(root, taskId, completedAt) {
   const path = readMarkerPath(root, taskId);
   if (!existsSync(path)) return undefined;
@@ -84,6 +103,23 @@ function validate(report) {
   if (report.wakeAt !== null && report.wakeAt !== undefined && (!Number.isSafeInteger(report.wakeAt) || report.wakeAt < report.completedAt)) {
     throw new Error("report wakeAt must be null or a timestamp at/after completion");
   }
+  if (report.logicalId !== undefined && (typeof report.logicalId !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,319}$/.test(report.logicalId))) {
+    throw new Error("report logicalId must be a bounded identifier");
+  }
+  for (const [field, max] of [["resourceId", 500], ["provider", 200], ["modelId", 300], ["effectiveThinking", 40]]) {
+    if (report[field] !== undefined && (typeof report[field] !== "string" || report[field].length < 1 || report[field].length > max)) {
+      throw new Error(`report ${field} must be a bounded string`);
+    }
+  }
+  if (report.usage !== undefined) {
+    if (!report.usage || typeof report.usage !== "object" || Array.isArray(report.usage)) throw new Error("report usage must be an object");
+    for (const field of ["input", "output", "cacheRead", "cacheWrite", "turns"]) {
+      if (report.usage[field] !== undefined && (!Number.isFinite(report.usage[field]) || report.usage[field] < 0)) {
+        throw new Error(`report usage.${field} must be non-negative`);
+      }
+    }
+  }
   for (const field of ["text", "error", "route", "routeExplanation"]) {
     if (report[field] !== undefined && typeof report[field] === "string" && report[field].length > MAX_TEXT) {
       throw new Error(`report ${field} exceeds the bounded size`);
@@ -125,7 +161,11 @@ export function readReport(root, taskId) {
     const value = JSON.parse(readFileSync(path, "utf8"));
     validate(value);
     const readAt = readReadMarker(root, taskId, value.completedAt);
-    if (readAt !== undefined) value.readAt = value.readAt === null ? readAt : Math.min(value.readAt, readAt);
+    if (readAt !== undefined) value.readAt = value.readAt === null || value.readAt === undefined
+      ? readAt : Math.min(value.readAt, readAt);
+    const wakeAt = readWakeSentMarker(root, taskId, value.completedAt);
+    if (wakeAt !== undefined) value.wakeAt = value.wakeAt === null || value.wakeAt === undefined
+      ? wakeAt : Math.min(value.wakeAt, wakeAt);
     const claim = readWakeClaim(root, taskId, value.completedAt);
     if (claim && value.wakeAt === null) value.wakeClaimedAt = claim.createdAt;
     return freezeReport(value);
@@ -212,7 +252,21 @@ export function markReportWoken(root, taskId, now = Date.now()) {
   const report = readReport(root, taskId);
   if (!report) return undefined;
   if (report.wakeAt !== null && report.wakeAt !== undefined) return report;
-  return writeReport(root, { ...report, wakeAt: Math.max(now, report.completedAt) });
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const wakeAt = Math.max(now, report.completedAt);
+  let fd;
+  try { fd = openSync(wakeSentPath(root, taskId), "wx", 0o600); }
+  catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+  }
+  if (fd !== undefined) {
+    try { writeFileSync(fd, `${JSON.stringify({ wakeAt })}\n`); }
+    finally { closeSync(fd); }
+  }
+  const current = readReport(root, taskId);
+  if (!current) return undefined;
+  writeReport(root, { ...current, wakeAt: current.wakeAt ?? wakeAt });
+  return readReport(root, taskId);
 }
 
 /**
