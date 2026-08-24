@@ -245,27 +245,19 @@ test("a genuine task failure is not retried on another provider", async () => {
   }
 });
 
-test("the default bound survives four independent dead routes and reaches a fifth live provider", async () => {
-  const resolver = fakeResolver({ resources: [
-    { id: "provider-a/model" },
-    { id: "provider-b/model" },
-    { id: "provider-c/model" },
-    { id: "provider-d/model" },
-    { id: "provider-e/model" },
-  ] });
+test("the default bound crosses eight dead accounts and reaches the ninth live provider", async () => {
+  const resources = Array.from({ length: 9 }, (_, index) => ({ id: `provider-${index + 1}/model` }));
+  const resolver = fakeResolver({ resources });
   const { runner, root } = runnerWith(resolver, scriptedSpawn([
-    { error: "503 service unavailable" },
-    { error: "503 service unavailable" },
-    { error: "503 service unavailable" },
-    { error: "503 service unavailable" },
-    { text: "fifth route works" },
+    ...Array.from({ length: 8 }, () => ({ error: "503 service unavailable" })),
+    { text: "ninth route works" },
   ]));
 
   try {
     const result = await runner.run({ childId: "job-wide-failover", promptDigest: "c".repeat(64), cwd: root, prompt: "x" });
     assert.equal(result.status, "completed");
-    assert.equal(result.text, "fifth route works");
-    assert.equal(result.route.length, 5);
+    assert.equal(result.text, "ninth route works");
+    assert.equal(result.route.length, 9);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
