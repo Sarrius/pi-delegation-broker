@@ -9,9 +9,10 @@
  * "read these reports" — including reports that settled hours earlier and survived a
  * process restart because unread files are never pruned.
  *
- * Reports therefore go through `systemPrompt`, never the user-message stream, and never
- * on a failover continuation turn. Existing unread ids are seeded at session start so a
- * restart does not re-blast the inbox onto the first prompt.
+ * Automatic terminal wake uses a controller custom `sendMessage` follow-up. This module is
+ * the fallback when that dispatch fails: it adds unread facts through `systemPrompt`, never
+ * the user-message stream, and never on a failover continuation turn. Existing legacy unread
+ * ids are seeded at session start so an upgrade does not re-blast the historical inbox.
  */
 
 export const FAILOVER_CONTINUATION_MARKERS = Object.freeze([
@@ -49,7 +50,7 @@ export function formatUnreadNotice(unread) {
 }
 
 /**
- * Decide whether/how to surface newly settled unread reports on this agent start.
+ * Decide whether/how to surface newly settled reports whose automatic wake failed.
  * Never returns a `message` payload: that channel becomes the last user turn.
  */
 export function planUnreadNotice({ unread, notifiedIds, prompt, systemPrompt } = {}) {

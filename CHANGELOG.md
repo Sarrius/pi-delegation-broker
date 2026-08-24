@@ -4,6 +4,8 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## Unreleased
 
+- **Background delegation now wakes the parent automatically.** A terminal top-level task/workflow queues a typed hidden custom `followUp` with `triggerTurn: true`, so an idle parent collects the durable report and continues instead of waiting for another owner message. It never calls `sendUserMessage`; because Pi maps custom messages to provider-visible user role, the always-on `delegate_collect` prompt guideline provides persistent controller-state system framing and the payload carries only bounded IDs/statuses, never child text. A persistent create-once pre-send claim and monotonic read marker prevent ambiguous crash replay, duplicate model spend and collection resurrection. Claim paths are never automatically released, stale-reaped or pruned; terminal bursts coalesce, definite unclaimed pending wakes recover after restart, legacy unread reports do not replay, and system-prompt inbox notice remains the failure/ambiguity fallback.
+
 - **Read-only children no longer spend a model turn declaring every observation.** The child guard now declares and authorizes the closed `read`/`grep`/`ls`/`find`/`test` set automatically, while effect tools still require the model's exact prior `broker_declare_action`. This removes repeated declaration/read protocol loops that exhausted Cursor child turns and produced `incomplete` failovers. Fresh live observe and effect canaries both pass.
 
 - **Live delegation recovers and drains.** Unknown routes get bounded probes, busy accounts queue without spending attempts, incomplete tool turns are not success, and settled parents reap orphan RPC children. Live canaries: `LIVE2_OK`, `UNKNOWN_LIVE_OK`, `CAPACITY_PROTOCOL_OK`.

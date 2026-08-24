@@ -1,8 +1,13 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = new URL("..", import.meta.url).pathname;
-const publicRoots = ["src", "docs/INTEGRATION.md", "docs/LIVE-VALIDATION-PLAN.md", "README.md", "SECURITY.md", "CHANGELOG.md", "LICENSE", "package.json"];
+const root = fileURLToPath(new URL("..", import.meta.url));
+const packageJson = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+if (!Array.isArray(packageJson.files) || packageJson.files.some((path) => typeof path !== "string" || !path)) {
+  throw new Error("package.json files allowlist is missing or malformed");
+}
+const publicRoots = [...new Set([...packageJson.files, "package.json"])];
 const secretPatterns = [
   /sk-[A-Za-z0-9_-]{8,}/,
   /gh[pousr]_[A-Za-z0-9_]{20,}/,
