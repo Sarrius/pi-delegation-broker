@@ -31,6 +31,8 @@ import { fileURLToPath } from "node:url";
 import {
   BrokeredChildRunner,
   BrokeredLaunchResolver,
+  CheckpointStore,
+  DefectStore,
   disposeBrokeredChildProcesses,
   addModelPreference,
   activeAuthorizedProviders,
@@ -47,6 +49,10 @@ import {
   freshnessForCurrency,
   workflowObserveCapabilityRequest,
   SingleHostBrokerSupervisor,
+  SessionBindingStore,
+  formatSessionResumeStatus,
+  sessionCursor,
+  sessionIdentity,
   buildCurrencyMap,
   catalogToBrokerRegistry,
   createSelectContract,
@@ -103,6 +109,9 @@ const CURRENCY_CACHE_PATH = join(STATE_DIR, "currency-cache.json");
 const ROUTING_AUDIT_PATH = join(STATE_DIR, "routing-audit.json");
 const REPORTS_DIR = join(STATE_DIR, "reports");
 const JOBS_DIR = join(STATE_DIR, "jobs");
+const CHECKPOINTS_DIR = join(STATE_DIR, "checkpoints");
+const DEFECTS_DIR = join(STATE_DIR, "defects");
+const SESSION_BINDINGS_DIR = join(STATE_DIR, "session-bindings");
 const REGISTRY_KEY_ID = "controller";
 const CURRENCY_REFRESH_MS = 15 * 60 * 1_000;
 const CURRENCY_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
@@ -212,6 +221,8 @@ interface BrokerRuntime {
   lastRoute?: { summary: string; at: number };
   routingAudit: any;
   currency: () => Record<string, any>;
+  checkpointStore: any;
+  defectStore: any;
 }
 
 function formatPreferences(tier: string) {
@@ -386,12 +397,16 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[]): Promis
   // Built before the supervisor: the broker refuses to make any task terminal unless a receipt
   // authenticates against this authority, so it has to exist at supervisor construction.
   const evidenceStore = new ControllerEvidenceStore({ root: join(STATE_DIR, "verification-evidence") });
+  const checkpointStore = new CheckpointStore({ root: CHECKPOINTS_DIR });
+  const defectStore = new DefectStore({ root: DEFECTS_DIR });
   const verificationAuthority = new ControllerVerificationAuthority({ evidenceStore });
   const supervisor = new SingleHostBrokerSupervisor({
     stateDir: STATE_DIR,
     // Without this the controller token alone would be trusted, and every verified completion
     // would be denied instead — the acceptance path would exist but never finish a task.
     verificationReceiptVerifier: (receipt: any, binding: any) => verificationAuthority.verify(receipt, binding),
+    checkpointStore,
+    defectRecorder: (defect: any) => defectStore.capture(defect),
     // Every child is launched with the attested behavioral enforcement extension, which is what
     // makes effect-capable contracts admissible at all.
     behavioralEnforcement: "blocking_monitor",
@@ -523,6 +538,8 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[]): Promis
   const runner = new BrokeredChildRunner({
     resolver,
     sessionsRoot: join(STATE_DIR, "sessions"),
+    checkpointStore,
+    defectRecorder: (defect: any) => defectStore.capture(defect),
   });
 
   return {
@@ -533,6 +550,8 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[]): Promis
     lastRoute: undefined,
     routingAudit,
     currency,
+    checkpointStore,
+    defectStore,
   };
 }
 
@@ -565,6 +584,32 @@ export default function piDelegationBroker(pi: any) {
   // An operator must never read a bounded view as a complete one. Eviction is sticky for the
   // session: once durable work fell out of the live projection, the summary says "bounded".
   let fleetEvicted = false;
+  const sessionBindings = new SessionBindingStore({ root: SESSION_BINDINGS_DIR });
+
+  const currentSessionId = (ctx: any = lastCtx) => sessionIdentity(ctx);
+  const activeRootJobs = () => {
+    try {
+      return listJobs(JOBS_DIR)
+        .filter((job: any) => !isTerminalJobStatus(job.status))
+        .map((job: any) => job.jobId)
+        .slice(0, 64);
+    } catch { return []; }
+  };
+  const refreshSessionBinding = (ctx: any = lastCtx, status = "active") => {
+    if (!ctx) return undefined;
+    const sessionId = currentSessionId(ctx);
+    const existing = sessionBindings.read(sessionId);
+    const roots = activeRootJobs();
+    const cursor = sessionCursor(ctx);
+    if (!existing) {
+      return sessionBindings.bind({
+        sessionId,
+        ...(typeof ctx.sessionManager?.getSessionFile?.() === "string" ? { sessionFile: ctx.sessionManager.getSessionFile() } : {}),
+        rootIds: roots, cursor, status,
+      });
+    }
+    return sessionBindings.update(sessionId, { rootIds: roots, ...(cursor ? { cursor } : {}), status, updatedAt: Date.now() });
+  };
 
   const rememberFleetValue = (map: Map<string, any>, id: string, value: any) => {
     if (!value || typeof id !== "string") return;
@@ -1015,6 +1060,7 @@ export default function piDelegationBroker(pi: any) {
     })().finally(() => {
       if (deadlineTimer) clearTimeout(deadlineTimer);
       activeTasks.delete(taskId);
+      try { refreshSessionBinding(lastCtx, "active"); } catch { /* terminal state is already durable */ }
     });
 
     if (initial.deadlineAt !== undefined) {
@@ -1136,6 +1182,7 @@ export default function piDelegationBroker(pi: any) {
     }).finally(() => {
       if (deadlineTimer) clearTimeout(deadlineTimer);
       activeWorkflows.delete(workflowId);
+      try { refreshSessionBinding(lastCtx, "active"); } catch { /* terminal state is already durable */ }
     });
 
     if (initial.deadlineAt !== undefined) {
@@ -1253,6 +1300,9 @@ export default function piDelegationBroker(pi: any) {
       rememberFleetJob(job);
       projectRecoveredTerminalReport(job);
     }
+    try { refreshSessionBinding(ctx, "active"); } catch (error) {
+      ctx.ui?.notify?.(`Delegation session binding failed (${String((error as Error).message).slice(0, 160)}). Resume status may be incomplete.`, "warning");
+    }
     startFleet(ctx);
     // Activation is explicit: a stopped broker stays stopped across sessions. Recovered
     // read-only workflows are relaunched only after the new controller incarnation is live.
@@ -1265,6 +1315,21 @@ export default function piDelegationBroker(pi: any) {
         }
       }).catch(() => undefined);
     }
+  });
+
+  pi.on("session_compact", (event: any, ctx: any) => {
+    try {
+      const sessionId = currentSessionId(ctx);
+      const binding = sessionBindings.read(sessionId);
+      if (!binding) return;
+      const cursor = event?.compactionEntry?.id ?? sessionCursor(ctx);
+      sessionBindings.update(sessionId, {
+        status: "compacted",
+        ...(cursor ? { cursor } : {}),
+        rootIds: activeRootJobs(),
+        updatedAt: Date.now(),
+      });
+    } catch { /* compaction must continue even if the external binding projection is unavailable */ }
   });
 
   // Fallback for a failed automatic custom wake: inject through systemPrompt, never
@@ -1282,8 +1347,16 @@ export default function piDelegationBroker(pi: any) {
       systemPrompt: event?.systemPrompt,
     });
     notifiedUnread = planned.notifiedIds;
-    if (!planned.inject) return;
-    return { systemPrompt: planned.systemPrompt };
+    const additions = [];
+    if (planned.inject && planned.systemPrompt) additions.push(planned.systemPrompt);
+    else if (typeof event?.systemPrompt === "string" && event.systemPrompt.length > 0) additions.push(event.systemPrompt);
+    try {
+      const binding = sessionBindings.read(currentSessionId(lastCtx));
+      const resumeStatus = formatSessionResumeStatus(binding, listJobs(JOBS_DIR));
+      if (resumeStatus) additions.push(resumeStatus);
+    } catch { /* durable resume status is best effort and never blocks the user turn */ }
+    if (additions.length === 0) return;
+    return { systemPrompt: additions.join("\n\n") };
   });
 
   pi.on("agent_settled", async () => {
@@ -1292,12 +1365,13 @@ export default function piDelegationBroker(pi: any) {
     }
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event: any, ctx: any) => {
     stopFleet();
     parentWake?.close();
     parentWake = undefined;
     await pauseActiveTasks();
     await pauseActiveWorkflows();
+    try { refreshSessionBinding(ctx, "suspended"); } catch { /* preserve the best prior binding on shutdown */ }
     await stopBroker();
   });
 
@@ -1483,6 +1557,7 @@ export default function piDelegationBroker(pi: any) {
         }
         const taskId = submission.job.jobId;
         rememberFleetJob(submission.job);
+        try { refreshSessionBinding(ctx, "active"); } catch { /* fleet state remains durable even if the parent binding is unavailable */ }
         if (!isTerminalJobStatus(submission.job.status)) startTask(taskId, ctx).catch(() => undefined);
         return {
           content: [{
@@ -1776,6 +1851,7 @@ export default function piDelegationBroker(pi: any) {
       }
       const workflowId = submission.job.jobId;
       rememberFleetJob(submission.job);
+      try { refreshSessionBinding(ctx, "active"); } catch { /* workflow state remains durable even if the parent binding is unavailable */ }
       const promise = isTerminalJobStatus(submission.job.status)
         ? Promise.resolve(submission.job)
         : startWorkflow(workflowId, ctx, params.wait ? onUpdate : undefined, !params.wait);
