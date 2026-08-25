@@ -62,7 +62,23 @@ export {
 } from "./model-provenance-policy.mjs";
 export { effectiveThinkingLevel, requiresReasoning } from "./model-thinking-policy.mjs";
 export { ModelAffinityJournal } from "./model-affinity-journal.mjs";
-export { TaskOrchestrator, formatWorkflowSummary, workflowObserveCapabilityRequest } from "./workflow-scheduler.mjs";
+export {
+  TaskOrchestrator,
+  appendWorkflowNodes,
+  closeWorkflow,
+  formatWorkflowSummary,
+  workflowObserveCapabilityRequest,
+} from "./workflow-scheduler.mjs";
+export {
+  admitTeamNodes,
+  evaluateTeamJoin,
+  evaluateTeamJoins,
+  normalizeTaskAdmission,
+  normalizeTeamBudgets,
+  normalizeTeamJoin,
+  normalizeTeamMetadata,
+  teamProposalDigest,
+} from "./team.mjs";
 export {
   isTerminalJobStatus,
   listJobs,
@@ -109,6 +125,13 @@ export { BrokeredChildRunner, classifyChildFailure } from "./brokered-runner.mjs
 export { spawnBrokeredChild, disposeBrokeredChildProcesses } from "./child-launcher.mjs";
 export { Semaphore } from "./semaphore.mjs";
 export { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionError } from "./worktree.mjs";
+export {
+  applyAcceptedProposal,
+  applyIntegrationToTarget,
+  collectIntegrationPatch,
+  createIntegrationWorktree,
+  integrateAcceptedProposals,
+} from "./integration-worktree.mjs";
 export { verifyProposedPatch, spawnControllerArgv, EffectVerificationError } from "./effect-verification.mjs";
 export { applyProposedPatch, proposedPatchPaths } from "./proposed-patch.mjs";
 export { proxyCanonicalContext, proxyTerminalError } from "./proxy-context.mjs";
