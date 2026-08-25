@@ -116,6 +116,7 @@ export { compileEffectiveChildCapability, createEffectiveChildCapability, derive
 export { ArtifactPipeline } from "./artifact-pipeline.mjs";
 export { DefectStore, defectFingerprint } from "./defect-store.mjs";
 export { CheckpointStore } from "./checkpoint-store.mjs";
+export { RepairController, RepairStore } from "./repair-controller.mjs";
 export { SessionBindingStore, formatSessionResumeStatus, sessionCursor, sessionIdentity } from "./session-binding-store.mjs";
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";
 export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
