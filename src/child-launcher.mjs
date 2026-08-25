@@ -4,6 +4,7 @@ import { accessSync, constants, mkdirSync, readFileSync, realpathSync, rmSync, s
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnChildRpc } from "./child-rpc.mjs";
+import { reviewSkills } from "./child-skills.mjs";
 import { baseProviderFor } from "./scoped-child-auth.mjs";
 
 const TOOL_REPORT_TIMEOUT_MS = 60_000;
@@ -80,6 +81,15 @@ function buildChildArgs(config) {
   if (config.forkSessionFile) args.push("--fork", config.forkSessionFile);
   if (config.shimPath) args.push("--extension", config.shimPath);
   for (const extensionPath of config.trustedExtensionPaths ?? []) args.push("--extension", extensionPath);
+  // Ambient discovery stays disabled; only controller-reviewed paths are reintroduced one by one.
+  // Skills without --no-skills would mix reviewed files with whatever the child cwd discovers.
+  if ((config.reviewedSkills?.length) && !config.isolatedDiscovery) {
+    throw new Error("reviewed skills require isolated discovery");
+  }
+  for (const skill of config.reviewedSkills ?? []) {
+    if (typeof skill?.path !== "string" || !skill.path) throw new Error("reviewed skill is missing a path");
+    args.push("--skill", skill.path);
+  }
   return args;
 }
 
@@ -296,6 +306,9 @@ export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPi
   // leased credential under this canonical name, so Pi can resolve the model without loading
   // an account-management extension or gaining the parent's other credentials.
   const { provider, modelId } = resolveChildLaunchModel(model);
+  // Re-hash at the spawn boundary: a digest checked at submit/resolve must still match the bytes
+  // that are about to be passed as --skill, or a mutated file would ride a reviewed path.
+  const reviewedSkills = spec.skills ? reviewSkills(spec.skills) : undefined;
 
   const args = buildChildArgs({
     provider, modelId,
@@ -306,6 +319,7 @@ export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPi
     forkSessionFile,
     appendSystemPrompt: spec.appendSystemPrompt ?? "",
     shimPath,
+    ...(reviewedSkills ? { reviewedSkills } : {}),
     ...(launchPolicy ? {
       trustedExtensionPaths: launchPolicy.extensionPaths,
       isolatedDiscovery: true,

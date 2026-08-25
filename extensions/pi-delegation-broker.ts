@@ -89,6 +89,7 @@ import {
 } from "../src/parent-wake.mjs";
 import { planUnreadNotice, seedNotifiedUnread } from "../src/unread-notice.mjs";
 import { buildFleetProjection, fleetSummary, formatFleetDetails, formatFleetWidget } from "../src/fleet-view.mjs";
+import { normalizeContract, renderRoleFraming, resolveContract } from "../src/child-contract.mjs";
 
 const EXTENSIONS_DIR = dirname(fileURLToPath(import.meta.url));
 const CHILD_SHIM_PATH = join(EXTENSIONS_DIR, "child-shim.ts");
@@ -112,6 +113,20 @@ const MODEL_CATALOG_REQUEST_EVENT = "pi:model-catalog:request:v1";
 const MODEL_CATALOG_SNAPSHOT_EVENT = "pi:model-catalog:snapshot:v1";
 
 const CAPABILITIES = ["text_generation", "code_reasoning", "large_context", "vision_input"] as const;
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+// Effort is its own axis. "auto" keeps the controller default, "inherit" copies the parent's
+// current effective level, and a literal level is explicit intent that is never silently lowered.
+const THINKING_MODES = ["auto", "inherit", ...THINKING_LEVELS] as const;
+// Route is separate from tier: a peer-level child for hard reasoning is not the same request as
+// "cheapest model that clears the bar".
+const ROUTE_MODES = ["auto", "inherit_model", "peer"] as const;
+const ROLE = Type.Object({
+  schemaVersion: Type.Optional(Type.Integer({ minimum: 1, maximum: 1 })),
+  name: Type.String({ maxLength: 80, description: "Short role name, e.g. reviewer, planner, researcher." }),
+  mission: Type.Optional(Type.String({ maxLength: 2000, description: "What this role is responsible for producing." })),
+  deliverables: Type.Optional(Type.Array(Type.String({ maxLength: 300 }), { maxItems: 10 })),
+  boundaries: Type.Optional(Type.Array(Type.String({ maxLength: 300 }), { maxItems: 10 })),
+}, { description: "Framing only. A role shapes how the child works; it never grants tools, authority or effect capability." });
 const observedCount = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 
 const WORKFLOW_NODE = Type.Object({
@@ -124,6 +139,13 @@ const WORKFLOW_NODE = Type.Object({
   })),
   capabilities: Type.Optional(Type.Array(StringEnum([...CAPABILITIES]))),
   tier: Type.Optional(StringEnum(["cheap", "standard", "frontier"] as const)),
+  thinking: Type.Optional(StringEnum([...THINKING_MODES])),
+  route: Type.Optional(StringEnum([...ROUTE_MODES])),
+  role: Type.Optional(ROLE),
+  skills: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
+    maxItems: 8,
+    description: "Absolute paths of controller-reviewed skill files. Ambient skill discovery stays off; each path is hashed and passed as an explicit --skill. A skill cannot grant tools or effect capability.",
+  })),
 });
 const WORKFLOW_PARAMS = Type.Object({
   nodes: Type.Array(WORKFLOW_NODE, { minItems: 1, maxItems: 1000 }),
@@ -168,6 +190,17 @@ const DELEGATE_PARAMS = Type.Object({
   }), { minItems: 1, maxItems: 20, description: "Fixed controller-owned checks. Omit when no independent acceptance check exists; such work cannot train routing affinity." })),
   proposeChangesIn: Type.Optional(Type.String({
     description: "Absolute path to a git repository the child may edit. The child works in a throwaway worktree; the controller verifies the resulting patch in a scratch tree and returns it for review. Requires acceptance checks. Nothing is applied to this repository.",
+  })),
+  thinking: Type.Optional(StringEnum([...THINKING_MODES], {
+    description: "Reasoning effort, independent of tier: auto (controller default), inherit (this session's current level), or an explicit level. An explicit level is never silently lowered.",
+  })),
+  route: Type.Optional(StringEnum([...ROUTE_MODES], {
+    description: "auto lets the selector choose; inherit_model asks for this session's exact model when it is current and admissible; peer asks for a proven quality-equivalent and fails closed while no calibrated equivalence exists.",
+  })),
+  role: Type.Optional(ROLE),
+  skills: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
+    maxItems: 8,
+    description: "Absolute paths of controller-reviewed skill files. Ambient skill discovery stays off; each path is hashed and passed as an explicit --skill. A skill cannot grant tools or effect capability.",
   })),
 });
 
@@ -702,6 +735,8 @@ export default function piDelegationBroker(pi: any) {
       ...(result.resolved?.provider ? { provider: String(result.resolved.provider).slice(0, 200) } : {}),
       ...(result.resolved?.modelId ? { modelId: String(result.resolved.modelId).slice(0, 300) } : {}),
       ...(result.resolved?.thinkingLevel ? { effectiveThinking: String(result.resolved.thinkingLevel).slice(0, 40) } : {}),
+      ...(result.requestedThinking ? { requestedThinking: String(result.requestedThinking).slice(0, 40) } : {}),
+      ...(result.role ? { role: String(result.role).slice(0, 80) } : {}),
       ...(result.usage ? { usage: {
         input: observedCount(result.usage.input),
         output: observedCount(result.usage.output),
@@ -889,14 +924,25 @@ export default function piDelegationBroker(pi: any) {
         if (Array.isArray(initial.acceptance) && initial.acceptance.length > 0) {
           broker.acceptancePlans.set(taskId, initial.acceptance);
         }
+        // The contract is resolved against the session that is alive now, not the one that
+        // submitted the job: after a restart the recorded axes still apply, but inherit has to
+        // mean "this session", and an unhonourable contract must fail loudly rather than run cheap.
+        const contract = resolveContract(initial.contract, ctx ?? lastCtx);
+        const roleFraming = renderRoleFraming(contract.role);
         result = await broker.runner.run({
           childId: taskId,
           promptDigest: createHash("sha256").update(initial.task).digest("hex"),
           trackForVerification: Boolean(initial.acceptance?.length),
           cwd: initial.cwd,
-          thinkingLevel: "off",
+          thinkingLevel: contract.requestedThinking,
+          ...(contract.model ? { model: contract.model } : {}),
+          ...(roleFraming ? { roleFraming } : {}),
+          ...(contract.skills ? { skills: contract.skills } : {}),
           prompt: initial.task,
-          fleet: { logicalId: taskId, rootId: taskId, kind: "task", role: "worker" },
+          fleet: {
+            logicalId: taskId, rootId: taskId, kind: "task",
+            role: contract.role?.name ?? "worker",
+          },
           capabilityRequest: {
             taskId,
             taskDescription: initial.task,
@@ -1009,12 +1055,21 @@ export default function piDelegationBroker(pi: any) {
         const startedAt = Date.now();
         let result: any;
         try {
+          // Each node carries its own axes: one stage may need peer-level effort while its
+          // siblings stay cheap, which is the whole point of assembling a team per stage.
+          const nodeContract = resolveContract(node.contract ?? normalizeContract(node), ctx ?? lastCtx);
+          const nodeRoleFraming = renderRoleFraming(nodeContract.role);
           result = await broker.runner.run({
-            childId, prompt: task, cwd: initial.cwd, thinkingLevel: "off",
+            childId, prompt: task, cwd: initial.cwd,
+            thinkingLevel: nodeContract.requestedThinking,
+            ...(nodeContract.model ? { model: nodeContract.model } : {}),
+            ...(nodeRoleFraming ? { roleFraming: nodeRoleFraming } : {}),
+            ...(nodeContract.skills ? { skills: nodeContract.skills } : {}),
             promptDigest: createHash("sha256").update(task).digest("hex"),
             fleet: {
               logicalId: `${workflowId}/${node.id}`, rootId: workflowId,
-              workflowId, nodeId: node.id, kind: "workflow_node", role: "worker",
+              workflowId, nodeId: node.id, kind: "workflow_node",
+              role: nodeContract.role?.name ?? "worker",
             },
             capabilityRequest: workflowObserveCapabilityRequest({ ...node, task }, childId),
           });
@@ -1357,13 +1412,17 @@ export default function piDelegationBroker(pi: any) {
       + "one cheap child = self-contained read/summarize/grep/draft; "
       + "one standard child = self-contained code reasoning at non-frontier difficulty; "
       + "one frontier child = self-contained, hard, or effect-capable via proposeChangesIn; "
-      + "team = 2+ independent branches via delegate_workflow.",
+      + "team = 2+ independent branches via delegate_workflow. "
+      + "Tier, effort and model identity are independent: tier sets the quality floor, thinking sets reasoning effort (auto|inherit|explicit level), "
+      + "and route=inherit_model asks for this session's exact model when a peer-level pair of hands is needed. role names what the child is for; it never grants authority.",
     promptSnippet: "Delegate a self-contained subtask to an isolated brokered child agent (cheap/standard/frontier tier, or delegate_workflow for a team)",
     promptGuidelines: [
       "Before doing work yourself, ask: is this self-contained? If yes, delegate; if no, be able to say why. Self is a decision, not a default.",
       "Use delegate when a subtask is self-contained: reading or summarizing files, answering a focused question, drafting text that does not need this conversation's context.",
       "Do not use delegate for work that needs this conversation's history or your judgement about the user's intent.",
       "Pick the tier explicitly: cheap for read/summarize/draft, standard for code reasoning, frontier for hard or effect-capable work. Omit tier only when the task is genuinely ambiguous.",
+      "Raise thinking when the work is hard rather than long, and use thinking:inherit or route:inherit_model when you need a genuine peer for reasoning instead of a cheaper helper.",
+      "Give a role when several children collaborate, so each one knows which part of the result is its own; a role is framing, never permission.",
       "For 2+ independent subtasks use delegate_workflow instead of sequential delegate calls.",
       "To get a code change, pass proposeChangesIn with the repository path and acceptance checks: the child edits an isolated worktree and the controller returns a verified patch that you or the user still have to apply.",
       "Write the delegate task as a complete brief: the child sees nothing of this conversation, so include file paths, context, and exactly what output you expect.",
@@ -1383,6 +1442,15 @@ export default function piDelegationBroker(pi: any) {
         return { content: [{ type: "text", text: "Delegation broker is stopped. Run /delegation-broker start to allow new children." }], isError: true };
       }
       lastCtx = ctx;
+      let submittedContract;
+      try {
+        submittedContract = normalizeContract(params);
+        // Reject an unhonourable contract at submission, while the caller is still here to read
+        // the reason, instead of failing later inside a background job.
+        resolveContract(submittedContract, ctx);
+      } catch (error) {
+        return { content: [{ type: "text", text: (error as Error).message }], isError: true };
+      }
       const submittedAt = Date.now();
       const childId = `delegate-${submittedAt.toString(36)}-${++counter}`;
       const asynchronous = !params.proposeChangesIn && params.wait !== true && params.background !== false;
@@ -1395,6 +1463,9 @@ export default function piDelegationBroker(pi: any) {
             kind: "task",
             status: "queued",
             task: params.task,
+            // Persist the requested axes, not the resolved ones: a job recovered after restart
+            // must re-resolve "inherit" against the session that actually runs it.
+            contract: submittedContract,
             cwd: ctx.cwd,
             submittedAt,
             updatedAt: submittedAt,
@@ -1433,6 +1504,10 @@ export default function piDelegationBroker(pi: any) {
       }
 
       const promptDigest = createHash("sha256").update(params.task).digest("hex");
+      let syncContract;
+      try { syncContract = resolveContract(normalizeContract(params), ctx); }
+      catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+      const syncRoleFraming = renderRoleFraming(syncContract.role);
       if (params.acceptance) broker.acceptancePlans.set(childId, params.acceptance.map((check) => ({ ...check, timeoutMs: check.timeoutMs ?? 30_000 })));
       const runArgs = {
         childId,
@@ -1442,9 +1517,16 @@ export default function piDelegationBroker(pi: any) {
         trackForVerification: Boolean(params.acceptance?.length && !params.proposeChangesIn),
         cwd: params.proposeChangesIn ?? ctx.cwd,
         ...(params.proposeChangesIn ? { isolation: "worktree" as const } : {}),
-        thinkingLevel: "off",
+        thinkingLevel: syncContract.requestedThinking,
+        ...(syncContract.model ? { model: syncContract.model } : {}),
+        ...(syncRoleFraming ? { roleFraming: syncRoleFraming } : {}),
+        ...(syncContract.skills ? { skills: syncContract.skills } : {}),
         prompt: params.task,
-        fleet: { logicalId: childId, rootId: childId, kind: params.proposeChangesIn ? "propose_effect" : "task", role: "worker" },
+        fleet: {
+          logicalId: childId, rootId: childId,
+          kind: params.proposeChangesIn ? "propose_effect" : "task",
+          role: syncContract.role?.name ?? "worker",
+        },
         capabilityRequest: {
           taskId: childId,
           taskDescription: params.task,

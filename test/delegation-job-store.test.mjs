@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -103,5 +103,67 @@ test("invalid terminal and deadline shapes fail closed", () => {
     assert.throws(() => submitJob(s.root, task("bad", { status: "completed" })), /completedAt/);
     assert.throws(() => submitJob(s.root, task("bad", { deadlineAt: 100 })), /deadlineAt/);
     assert.equal(readJob(s.root, "../escape"), undefined);
+  } finally { s.done(); }
+});
+
+test("canonical contracts persist and invalid node contracts fail closed on read", () => {
+  const s = store();
+  try {
+    const submitted = submitJob(s.root, task("with-contract", {
+      contract: {
+        thinking: "low",
+        route: "inherit_model",
+        role: { schemaVersion: 1, name: "reviewer" },
+      },
+    }));
+    assert.equal(submitted.created, true);
+    assert.equal(readJob(s.root, "with-contract").contract.thinking, "low");
+    assert.equal(readJob(s.root, "with-contract").contract.route, "inherit_model");
+
+    assert.throws(
+      () => submitJob(s.root, task("bad-thinking", { contract: { thinking: "turbo", route: "auto" } })),
+      /thinking mode is invalid/,
+    );
+    assert.throws(
+      () => submitJob(s.root, task("partial", { contract: { route: "auto" } })),
+      /must include thinking and route/,
+    );
+
+    submitJob(s.root, workflow("wf-ok", {
+      nodes: [{
+        id: "a", task: "inspect", dependsOn: [], inputs: [], state: "pending",
+        contract: { thinking: "high", route: "auto", role: { schemaVersion: 1, name: "reviewer" } },
+      }],
+    }));
+    assert.equal(readJob(s.root, "wf-ok").nodes[0].contract.thinking, "high");
+
+    const tampered = readJob(s.root, "wf-ok");
+    writeFileSync(
+      join(s.root, "wf-ok.json"),
+      `${JSON.stringify({
+        ...tampered,
+        nodes: [{ ...tampered.nodes[0], contract: { thinking: "turbo", route: "auto" } }],
+      })}\n`,
+    );
+    assert.equal(readJob(s.root, "wf-ok"), undefined, "tampered node contract must not load");
+    assert.equal(listJobs(s.root).some((job) => job.jobId === "wf-ok"), false);
+  } finally { s.done(); }
+});
+
+test("attested skill identities persist on a task contract and invalid ones fail closed", () => {
+  const s = store();
+  try {
+    const skills = [{ path: "/tmp/reviewer.md", digest: "ab".repeat(32), bytes: 24 }];
+    const submitted = submitJob(s.root, task("skill-task", {
+      contract: { thinking: "low", route: "auto", skills },
+    }));
+    assert.equal(submitted.created, true);
+    assert.deepEqual(readJob(s.root, "skill-task").contract.skills, skills);
+    assert.throws(
+      () => submitJob(s.root, task("bad-skill", {
+        contract: { thinking: "low", route: "auto", skills: ["/tmp/reviewer.md"] },
+      })),
+      /path, sha256 digest and byte size/,
+    );
   } finally { s.done(); }
 });

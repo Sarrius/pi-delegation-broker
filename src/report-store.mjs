@@ -107,7 +107,10 @@ function validate(report) {
     || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,319}$/.test(report.logicalId))) {
     throw new Error("report logicalId must be a bounded identifier");
   }
-  for (const [field, max] of [["resourceId", 500], ["provider", 200], ["modelId", 300], ["effectiveThinking", 40]]) {
+  for (const [field, max] of [
+    ["resourceId", 500], ["provider", 200], ["modelId", 300],
+    ["effectiveThinking", 40], ["requestedThinking", 40], ["role", 80],
+  ]) {
     if (report[field] !== undefined && (typeof report[field] !== "string" || report[field].length < 1 || report[field].length > max)) {
       throw new Error(`report ${field} must be a bounded string`);
     }

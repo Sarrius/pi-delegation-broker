@@ -462,6 +462,61 @@ test("dispose waits for a launch already past admission instead of orphaning it"
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("requested effort and role framing reach the child without widening its authority", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-contract-"));
+  let launched;
+  const resolver = {
+    async resolve(request) {
+      launched = { requestedModel: request.model };
+      return {
+        action: "allow",
+        resource: { id: "provider/model", capacityGroup: "group" },
+        resolvedModel: MODEL,
+        policy: {
+          policyId: "lease-1", agentDir: root, environment: {}, promptRules: "LEASE RULES",
+          async onChildSessionOpened() {}, async onBeforeChildAbandoned() {},
+          async onChildSessionClosed() { return { status: "released" }; },
+        },
+      };
+    },
+  };
+  const spawnChild = async ({ spec }) => {
+    launched = { ...launched, spec };
+    return {
+      resolved: { ...MODEL, thinkingLevel: spec.thinkingLevel },
+      session: {
+        usage: { input: 1, output: 1 }, latestAssistantMessage: { stopReason: "end_turn" },
+        async prompt() {}, async abort() {}, async dispose() {},
+      },
+    };
+  };
+  try {
+    const runner = new BrokeredChildRunner({ resolver, sessionsRoot: join(root, "sessions"), spawnChild });
+    const result = await runner.run({
+      childId: "contract-task", promptDigest: "a".repeat(64), cwd: root, prompt: "work",
+      thinkingLevel: "high",
+      model: { provider: "anthropic", modelId: "claude-opus-5" },
+      roleFraming: "Your role for this task: reviewer.\nThis role is framing only.",
+      skills: [{ path: "/tmp/reviewer.md", digest: "ab".repeat(32), bytes: 24 }],
+      fleet: { logicalId: "contract-task", rootId: "contract-task", kind: "task", role: "reviewer" },
+      maxAttempts: 1,
+    });
+    assert.equal(result.requestedThinking, "high", "the result must carry what was asked for");
+    assert.equal(result.role, "reviewer");
+    assert.equal(launched.spec.thinkingLevel, "high", "explicit effort must not be silently lowered");
+    assert.deepEqual(launched.requestedModel, { provider: "anthropic", modelId: "claude-opus-5", thinkingLevel: "high" });
+    // Role framing is quoted and non-authoritative; lease rules speak last so they win conflicts.
+    const framing = launched.spec.appendSystemPrompt;
+    assert.ok(framing.indexOf("You are a subagent") < framing.indexOf("Your role for this task"));
+    assert.ok(framing.indexOf("Your role for this task") < framing.indexOf("LEASE RULES"));
+    // A role must not become permission: tool authority still comes from the lease alone.
+    assert.equal(launched.spec.tools, undefined);
+    assert.equal(launched.spec.excludeTools, undefined);
+    // Skills are guidance passed through to spawn; they do not become a tool grant.
+    assert.equal(launched.spec.skills.length, 1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("no-progress deadline aborts a silent route and reports it failover-eligible", async () => {
   const root = mkdtempSync(join(tmpdir(), "runner-no-progress-"));
   let aborted = 0;

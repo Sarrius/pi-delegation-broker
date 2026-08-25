@@ -210,6 +210,8 @@ test("path traversal and invalid shapes are rejected at write time", () => {
     assert.throws(() => writeReport(s.root, report("ok", {
       usage: { input: 1, output: -1, cacheRead: 0, cacheWrite: 0, turns: 1 },
     })), /usage.output/);
+    assert.throws(() => writeReport(s.root, report("ok", { requestedThinking: "x".repeat(41) })), /requestedThinking/);
+    assert.throws(() => writeReport(s.root, report("ok", { role: "r".repeat(81) })), /role/);
     assert.equal(readReport(s.root, "../etc/passwd"), undefined);
   } finally { s.done(); }
 });

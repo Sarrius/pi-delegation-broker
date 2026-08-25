@@ -1,4 +1,5 @@
 import { basename, dirname, isAbsolute } from "node:path";
+import { normalizeContract } from "./child-contract.mjs";
 import {
   isTerminalJobStatus, readJob, submitJob, updateJob,
 } from "./delegation-job-store.mjs";
@@ -63,6 +64,14 @@ function normalizeNodes(nodes) {
         || capabilities.some((capability) => typeof capability !== "string" || !capability || capability.length > 64)
         || new Set(capabilities).size !== capabilities.length) fail("capabilities are invalid");
     }
+    // Node normalization is an allowlist, so a new contract axis must be carried here
+    // explicitly: anything omitted is silently dropped and the stage quietly runs on defaults.
+    const contract = node.contract !== undefined || node.thinking !== undefined
+      || node.route !== undefined || node.role !== undefined || node.skills !== undefined
+      ? normalizeContract(node.contract ?? {
+        thinking: node.thinking, route: node.route, role: node.role, skills: node.skills,
+      })
+      : undefined;
     return {
       id: node.id,
       task: node.task,
@@ -71,6 +80,7 @@ function normalizeNodes(nodes) {
       state: "pending",
       ...(node.tier !== undefined ? { tier: node.tier } : {}),
       ...(capabilities !== undefined ? { capabilities: [...capabilities] } : {}),
+      ...(contract ? { contract: structuredClone(contract) } : {}),
     };
   });
   for (const node of normalized) {
