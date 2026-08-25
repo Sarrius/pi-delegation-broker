@@ -42,7 +42,7 @@ test("extension submits task/workflow immediately and exposes durable lifecycle 
     const result = JSON.parse(stdout.trim().split("\n").at(-1));
     assert.ok(result.workflowElapsedMs < 500);
     assert.ok(result.taskElapsedMs < 500);
-    for (const name of ["delegate", "delegate_workflow", "delegate_status", "delegate_list", "delegate_collect", "delegate_cancel"]) {
+    for (const name of ["delegate", "delegate_workflow", "delegate_workflow_append", "delegate_workflow_close", "delegate_status", "delegate_list", "delegate_collect", "delegate_cancel"]) {
       assert.ok(result.toolNames.includes(name), `${name} must be registered`);
     }
   } finally {

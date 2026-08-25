@@ -3,6 +3,7 @@ import {
 } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { assertStoredContract } from "./child-contract.mjs";
+import { validateTeamState } from "./team.mjs";
 
 const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/;
 const JOB_KINDS = new Set(["task", "workflow"]);
@@ -55,6 +56,10 @@ function validate(job) {
       catch (error) {
         fail(`node ${node.id ?? "?"} ${String(error.message).replace(/^child contract: /, "")}`);
       }
+    }
+    if (job.team !== undefined) {
+      try { validateTeamState(job.team, job.nodes); }
+      catch (error) { fail(String(error.message).replace(/^team admission: /, "")); }
     }
   }
   const serialized = JSON.stringify(job);

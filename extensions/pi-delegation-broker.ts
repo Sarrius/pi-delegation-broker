@@ -45,6 +45,8 @@ import {
   RoutingBoard,
   RoutingAuditJournal,
   TaskOrchestrator,
+  appendWorkflowNodes,
+  closeWorkflow,
   formatWorkflowSummary,
   freshnessForCurrency,
   workflowObserveCapabilityRequest,
@@ -137,10 +139,31 @@ const ROLE = Type.Object({
   boundaries: Type.Optional(Type.Array(Type.String({ maxLength: 300 }), { maxItems: 10 })),
 }, { description: "Framing only. A role shapes how the child works; it never grants tools, authority or effect capability." });
 const observedCount = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+const ACCEPTANCE_CHECK = Type.Object({
+  id: Type.String(),
+  claim: Type.String(),
+  argv: Type.Array(Type.String(), { minItems: 1, maxItems: 32 }),
+  timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 120000 })),
+});
 
 const WORKFLOW_NODE = Type.Object({
   id: Type.String({ description: "Stable workflow node id." }),
   task: Type.String({ description: "Self-contained child instruction for this stage." }),
+  objective: Type.Optional(Type.String({ maxLength: 262144 })),
+  scope: Type.Optional(Type.String({ maxLength: 16384 })),
+  inputFingerprint: Type.Optional(Type.String({ maxLength: 4096 })),
+  artifactFingerprint: Type.Optional(Type.String({ maxLength: 4096 })),
+  purpose: Type.Optional(StringEnum(["specialist", "sectioning", "ensemble", "reviewer", "adjudication", "integrator"] as const)),
+  materialDifference: Type.Optional(StringEnum(["provider_diversity", "adversarial_method", "separate_evidence_source", "reviewer_independence", "different_scope"] as const)),
+  acceptance: Type.Optional(Type.Array(ACCEPTANCE_CHECK, { minItems: 1, maxItems: 20 })),
+  admission: Type.Optional(Type.Object({
+    objective: Type.Optional(Type.String({ maxLength: 262144 })),
+    scope: Type.Optional(Type.String({ maxLength: 16384 })),
+    inputFingerprint: Type.Optional(Type.String({ maxLength: 4096 })),
+    artifactFingerprint: Type.Optional(Type.String({ maxLength: 4096 })),
+    purpose: Type.Optional(StringEnum(["specialist", "sectioning", "ensemble", "reviewer", "adjudication", "integrator"] as const)),
+    materialDifference: Type.Optional(StringEnum(["provider_diversity", "adversarial_method", "separate_evidence_source", "reviewer_independence", "different_scope"] as const)),
+  })),
   dependsOn: Type.Optional(Type.Array(Type.String(), { maxItems: 64 })),
   inputs: Type.Optional(Type.Array(Type.String(), {
     maxItems: 64,
@@ -156,9 +179,35 @@ const WORKFLOW_NODE = Type.Object({
     description: "Absolute paths of controller-reviewed skill files. Ambient skill discovery stays off; each path is hashed and passed as an explicit --skill. A skill cannot grant tools or effect capability.",
   })),
 });
+const TEAM_BUDGETS = Type.Object({
+  maxNodes: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+  maxAppends: Type.Optional(Type.Integer({ minimum: 0, maximum: 1000 })),
+  maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+  maxRedundant: Type.Optional(Type.Integer({ minimum: 0, maximum: 1000 })),
+});
+const TEAM_JOIN = Type.Object({
+  id: Type.String(),
+  kind: StringEnum(["sectioning", "ensemble", "reviewer"] as const),
+  members: Type.Array(Type.String(), { minItems: 1, maxItems: 1000 }),
+  reviewerId: Type.Optional(Type.String()),
+  adjudicatorId: Type.Optional(Type.String()),
+  policy: Type.Optional(StringEnum(["all_accepted", "majority", "adjudicated", "reviewer_accepts"] as const)),
+});
 const WORKFLOW_PARAMS = Type.Object({
   nodes: Type.Array(WORKFLOW_NODE, { minItems: 1, maxItems: 1000 }),
   concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+  dynamic: Type.Optional(Type.Union([
+    Type.Boolean(),
+    Type.Object({
+      maxMembers: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+      maxRounds: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
+      maxAttempts: Type.Optional(Type.Integer({ minimum: 1, maximum: 100000 })),
+      maxOutputTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 2000000000 })),
+    }),
+  ])),
+  acceptingAppends: Type.Optional(Type.Boolean()),
+  budgets: Type.Optional(TEAM_BUDGETS),
+  joins: Type.Optional(Type.Array(TEAM_JOIN, { maxItems: 1000 })),
   idempotencyKey: Type.Optional(Type.String({
     maxLength: 200,
     description: "Stable submission key. Repeating it returns the original workflow instead of launching duplicate work.",
@@ -798,6 +847,7 @@ export default function piDelegationBroker(pi: any) {
         ...(hop.resourceId ? { resourceId: hop.resourceId } : {}), outcome: hop.outcome ?? "unknown",
       })) : [],
       reportTaskId: childId,
+      ...(result.verification?.outcome?.status === "completed" ? { semanticStatus: "accepted", acceptanceStatus: "accepted" } : {}),
       ...(result.selection?.policyGeneration ? { policyGeneration: result.selection.policyGeneration } : {}),
       ...(result.selection?.billingPool ? { billingPool: result.selection.billingPool } : {}),
       ...(result.selection?.freshness ? { freshness: result.selection.freshness } : {}),
@@ -1101,8 +1151,7 @@ export default function piDelegationBroker(pi: any) {
         const startedAt = Date.now();
         let result: any;
         try {
-          // Each node carries its own axes: one stage may need peer-level effort while its
-          // siblings stay cheap, which is the whole point of assembling a team per stage.
+          if (node.acceptance?.length) broker.acceptancePlans.set(childId, node.acceptance);
           const nodeContract = resolveContract(node.contract ?? normalizeContract(node), ctx ?? lastCtx);
           const nodeRoleFraming = renderRoleFraming(nodeContract.role);
           result = await broker.runner.run({
@@ -1118,10 +1167,12 @@ export default function piDelegationBroker(pi: any) {
               role: nodeContract.role?.name ?? "worker",
             },
             capabilityRequest: workflowObserveCapabilityRequest({ ...node, task }, childId),
+            trackForVerification: Boolean(node.acceptance?.length),
           });
         } catch (error) {
           result = { status: "failed", error: (error as Error).message, route: [] };
         } finally {
+          broker.acceptancePlans.delete(childId);
           nodeIds.delete(childId);
         }
         return persistDelegationReport(broker, childId, task, startedAt, result, false, `${workflowId}/${node.id}`);
@@ -1827,11 +1878,19 @@ export default function piDelegationBroker(pi: any) {
       "Submit a durable dependency graph of isolated read-only subtasks. By default this returns a workflow id immediately and the parent remains free; "
       + "the controller runs, verifies, deadlines and recovers nodes in the background, then automatically wakes the parent on terminal report. Use delegate_status/list/collect/cancel with the returned id.",
     parameters: WORKFLOW_PARAMS,
-    async execute(toolCallId: string, params: { nodes: any[]; concurrency?: number; idempotencyKey?: string; deadlineMs?: number; wait?: boolean }, _signal: AbortSignal, onUpdate: any, ctx: any) {
+    async execute(toolCallId: string, params: { nodes: any[]; concurrency?: number; dynamic?: boolean | { maxMembers?: number; maxRounds?: number; maxAttempts?: number; maxOutputTokens?: number }; acceptingAppends?: boolean; budgets?: any; joins?: any[]; idempotencyKey?: string; deadlineMs?: number; wait?: boolean }, _signal: AbortSignal, onUpdate: any, ctx: any) {
       if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
       lastCtx = ctx;
       const submittedAt = Date.now();
       const proposedId = `workflow-${submittedAt.toString(36)}-${++counter}`;
+      const dynamicPolicy = params.dynamic && typeof params.dynamic === "object" ? params.dynamic : {};
+      const teamBudgets = {
+        ...(params.budgets ?? {}),
+        ...(dynamicPolicy.maxMembers !== undefined ? { maxNodes: dynamicPolicy.maxMembers } : {}),
+        ...(dynamicPolicy.maxRounds !== undefined ? { maxAppends: dynamicPolicy.maxRounds } : {}),
+        ...(dynamicPolicy.maxAttempts !== undefined ? { maxAttempts: dynamicPolicy.maxAttempts } : {}),
+        ...(dynamicPolicy.maxOutputTokens !== undefined ? { maxOutputTokens: dynamicPolicy.maxOutputTokens } : {}),
+      };
       const orchestrator = new TaskOrchestrator({
         root: JOBS_DIR,
         jobId: proposedId,
@@ -1844,6 +1903,10 @@ export default function piDelegationBroker(pi: any) {
           cwd: ctx.cwd,
           submittedAt,
           idempotencyKey: params.idempotencyKey ?? `tool:${toolCallId}`,
+          dynamic: Boolean(params.dynamic),
+          ...(params.acceptingAppends === undefined ? {} : { acceptingAppends: params.acceptingAppends }),
+          ...(Object.keys(teamBudgets).length ? { budgets: teamBudgets } : {}),
+          ...(params.joins ? { joins: params.joins } : {}),
           ...(params.deadlineMs ? { deadlineAt: submittedAt + params.deadlineMs } : {}),
         });
       } catch (error) {
@@ -1858,7 +1921,8 @@ export default function piDelegationBroker(pi: any) {
       if (params.wait) {
         const state = await promise;
         const incomplete = state.nodes.filter((node: any) => node.state !== "completed");
-        return { content: [{ type: "text", text: formatWorkflowSummary(workflowId, state) }], isError: incomplete.length > 0, details: state };
+        const unresolvedJoins = (state.team?.joinStates ?? []).filter((join: any) => join.status !== "accepted");
+        return { content: [{ type: "text", text: formatWorkflowSummary(workflowId, state) }], isError: incomplete.length > 0 || unresolvedJoins.length > 0, details: state };
       }
       return {
         content: [{
@@ -1867,6 +1931,63 @@ export default function piDelegationBroker(pi: any) {
         }],
         details: { workflowId, status: submission.job.status, background: true, idempotentReplay: !submission.created },
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_workflow_append",
+    label: "Append workflow tasks",
+    description: "Append bounded flat-team tasks and joins to a dynamic workflow.",
+    parameters: Type.Object({
+      workflowId: Type.String({ description: "Existing dynamic workflow id." }),
+      nodes: Type.Array(WORKFLOW_NODE, { minItems: 1, maxItems: 1000 }),
+      joins: Type.Optional(Type.Array(TEAM_JOIN, { maxItems: 1000 })),
+      proposalId: Type.Optional(Type.String({ maxLength: 160 })),
+      expectedRevision: Type.Optional(Type.Integer({ minimum: 0, maximum: 1000000 })),
+      proposalDigest: Type.Optional(Type.String({ minLength: 64, maxLength: 64 })),
+    }),
+    async execute(_toolCallId: string, params: { workflowId: string; nodes: any[]; joins?: any[]; proposalId?: string; expectedRevision?: number; proposalDigest?: string }, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
+      lastCtx = ctx;
+      try {
+        const result = appendWorkflowNodes(JOBS_DIR, params.workflowId, params.nodes, {
+          joins: params.joins ?? [],
+          proposalId: params.proposalId,
+          expectedRevision: params.expectedRevision,
+          proposalDigest: params.proposalDigest,
+        });
+        rememberFleetJob(result.job);
+        if (!activeWorkflows.has(params.workflowId) && !isTerminalJobStatus(result.job.status)) {
+          startWorkflow(params.workflowId, ctx).catch(() => undefined);
+        }
+        return {
+          content: [{ type: "text", text: `Workflow ${params.workflowId} append admitted: ${result.added.length} added, ${result.reused.length} exact duplicate(s) reused.` }],
+          details: result,
+        };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Workflow append rejected: ${(error as Error).message}` }], isError: true };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_workflow_close",
+    label: "Close workflow append window",
+    description: "Seal a dynamic workflow append window.",
+    parameters: Type.Object({
+      workflowId: Type.String({ description: "Existing dynamic workflow id." }),
+      expectedRevision: Type.Optional(Type.Integer({ minimum: 0, maximum: 1000000 })),
+    }),
+    async execute(_toolCallId: string, params: { workflowId: string; expectedRevision?: number }, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
+      lastCtx = ctx;
+      try {
+        const job = closeWorkflow(JOBS_DIR, params.workflowId, params.expectedRevision);
+        rememberFleetJob(job);
+        return { content: [{ type: "text", text: `Workflow ${params.workflowId} append window closed.` }], details: job };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Workflow close rejected: ${(error as Error).message}` }], isError: true };
+      }
     },
   });
 }
