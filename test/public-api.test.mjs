@@ -122,6 +122,8 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "readCurrencyCache",
     "readJob",
     "readProviderRegistry",
+    "RepairController",
+    "RepairStore",
     "RecursiveAdmissionStore",
     "normalizeRecursivePolicy",
     "requestChildIpc",
