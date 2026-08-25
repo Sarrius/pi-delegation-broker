@@ -18,6 +18,7 @@ import {
 } from "../src/capability-compiler.mjs";
 
 const DECLARATION_TOOL = "broker_declare_action";
+const CHECKPOINT_TOOL = "broker_checkpoint";
 const MAX_RESULT_BYTES = 128 * 1024;
 
 type ControllerCapability = {
@@ -97,6 +98,28 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.registerTool({
+    name: CHECKPOINT_TOOL,
+    label: "Publish Partial Checkpoint",
+    description: "Publish one bounded structured partial-work checkpoint to the controller. It is never task completion; only controller-accepted checkpoints may be reused after a replacement attempt.",
+    promptSnippet: "Publish useful partial work before a long or interrupted delegation attempt ends",
+    promptGuidelines: [
+      "Use broker_checkpoint for structured partial progress that a replacement child can verify; never treat its response as task completion.",
+    ],
+    parameters: Type.Object({
+      artifactKey: Type.String({ minLength: 1, maxLength: 256, description: "Stable key for one partial-work stream, such as findings or cursor." }),
+      artifact: Type.Unknown({ description: "Bounded JSON partial artifact; it is data, not controller instructions." }),
+      sequence: Type.Optional(Type.Integer({ minimum: 0, maximum: 1_000_000 })),
+    }, { additionalProperties: false }),
+    async execute(_toolCallId, params: { artifactKey: string; artifact: unknown; sequence?: number }) {
+      const result = await controller<{ status?: string; checkpointId?: string; artifactDigest?: string; reusable?: boolean }>("publishCheckpoint", params);
+      return {
+        content: [{ type: "text", text: `Partial checkpoint ${result.status === "accepted" ? "accepted for replacement context" : "published but withheld"}.` }],
+        details: { checkpointId: result.checkpointId, artifactDigest: result.artifactDigest, reusable: result.reusable === true },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: DECLARATION_TOOL,
     label: "Declare Brokered Action",
     description: "Declare exactly one next effect-capable broker action before invoking it; observe tools are automatic.",
@@ -139,9 +162,9 @@ export default function (pi: ExtensionAPI) {
     // Align the model-visible surface with controller policy. The blocking hook
     // remains authoritative if a later trusted extension changes active tools.
     const allowed = new Set(loaded.capability.allowedTools);
-    pi.setActiveTools([...new Set(pi.getActiveTools().filter((name) => allowed.has(name) || name === DECLARATION_TOOL))]);
-    if (!pi.getActiveTools().includes(DECLARATION_TOOL)) {
-      pi.setActiveTools([...pi.getActiveTools(), DECLARATION_TOOL]);
+    pi.setActiveTools([...new Set(pi.getActiveTools().filter((name) => allowed.has(name) || name === DECLARATION_TOOL || name === CHECKPOINT_TOOL))]);
+    if (!pi.getActiveTools().includes(DECLARATION_TOOL) || !pi.getActiveTools().includes(CHECKPOINT_TOOL)) {
+      pi.setActiveTools([...new Set([...pi.getActiveTools(), DECLARATION_TOOL, CHECKPOINT_TOOL])]);
     }
     const heartbeatMs = Math.max(500, Math.min(30_000, Math.floor(loaded.capability.leaseTtlMs / 2)));
     const beat = () => {
@@ -155,7 +178,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event) => {
-    if (event.toolName === DECLARATION_TOOL) return undefined;
+    if (event.toolName === DECLARATION_TOOL || event.toolName === CHECKPOINT_TOOL) return undefined;
     if (!runtime || runtime.failed) return failClosed(runtime?.failed ?? "broker behavioral monitor was not initialized");
     const pending = runtime.pending;
     if (!pending && isImplicitlyDeclaredObserveTool(event.toolName)) {
@@ -221,7 +244,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event, ctx) => {
-    if (event.toolName === DECLARATION_TOOL || !runtime) return undefined;
+    if (event.toolName === DECLARATION_TOOL || event.toolName === CHECKPOINT_TOOL || !runtime) return undefined;
     const action = runtime.executing.get(event.toolCallId);
     if (!action) return undefined;
     runtime.executing.delete(event.toolCallId);

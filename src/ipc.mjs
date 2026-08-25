@@ -9,6 +9,11 @@ import { BehavioralRunMonitor } from "./behavior-monitor.mjs";
 import { ArtifactPipeline } from "./artifact-pipeline.mjs";
 import { AttemptSettlement, ProviderStreamAssembler, createAttemptRouteSnapshot, outcomeProperties } from "./provider-protocol.mjs";
 const MAX_REQUEST_BYTES = 1024 * 1024;
+// Runner attempt ids are `<logical-id>` and `<logical-id>-rN`. The controller derives the
+// logical lineage from the lease id rather than trusting a child-supplied root field.
+function logicalTaskId(taskId) {
+  return typeof taskId === "string" ? taskId.replace(/-r[0-9]+$/, "") : taskId;
+}
 // A handler that already wrote its own frames and ended the socket must say so explicitly.
 // Overloading `undefined` for that made every void controller method hang its caller, because
 // requestBrokerIpc only settles on the response.
@@ -16,6 +21,7 @@ const STREAM_ALREADY_WRITTEN = Symbol("broker_stream_already_written");
 const CHILD_METHODS = new Set([
   "heartbeat", "release", "providerAttempt", "providerStream",
   "getEffectiveChildCapability", "declareBehavioralAction", "authorizeBehavioralAction", "observeBehavioralResult",
+  "publishCheckpoint",
 ]);
 const CONTROLLER_METHODS = new Set([
   "reserve", "submit", "dispatchPending", "pendingTasks", "queueWaitMetrics", "readyTasks", "claimReadyTask", "trackLeasedTask", "abandonClaimedTask", "releaseClaimedTaskForVerification", "finalizeVerifiedTask", "reschedulePending", "finishPending",
@@ -56,12 +62,14 @@ export class BrokerIpcServer {
   #fakeProvider;
   #providerTransport;
   #routeResolver;
+  #checkpointStore;
+  #defectRecorder;
   #server;
   #connections = new Set();
   #controllerEpoch = randomUUID();
   #behavioralMonitors = new Map();
 
-  constructor({ broker, socketPath, controllerToken = randomBytes(32).toString("base64url"), fakeProvider, providerTransport, routeResolver }) {
+  constructor({ broker, socketPath, controllerToken = randomBytes(32).toString("base64url"), fakeProvider, providerTransport, routeResolver, checkpointStore, defectRecorder }) {
     if (!broker || !socketPath) throw new Error("Broker IPC server needs broker and socketPath");
     if ((providerTransport && !routeResolver) || (!providerTransport && routeResolver)) {
       throw new Error("real provider transport requires both providerTransport and routeResolver");
@@ -69,12 +77,16 @@ export class BrokerIpcServer {
     if (providerTransport && fakeProvider) throw new Error("choose either fakeProvider or real providerTransport, never both");
     if (providerTransport && typeof providerTransport.stream !== "function") throw new Error("providerTransport requires a stream method");
     if (routeResolver && typeof routeResolver !== "function") throw new Error("routeResolver must be a function");
+    if (checkpointStore !== undefined && typeof checkpointStore.publish !== "function") throw new Error("checkpointStore must publish checkpoints");
+    if (defectRecorder !== undefined && typeof defectRecorder !== "function") throw new Error("defectRecorder must be a function");
     this.#broker = broker;
     this.#socketPath = socketPath;
     this.#controllerToken = controllerToken;
     this.#fakeProvider = fakeProvider;
     this.#providerTransport = providerTransport;
     this.#routeResolver = routeResolver;
+    this.#checkpointStore = checkpointStore;
+    this.#defectRecorder = defectRecorder;
     this.#server = createServer((socket) => {
       this.#connections.add(socket);
       socket.once("close", () => this.#connections.delete(socket));
@@ -167,13 +179,25 @@ export class BrokerIpcServer {
         },
         (error) => {
           if (abortController.signal.aborted) return;
+          const message = error instanceof Error ? error.message : "internal_error";
+          this.#recordDefect({
+            kind: "controller", origin: "controller", phase: "ipc_dispatch",
+            ...(typeof request?.params?.taskId === "string" ? { taskId: request.params.taskId } : {}),
+            tool: typeof request?.method === "string" ? `ipc:${request.method}` : "ipc:unknown",
+            message: message.replace(/\s+/g, " ").slice(0, 2_000), retryable: false,
+            details: { method: request?.method ?? "unknown" },
+          });
           responded = true;
           // Do not stringify raw request fields or authorization in an error.
-          this.#respond(socket, { id: request?.id ?? null, ok: false, error: error instanceof Error ? error.message : "internal_error" });
+          this.#respond(socket, { id: request?.id ?? null, ok: false, error: message });
         },
       );
     });
     socket.on("error", () => socket.destroy());
+  }
+
+  #recordDefect(defect) {
+    try { this.#defectRecorder?.(defect); } catch { /* defect capture cannot change IPC authority */ }
   }
 
   #respond(socket, response) {
@@ -223,6 +247,7 @@ export class BrokerIpcServer {
     if (method === "declareBehavioralAction") return this.#declareBehavioralAction(capability.lease, params, now);
     if (method === "authorizeBehavioralAction") return this.#authorizeBehavioralAction(capability.lease, params, now);
     if (method === "observeBehavioralResult") return this.#observeBehavioralResult(capability.lease, params, now);
+    if (method === "publishCheckpoint") return this.#publishCheckpoint(capability.lease, params, now);
     if (method === "providerStream") return this.#providerStream(capability.lease, params, signal, socket, request.id);
     return this.#providerAttempt(capability.lease, params.inputDigest, signal);
   }
@@ -274,12 +299,50 @@ export class BrokerIpcServer {
       isError: params?.isError,
       stateDigest: state.stateDigest,
     });
+    const resultDigest = createHash("sha256").update(captured.canonical).digest("hex");
     const recorded = this.#broker.recordBehavioralEvent(lease.leaseId, lease.fencingToken, {
-      kind: "tool_result_observed", status: result.status,
-      resultDigest: createHash("sha256").update(captured.canonical).digest("hex"),
+      kind: "tool_result_observed", status: result.status, resultDigest,
     }, now);
     if (recorded.status !== "recorded") throw new Error("lease no longer active");
+    if (params?.isError === true) {
+      this.#recordDefect({
+        kind: "tool", origin: "child", rootId: logicalTaskId(lease.taskId), taskId: logicalTaskId(lease.taskId),
+        attemptId: lease.leaseId, tool: String(params.toolName ?? "unknown").slice(0, 256),
+        phase: "tool_result", message: "child tool returned an error", retryable: result.status !== "terminated",
+        observedAt: now, details: { resultDigest, monitorStatus: result.status },
+        provenance: { source: "behavioral_monitor", leaseId: lease.leaseId },
+      });
+    }
     return result;
+  }
+
+  #publishCheckpoint(lease, params, now) {
+    if (!this.#checkpointStore) throw new Error("checkpoint_store_unavailable");
+    const lineage = logicalTaskId(lease.taskId);
+    const checkpoint = this.#checkpointStore.publish({
+      taskId: lineage,
+      rootId: lineage,
+      attemptId: lease.leaseId,
+      artifactKey: params?.artifactKey,
+      artifact: params?.artifact,
+      sequence: params?.sequence,
+      provenance: { source: "lease_child", leaseId: lease.leaseId },
+      publishedAt: now,
+      // Schema/provenance acceptance is controller-owned. This accepts a partial checkpoint,
+      // never a terminal task result; conflicting keys remain withheld by the store.
+      autoAccept: true,
+    });
+    const checkpointEvent = this.#broker.recordBehavioralEvent(lease.leaseId, lease.fencingToken, {
+      kind: "checkpoint_published", checkpointId: checkpoint.checkpointId,
+      status: checkpoint.status, artifactDigest: checkpoint.artifactDigest,
+    }, now);
+    if (checkpointEvent.status !== "recorded") throw new Error("lease no longer active");
+    return {
+      status: checkpoint.status,
+      checkpointId: checkpoint.checkpointId,
+      artifactDigest: checkpoint.artifactDigest,
+      reusable: checkpoint.status === "accepted",
+    };
   }
 
   async #providerStream(lease, params, signal, socket, requestId) {

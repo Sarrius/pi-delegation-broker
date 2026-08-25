@@ -81,6 +81,8 @@ export class SingleHostBrokerSupervisor {
   #fakeProvider;
   #providerTransport;
   #routeResolver;
+  #checkpointStore;
+  #defectRecorder;
   #verificationReceiptVerifier;
   #resourceRanker;
   #behavioralEnforcement;
@@ -109,6 +111,8 @@ export class SingleHostBrokerSupervisor {
     fakeProvider,
     providerTransport,
     routeResolver,
+    checkpointStore,
+    defectRecorder,
     verificationReceiptVerifier,
     resourceRanker,
     behavioralEnforcement = "unavailable",
@@ -154,6 +158,8 @@ export class SingleHostBrokerSupervisor {
     if (providerTransport && fakeProvider) throw new Error("Broker supervisor chooses either fakeProvider or real provider transport");
     if (providerTransport && typeof providerTransport.stream !== "function") throw new Error("Broker supervisor providerTransport requires stream");
     if (routeResolver && typeof routeResolver !== "function") throw new Error("Broker supervisor routeResolver must be a function");
+    if (checkpointStore !== undefined && typeof checkpointStore.publish !== "function") throw new Error("Broker supervisor checkpointStore must publish checkpoints");
+    if (defectRecorder !== undefined && typeof defectRecorder !== "function") throw new Error("Broker supervisor defectRecorder must be a function");
     if (verificationReceiptVerifier !== undefined && typeof verificationReceiptVerifier !== "function") {
       throw new Error("Broker supervisor verificationReceiptVerifier must be a function");
     }
@@ -163,6 +169,8 @@ export class SingleHostBrokerSupervisor {
     this.#fakeProvider = fakeProvider;
     this.#providerTransport = providerTransport;
     this.#routeResolver = routeResolver;
+    this.#checkpointStore = checkpointStore;
+    this.#defectRecorder = defectRecorder;
     this.#verificationReceiptVerifier = verificationReceiptVerifier;
     this.#resourceRanker = resourceRanker;
     // Effect-capable contracts are refused unless a blocking monitor is actually wired, so this
@@ -240,6 +248,8 @@ export class SingleHostBrokerSupervisor {
         controllerToken: this.#controllerToken,
         ...(this.#fakeProvider === undefined ? {} : { fakeProvider: this.#fakeProvider }),
         ...(this.#providerTransport === undefined ? {} : { providerTransport: this.#providerTransport, routeResolver: this.#routeResolver }),
+        ...(this.#checkpointStore === undefined ? {} : { checkpointStore: this.#checkpointStore }),
+        ...(this.#defectRecorder === undefined ? {} : { defectRecorder: this.#defectRecorder }),
       });
       await this.#server.start();
       // SQLite may create WAL/SHM beside the DB. The owner-only directory is

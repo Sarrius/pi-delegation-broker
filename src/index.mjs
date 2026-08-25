@@ -98,6 +98,9 @@ export {
 } from "./provider-probe.mjs";
 export { compileEffectiveChildCapability, createEffectiveChildCapability, deriveAllowedTools, canonicalDeclaredToolName } from "./capability-compiler.mjs";
 export { ArtifactPipeline } from "./artifact-pipeline.mjs";
+export { DefectStore, defectFingerprint } from "./defect-store.mjs";
+export { CheckpointStore } from "./checkpoint-store.mjs";
+export { SessionBindingStore, formatSessionResumeStatus, sessionCursor, sessionIdentity } from "./session-binding-store.mjs";
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";
 export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
 export { BrokeredLaunchResolver } from "./trusted-launch-resolver.mjs";

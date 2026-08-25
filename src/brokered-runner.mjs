@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { spawnBrokeredChild } from "./child-launcher.mjs";
 import { Semaphore } from "./semaphore.mjs";
@@ -86,6 +86,8 @@ export class BrokeredChildRunner {
   #capacityWaitMs;
   #capacityRetryMs;
   #now;
+  #checkpointStore;
+  #defectRecorder;
   #handles = new Map();
   #admissions = new Map();
   #inflightSpawns = new Map();
@@ -104,6 +106,8 @@ export class BrokeredChildRunner {
     attemptMaxRunMs = DEFAULT_ATTEMPT_MAX_RUN_MS,
     capacityWaitMs = DEFAULT_CAPACITY_WAIT_MS,
     capacityRetryMs = DEFAULT_CAPACITY_RETRY_MS,
+    checkpointStore,
+    defectRecorder,
     now = () => Date.now(),
   }) {
     if (!resolver || typeof resolver.resolve !== "function") throw new Error("BrokeredChildRunner requires a BrokeredLaunchResolver");
@@ -123,12 +127,16 @@ export class BrokeredChildRunner {
     if (!Number.isSafeInteger(capacityRetryMs) || capacityRetryMs < 1 || capacityRetryMs > 60_000) {
       throw new Error("BrokeredChildRunner capacityRetryMs must be between 1 and 60000");
     }
+    if (checkpointStore !== undefined && typeof checkpointStore.renderAccepted !== "function") throw new Error("BrokeredChildRunner checkpointStore must render accepted checkpoints");
+    if (defectRecorder !== undefined && typeof defectRecorder !== "function") throw new Error("BrokeredChildRunner defectRecorder must be a function");
     if (typeof now !== "function") throw new Error("BrokeredChildRunner now must be a function");
     this.#noProgressTimeoutMs = noProgressTimeoutMs;
     this.#attemptMaxRunMs = attemptMaxRunMs;
     this.#capacityWaitMs = capacityWaitMs;
     this.#capacityRetryMs = capacityRetryMs;
     this.#now = now;
+    this.#checkpointStore = checkpointStore;
+    this.#defectRecorder = defectRecorder;
     this.#resolver = resolver;
     this.#semaphore = semaphore;
     this.#sessionsRoot = sessionsRoot;
@@ -161,6 +169,23 @@ export class BrokeredChildRunner {
     if (attemptId) this.#attempts.delete(attemptId);
   }
 
+  #recordDefect(defect) {
+    try { this.#defectRecorder?.(defect); } catch { /* defect capture cannot change task settlement */ }
+  }
+
+  #acceptedCheckpointPrompt(taskId, rootId) {
+    if (!this.#checkpointStore) return "";
+    try { return this.#checkpointStore.renderAccepted({ taskId, ...(typeof rootId === "string" ? { rootId } : {}) }); }
+    catch (error) {
+      this.#recordDefect({
+        kind: "checkpoint", origin: "controller", taskId, rootId,
+        phase: "replacement_context", message: "accepted checkpoint rendering failed", retryable: false,
+        details: { error: String(error?.message ?? error).slice(0, 500) },
+      });
+      return "";
+    }
+  }
+
   #observeAttemptEvent(attemptId, event) {
     if (!event || typeof event.type !== "string") return;
     // Keep this list exactly aligned with #promptWithDeadline. Lifecycle chatter such as
@@ -169,11 +194,21 @@ export class BrokeredChildRunner {
       "message_update", "message_end", "tool_execution_start", "tool_execution_update",
       "tool_execution_end", "auto_retry_start", "auto_retry_end", "bash_execution_update",
     ].includes(event.type);
+    const observedAt = this.#now();
     this.#updateAttempt(attemptId, {
-      lastEventAt: this.#now(),
+      lastEventAt: observedAt,
       lastEventType: event.type,
-      ...(progress ? { lastProgressAt: this.#now() } : {}),
+      ...(progress ? { lastProgressAt: observedAt } : {}),
     });
+    if ((event.type === "tool_execution_end" || event.type === "tool_result") && (event.isError === true || event.error)) {
+      const attempt = this.#attempts.get(attemptId);
+      this.#recordDefect({
+        kind: "tool", origin: "child", rootId: attempt?.rootId, taskId: attempt?.logicalId ?? attempt?.baseChildId,
+        attemptId, tool: typeof event.toolName === "string" ? event.toolName.slice(0, 256) : "unknown",
+        phase: event.type, message: "child tool execution reported an error", retryable: true,
+        observedAt, details: { eventType: event.type, hasError: true },
+      });
+    }
   }
 
   /**
@@ -263,9 +298,21 @@ export class BrokeredChildRunner {
           : {}),
       };
 
+      // Checkpoints are keyed to the controller lease task id. The child may declare lineage
+      // metadata, but it cannot choose which other root's accepted artifacts enter its prompt.
+      const checkpointPrompt = this.#acceptedCheckpointPrompt(childId);
+      const attemptPrompt = checkpointPrompt
+        ? `${spec.prompt ?? ""}\n\n${checkpointPrompt}`
+        : spec.prompt;
+      const attemptPromptDigest = checkpointPrompt && typeof attemptPrompt === "string"
+        ? createHash("sha256").update(attemptPrompt).digest("hex")
+        : spec.promptDigest;
       let handle;
       try {
-        handle = await this.spawn({ ...spec, childId: attemptId, capabilityRequest, attempts: attempt, deferClosePolicy: true });
+        handle = await this.spawn({
+          ...spec, childId: attemptId, prompt: attemptPrompt, promptDigest: attemptPromptDigest,
+          capabilityRequest, attempts: attempt, deferClosePolicy: true,
+        });
       } catch (error) {
         if (abortedEarly()) return finish(Object.freeze({
           id: childId, status: "aborted", text: "",
@@ -637,6 +684,13 @@ export class BrokeredChildRunner {
       const truncated = ["length", "max_tokens", "maxTokens"].includes(message?.stopReason);
       const aborted = message?.stopReason === "aborted";
       if (message?.stopReason === "error" || !answered || unresolvedToolRequest || truncated || aborted) {
+        this.#recordDefect({
+          kind: "lifecycle", origin: "controller", rootId: this.#attempts.get(handle.id)?.rootId,
+          taskId: this.#attempts.get(handle.id)?.logicalId ?? handle.id, attemptId: handle.id,
+          phase: "child_settlement", message: String(message?.errorMessage ?? (unresolvedToolRequest
+            ? "child stopped with unresolved tool request" : truncated ? "child output was truncated" : aborted ? "child was aborted" : "child completed without a result")).replace(/\s+/g, " ").slice(0, 2_000),
+          retryable: true, details: { stopReason: message?.stopReason ?? "empty_result" },
+        });
         result = {
           id: handle.id,
           status: "failed",
@@ -669,6 +723,12 @@ export class BrokeredChildRunner {
         };
       }
     } catch (error) {
+      this.#recordDefect({
+        kind: "lifecycle", origin: "controller", rootId: this.#attempts.get(handle.id)?.rootId,
+        taskId: this.#attempts.get(handle.id)?.logicalId ?? handle.id, attemptId: handle.id,
+        phase: "child_settlement", message: String(error?.message ?? "child execution failed").replace(/\s+/g, " ").slice(0, 2_000),
+        retryable: true, details: { error: String(error?.name ?? "Error") },
+      });
       result = {
         id: handle.id,
         status: handle.wasExternallyCancelled ? "aborted" : "failed",
