@@ -254,6 +254,14 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
   const live = availabilityIndex(availability);
   const currencyLookup = currencyIndex(currency);
   const excluded = new Set(Array.isArray(constraints.excludeResources) ? constraints.excludeResources : []);
+  // An exact identity request (route=inherit_model) narrows the candidate set and nothing else.
+  // It is applied beside every other gate, never instead of one: a model that is legacy,
+  // wrongly provenanced, unhealthy or below the quality floor stays rejected when named.
+  const requiredIdentity = constraints.requireModelIdentity;
+  if (requiredIdentity !== undefined
+    && (typeof requiredIdentity?.provider !== "string" || typeof requiredIdentity?.modelId !== "string")) {
+    throw new Error("constraints.requireModelIdentity must be {provider, modelId}");
+  }
   const allowedProviders = Array.isArray(constraints.allowedProviders) && constraints.allowedProviders.length > 0
     ? new Set(constraints.allowedProviders)
     : undefined;
@@ -273,6 +281,8 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         if (excluded.has(id)) continue;
         if (allowedProviders && !allowedProviders.has(resource.model?.provider ?? id)) continue;
         const identity = resource.model ?? parseResourceModel(id);
+        if (requiredIdentity
+          && (identity?.provider !== requiredIdentity.provider || identity?.modelId !== requiredIdentity.modelId)) continue;
         const explicitlyAllowed = Boolean(userOnly && identity && preferenceMatches(preferenceEntries, identity));
         if (userOnly && !explicitlyAllowed) continue;
         // Empty user tiers mean controller auto mode, not "any model the aggregator happens

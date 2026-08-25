@@ -26,11 +26,12 @@ const unpackedSize = packed[0].unpackedSize;
 // provider set be picked up while delegated work is in flight, plus the currency probe and
 // scoped child-auth provisioner, plus the credentialless controller provider proxy that lets a
 // leased child stream through controller IPC while holding no provider credential of its own.
-// Keep an 800 KiB ceiling: enough for audited source, including controller-side automatic
-// observation declarations, durable parent wake/reconciliation, and the bounded terminal fleet projection,
+// Keep an 832 KiB ceiling: enough for audited source, including controller-side automatic
+// observation declarations, durable parent wake/reconciliation, the bounded terminal fleet projection,
+// and the child contract (effort/route/role plus reviewed skill identities),
 // while still catching accidental fixtures, credentials, or generated artifacts. The package
 // remains source-only: every byte is reviewable .mjs/.ts/.md.
-if (!Number.isSafeInteger(unpackedSize) || unpackedSize > 800 * 1024) throw new Error(`npm package is unexpectedly large: ${unpackedSize}`);
+if (!Number.isSafeInteger(unpackedSize) || unpackedSize > 832 * 1024) throw new Error(`npm package is unexpectedly large: ${unpackedSize}`);
 const packageJson = statSync(join(root, "package.json"));
 if ((packageJson.mode & 0o022) !== 0) throw new Error("package.json permissions must not grant group/other write access");
 console.log(`package check: pass (${names.length} files, ${unpackedSize} bytes unpacked)`);

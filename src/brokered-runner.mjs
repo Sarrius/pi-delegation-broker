@@ -209,7 +209,14 @@ export class BrokeredChildRunner {
       visibleAttemptId = undefined;
       this.#activeRuns.delete(childId);
       this.#abortedRuns.delete(childId);
-      return value;
+      // Carry the requested contract next to the result so the controller can persist what was
+      // asked for beside what the provider actually accepted. Without the pair, a silently
+      // downgraded effort level is indistinguishable from one that was never requested.
+      return Object.freeze({
+        ...value,
+        requestedThinking: spec.thinkingLevel ?? "off",
+        ...(typeof fleetMeta.role === "string" ? { role: fleetMeta.role } : {}),
+      });
     };
     // Cancellation must reach a run that owns no child process yet. Without this an abort issued
     // while the route is queued behind live capacity is silently a no-op, and the controller
@@ -248,6 +255,12 @@ export class BrokeredChildRunner {
         ...(spec.capabilityRequest ?? {}),
         ...(excludeResources.length > 0 ? { excludeResources: [...excludeResources] } : {}),
         ...(requiredCapabilities ? { requiredCapabilities: [...requiredCapabilities] } : {}),
+        // An exact identity has to reach the selector, not only the resolver. The resolver
+        // requires an explicit model to equal what the selector independently chose, so asking
+        // for one without constraining selection would deny every honourable request instead.
+        ...(spec.model?.provider && spec.model?.modelId
+          ? { requireModelIdentity: { provider: spec.model.provider, modelId: spec.model.modelId } }
+          : {}),
       };
 
       let handle;
@@ -429,6 +442,10 @@ export class BrokeredChildRunner {
    * registration there is a window with no admission and no handle, and dispose() must still
    * be able to wait for it instead of returning while a child is being born.
    */
+  /**
+   * Role framing is appended after the controller's own framing and the lease's prompt rules,
+   * so a role can never restate or weaken them: it is the last, least authoritative voice.
+   */
   async spawn(request) {
     const promise = this.#spawn(request);
     this.#inflightSpawns.set(promise, request?.childId);
@@ -436,7 +453,7 @@ export class BrokeredChildRunner {
     finally { this.#inflightSpawns.delete(promise); }
   }
 
-  async #spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, attempts = 1, deferClosePolicy = false }) {
+  async #spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, attempts = 1, deferClosePolicy = false, roleFraming, skills }) {
     if (this.#disposed) throw new Error("BrokeredChildRunner is disposed");
     if (this.#handles.has(childId)) throw new Error(`Duplicate child id: ${childId}`);
     if (!Number.isSafeInteger(attempts) || attempts < 1) throw new Error("brokered child attempt count must be a positive safe integer");
@@ -491,7 +508,10 @@ export class BrokeredChildRunner {
         ...(tools ? { tools } : {}),
         ...(excludeTools ? { excludeTools } : {}),
         label: label ?? "brokered-child",
-        appendSystemPrompt: [SUBAGENT_FRAMING, policy.promptRules].filter(Boolean).join("\n\n"),
+        // Controller framing first, caller role next (quoted, non-authoritative), lease rules
+        // last so they win any conflict with role prose that imitates a policy section.
+        appendSystemPrompt: [SUBAGENT_FRAMING, roleFraming, policy.promptRules].filter(Boolean).join("\n\n"),
+        ...(skills ? { skills } : {}),
       };
 
       if (isolation === "worktree") {

@@ -229,6 +229,8 @@ export function buildFleetProjection({
       modelId,
       route: resourceId ?? (provider && modelId ? `${provider}/${modelId}` : safeText(report.route, undefined, 240)),
       effectiveThinking: safeText(report.effectiveThinking, undefined, 40),
+      requestedThinking: safeText(report.requestedThinking, undefined, 40),
+      role: safeText(report.role, undefined, 80),
       usage: usageOf(report.usage),
       verification: safeText(report.verificationStatus, undefined, 80),
       persistence: byId.has(id) ? "durable_job+durable_report" : "durable_report",
@@ -349,7 +351,9 @@ export function formatFleetWidget(fleet, { maxRows = 5, width = 120 } = {}) {
     const elapsed = row.startedAt === undefined ? "—" : duration(fleet.now - row.startedAt);
     const progress = row.progressAgeMs === undefined ? "obs:—" : `${row.liveness === "stalled" ? "stale" : "obs"}:${duration(row.progressAgeMs)}`;
     const route = row.route ?? "route:pending";
-    const effort = row.effectiveThinking ?? "—";
+    // Show both sides only when they disagree: an effort the provider changed is news.
+    const effort = row.effectiveThinking && row.requestedThinking && row.effectiveThinking !== row.requestedThinking
+      ? `${row.requestedThinking}→${row.effectiveThinking}` : row.effectiveThinking ?? row.requestedThinking ?? "—";
     const attempt = row.attempt ? `a${row.attempt}` : "a—";
     const label = clip(row.label, 24);
     lines.push(clip(`${stateGlyph(row)} ${label} · ${row.role ?? "worker"} · ${route} · ${effort} · ${elapsed} · ${progress} · ${attempt}`, safeWidth));

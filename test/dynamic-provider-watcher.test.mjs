@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -180,7 +180,12 @@ test("auth-only provider with models.json models registers THOSE models, not a p
   }
 });
 
-test("dynamic provider watcher reads the live Pi agent dir", () => {
+const SKIP_LIVE_AGENT = Boolean(process.env.CI || process.env.GITHUB_ACTIONS)
+  || !existsSync(join(homedir(), ".pi", "agent"));
+
+test("dynamic provider watcher reads the live Pi agent dir", {
+  skip: SKIP_LIVE_AGENT && "live Pi agent dir is not available on CI",
+}, () => {
   const agentDir = join(homedir(), ".pi", "agent");
   const root = mkdtempSync(join(tmpdir(), "dpw-live-"));
   try {

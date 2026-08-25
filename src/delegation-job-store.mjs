@@ -2,6 +2,7 @@ import {
   existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync,
 } from "node:fs";
 import { join, resolve, sep } from "node:path";
+import { assertStoredContract } from "./child-contract.mjs";
 
 const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/;
 const JOB_KINDS = new Set(["task", "workflow"]);
@@ -38,9 +39,23 @@ function validate(job) {
   }
   if (typeof job.cwd !== "string" || job.cwd.length < 1 || job.cwd.length > 4096 || /\0/.test(job.cwd)) fail("cwd is invalid");
   if (job.kind === "task" && (typeof job.task !== "string" || job.task.length < 1 || job.task.length > 256 * 1024)) fail("task text is invalid");
+  // The contract is durable intent: a malformed one must not survive a restart and silently
+  // resolve into different spending than the caller asked for. Node contracts are the same
+  // allowlist — without this check, a tampered workflow stage would recover and run on defaults.
+  if (job.contract !== undefined) {
+    try { assertStoredContract(job.contract); }
+    catch (error) { fail(String(error.message).replace(/^child contract: /, "")); }
+  }
   if (job.kind === "workflow") {
     if (!Array.isArray(job.nodes) || job.nodes.length < 1 || job.nodes.length > 1000) fail("workflow nodes are invalid");
     if (!Number.isSafeInteger(job.concurrency) || job.concurrency < 1 || job.concurrency > 64) fail("workflow concurrency is invalid");
+    for (const node of job.nodes) {
+      if (node?.contract === undefined) continue;
+      try { assertStoredContract(node.contract); }
+      catch (error) {
+        fail(`node ${node.id ?? "?"} ${String(error.message).replace(/^child contract: /, "")}`);
+      }
+    }
   }
   const serialized = JSON.stringify(job);
   if (Buffer.byteLength(serialized) > MAX_JOB_BYTES) fail("job exceeds the durable size bound");

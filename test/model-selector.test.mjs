@@ -122,6 +122,44 @@ test("with a single strong-only account the selector escalates instead of denyin
   assert.equal(selected.expectedModel.modelId, "strong");
 });
 
+test("an exact identity request narrows selection and never bypasses a gate", () => {
+  const registry = registryOf(Array.from({ length: 3 }, (_, index) => account(`acct-${index}`)));
+
+  // Naming a live, admissible model pins selection to exactly that identity.
+  const pinned = selectModelForTask({
+    taskDescription: "read this file and tell me what it says",
+    registry,
+    constraints: baseConstraints({ requireModelIdentity: { provider: "acct-1", modelId: "strong" } }),
+  });
+  assert.equal(pinned.action, "allow");
+  assert.equal(pinned.expectedModel.provider, "acct-1");
+  assert.equal(pinned.expectedModel.modelId, "strong");
+
+  // Naming a model that does not exist denies; it must never fall back to a different one.
+  const missing = selectModelForTask({
+    taskDescription: "read this file and tell me what it says",
+    registry,
+    constraints: baseConstraints({ requireModelIdentity: { provider: "acct-1", modelId: "not-in-catalog" } }),
+  });
+  assert.equal(missing.action, "deny");
+
+  // Naming a model too weak for the work is still refused: identity is a filter, not a waiver.
+  const tooWeak = selectModelForTask({
+    taskDescription: "refactor the module and fix the failing test",
+    registry,
+    constraints: baseConstraints({ requireModelIdentity: { provider: "acct-0", modelId: "weak" } }),
+  });
+  assert.equal(tooWeak.action, "deny", "an exact identity cannot lower the quality floor");
+
+  assert.throws(
+    () => selectModelForTask({
+      taskDescription: "read", registry,
+      constraints: baseConstraints({ requireModelIdentity: { provider: "acct-0" } }),
+    }),
+    /requireModelIdentity must be \{provider, modelId\}/,
+  );
+});
+
 test("a class weaker than required is never selected, even as the only survivor", () => {
   const registry = registryOf([account("weak-only", { mid: false, strong: false })]);
   const selected = selectModelForTask({

@@ -126,6 +126,41 @@ test("a durable cancellation racing node completion cannot be overwritten by sta
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("per-node contract axes survive normalization and invalid ones are refused", () => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-contract-"));
+  try {
+    const orchestrator = new TaskOrchestrator({
+      root, jobId: "workflow-contract", concurrency: 2,
+      run: async () => ({ status: "completed" }),
+    });
+    const skills = [{ path: "/tmp/reviewer.md", digest: "ab".repeat(32), bytes: 24 }];
+    const { job } = orchestrator.initialize([
+      { id: "cheap", task: "summarize" },
+      { id: "hard", task: "reason", thinking: "high", route: "inherit_model", role: { name: "reviewer" }, skills },
+    ], { cwd: root, submittedAt: Date.now() });
+    // A stage that asked for peer-level effort must not silently run on defaults.
+    assert.equal(job.nodes[0].contract, undefined);
+    assert.equal(job.nodes[1].contract.thinking, "high");
+    assert.equal(job.nodes[1].contract.route, "inherit_model");
+    assert.equal(job.nodes[1].contract.role.name, "reviewer");
+    assert.equal(job.nodes[1].contract.role.schemaVersion, 1);
+    assert.deepEqual(job.nodes[1].contract.skills, skills);
+
+    const rejecting = new TaskOrchestrator({
+      root, jobId: "workflow-contract-bad", concurrency: 1,
+      run: async () => ({ status: "completed" }),
+    });
+    assert.throws(
+      () => rejecting.initialize([{ id: "n", task: "t", thinking: "very hard" }], { cwd: root, submittedAt: Date.now() }),
+      /thinking mode is invalid/,
+    );
+    assert.throws(
+      () => rejecting.initialize([{ id: "n", task: "t", skills: ["relative.md"] }], { cwd: root, submittedAt: Date.now() }),
+      /absolute filesystem path/,
+    );
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("workflow validation rejects cycles and undeclared dependency inputs", () => {
   const root = mkdtempSync(join(tmpdir(), "orchestrator-graph-"));
   try {
