@@ -3,6 +3,7 @@ import { normalizeContract } from "./child-contract.mjs";
 import {
   isTerminalJobStatus, readJob, submitJob, updateJob,
 } from "./delegation-job-store.mjs";
+import { normalizeRecursivePolicy } from "./recursive-admission.mjs";
 import {
   admitTeamNodes,
   evaluateTeamJoins,
@@ -87,6 +88,7 @@ function normalizeNodes(nodes, { knownIds = [] } = {}) {
     if (!Array.isArray(inputs) || inputs.some((id) => !ID.test(id)) || new Set(inputs).size !== inputs.length) fail("inputs are invalid");
     if (node.tier !== undefined && !TIER.has(node.tier)) fail("tier is invalid");
     const acceptance = normalizeAcceptance(node.acceptance);
+    const recursion = node.recursion === undefined ? undefined : normalizeRecursivePolicy(node.recursion, { canaryEnabled: true });
     const capabilities = node.capabilities;
     if (capabilities !== undefined) {
       if (!Array.isArray(capabilities) || capabilities.length > 16
@@ -111,6 +113,7 @@ function normalizeNodes(nodes, { knownIds = [] } = {}) {
       ...(node.tier !== undefined ? { tier: node.tier } : {}),
       ...(capabilities !== undefined ? { capabilities: [...capabilities] } : {}),
       ...(acceptance ? { acceptance: structuredClone(acceptance) } : {}),
+      ...(recursion ? { recursion: structuredClone(recursion) } : {}),
       ...(contract ? { contract: structuredClone(contract) } : {}),
     };
   });

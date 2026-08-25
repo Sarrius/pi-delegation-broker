@@ -45,6 +45,21 @@ test("effective child capability is immutable, fingerprinted, and rejects unknow
   assert.notEqual(different.capabilityFingerprint, cap.capabilityFingerprint);
 });
 
+test("read-only canary delegation is fingerprinted and depth-2 grants are refused", () => {
+  const delegation = {
+    mode: "read_only_canary", grantId: "grant-1", rootTaskId: "root-1", parentTaskId: "task-cap",
+    depth: 1, maxDepth: 2, maxChildren: 1, maxParallel: 1, maxAttemptsPerChild: 1, maxResultBytes: 4096,
+  };
+  const cap = createEffectiveChildCapability(capabilityInput({
+    allowedTools: ["read", "grep", "ls", "broker_request_child", "broker_cancel_child"], delegation,
+  }));
+  const compiled = compileEffectiveChildCapability(cap);
+  assert.ok(compiled.authorizationPolicy.allowedTools.has("broker_request_child"));
+  assert.match(compiled.promptRules, /delegation: read_only_canary depth=1\/2/);
+  assert.throws(() => createEffectiveChildCapability(capabilityInput({ delegation: { ...delegation, depth: 2 } })), /delegation grant is invalid/);
+  assert.notEqual(cap.capabilityFingerprint, createEffectiveChildCapability(capabilityInput({ delegation: { ...delegation, grantId: "grant-2" } })).capabilityFingerprint);
+});
+
 test("capability compiler generates prompt rules and authorization policy from one source", () => {
   const cap = createEffectiveChildCapability(capabilityInput());
   const { promptRules, authorizationPolicy } = compileEffectiveChildCapability(cap);

@@ -83,6 +83,7 @@ export class SingleHostBrokerSupervisor {
   #routeResolver;
   #checkpointStore;
   #defectRecorder;
+  #recursiveRequester;
   #verificationReceiptVerifier;
   #resourceRanker;
   #behavioralEnforcement;
@@ -113,6 +114,7 @@ export class SingleHostBrokerSupervisor {
     routeResolver,
     checkpointStore,
     defectRecorder,
+    recursiveRequester,
     verificationReceiptVerifier,
     resourceRanker,
     behavioralEnforcement = "unavailable",
@@ -160,6 +162,7 @@ export class SingleHostBrokerSupervisor {
     if (routeResolver && typeof routeResolver !== "function") throw new Error("Broker supervisor routeResolver must be a function");
     if (checkpointStore !== undefined && typeof checkpointStore.publish !== "function") throw new Error("Broker supervisor checkpointStore must publish checkpoints");
     if (defectRecorder !== undefined && typeof defectRecorder !== "function") throw new Error("Broker supervisor defectRecorder must be a function");
+    if (recursiveRequester !== undefined && typeof recursiveRequester !== "function") throw new Error("Broker supervisor recursiveRequester must be a function");
     if (verificationReceiptVerifier !== undefined && typeof verificationReceiptVerifier !== "function") {
       throw new Error("Broker supervisor verificationReceiptVerifier must be a function");
     }
@@ -171,6 +174,7 @@ export class SingleHostBrokerSupervisor {
     this.#routeResolver = routeResolver;
     this.#checkpointStore = checkpointStore;
     this.#defectRecorder = defectRecorder;
+    this.#recursiveRequester = recursiveRequester;
     this.#verificationReceiptVerifier = verificationReceiptVerifier;
     this.#resourceRanker = resourceRanker;
     // Effect-capable contracts are refused unless a blocking monitor is actually wired, so this
@@ -250,6 +254,7 @@ export class SingleHostBrokerSupervisor {
         ...(this.#providerTransport === undefined ? {} : { providerTransport: this.#providerTransport, routeResolver: this.#routeResolver }),
         ...(this.#checkpointStore === undefined ? {} : { checkpointStore: this.#checkpointStore }),
         ...(this.#defectRecorder === undefined ? {} : { defectRecorder: this.#defectRecorder }),
+        ...(this.#recursiveRequester === undefined ? {} : { recursiveRequester: this.#recursiveRequester }),
       });
       await this.#server.start();
       // SQLite may create WAL/SHM beside the DB. The owner-only directory is

@@ -98,6 +98,7 @@ import {
 import { planUnreadNotice, seedNotifiedUnread } from "../src/unread-notice.mjs";
 import { buildFleetProjection, fleetSummary, formatFleetDetails, formatFleetWidget } from "../src/fleet-view.mjs";
 import { normalizeContract, renderRoleFraming, resolveContract } from "../src/child-contract.mjs";
+import { RecursiveAdmissionStore, normalizeRecursivePolicy } from "../src/recursive-admission.mjs";
 
 const EXTENSIONS_DIR = dirname(fileURLToPath(import.meta.url));
 const CHILD_SHIM_PATH = join(EXTENSIONS_DIR, "child-shim.ts");
@@ -139,6 +140,16 @@ const ROLE = Type.Object({
   boundaries: Type.Optional(Type.Array(Type.String({ maxLength: 300 }), { maxItems: 10 })),
 }, { description: "Framing only. A role shapes how the child works; it never grants tools, authority or effect capability." });
 const observedCount = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+const RECURSION_POLICY = Type.Object({
+  mode: Type.Optional(StringEnum(["production", "depth2_readonly_canary"] as const)),
+  maxDepth: Type.Optional(Type.Integer({ minimum: 1, maximum: 2 })),
+  maxDirectChildren: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+  maxDescendants: Type.Optional(Type.Integer({ minimum: 1, maximum: 256 })),
+  maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
+  maxRedundant: Type.Optional(Type.Integer({ minimum: 0, maximum: 64 })),
+  maxAttempts: Type.Optional(Type.Integer({ minimum: 1, maximum: 256 })),
+  deadlineAt: Type.Optional(Type.Integer({ minimum: 1 })),
+});
 const ACCEPTANCE_CHECK = Type.Object({
   id: Type.String(),
   claim: Type.String(),
@@ -156,6 +167,7 @@ const WORKFLOW_NODE = Type.Object({
   purpose: Type.Optional(StringEnum(["specialist", "sectioning", "ensemble", "reviewer", "adjudication", "integrator"] as const)),
   materialDifference: Type.Optional(StringEnum(["provider_diversity", "adversarial_method", "separate_evidence_source", "reviewer_independence", "different_scope"] as const)),
   acceptance: Type.Optional(Type.Array(ACCEPTANCE_CHECK, { minItems: 1, maxItems: 20 })),
+  recursion: Type.Optional(RECURSION_POLICY),
   admission: Type.Optional(Type.Object({
     objective: Type.Optional(Type.String({ maxLength: 262144 })),
     scope: Type.Optional(Type.String({ maxLength: 16384 })),
@@ -272,6 +284,7 @@ interface BrokerRuntime {
   currency: () => Record<string, any>;
   checkpointStore: any;
   defectStore: any;
+  recursiveStore: any;
 }
 
 function formatPreferences(tier: string) {
@@ -421,7 +434,7 @@ function liveProviderCatalog(ctx: any, supplementalModels: any[] = []) {
   return modelRegistryToProviderCatalog(merged, { authorizedProviders: activeAuthorizedProviders(auth) });
 }
 
-async function startBroker(ctx: any, getSupplementalModels: () => any[]): Promise<BrokerRuntime> {
+async function startBroker(ctx: any, getSupplementalModels: () => any[], recursiveRequester?: (event: any) => any): Promise<BrokerRuntime> {
   if (!existsSync(PREFERENCES_PATH)) writeModelPreferences(PREFERENCES_PATH, DEFAULT_MODEL_PREFERENCES);
   else {
     const normalized = loadModelPreferences(PREFERENCES_PATH);
@@ -448,6 +461,11 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[]): Promis
   const evidenceStore = new ControllerEvidenceStore({ root: join(STATE_DIR, "verification-evidence") });
   const checkpointStore = new CheckpointStore({ root: CHECKPOINTS_DIR });
   const defectStore = new DefectStore({ root: DEFECTS_DIR });
+  const recursiveStore = new RecursiveAdmissionStore({
+    path: join(STATE_DIR, "recursive.sqlite"),
+    canaryEnabled: readJson(join(STATE_DIR, "recursion.json")).depth2ReadOnlyCanary === true,
+  });
+  recursiveStore.reconcile();
   const verificationAuthority = new ControllerVerificationAuthority({ evidenceStore });
   const supervisor = new SingleHostBrokerSupervisor({
     stateDir: STATE_DIR,
@@ -456,6 +474,7 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[]): Promis
     verificationReceiptVerifier: (receipt: any, binding: any) => verificationAuthority.verify(receipt, binding),
     checkpointStore,
     defectRecorder: (defect: any) => defectStore.capture(defect),
+    ...(recursiveRequester ? { recursiveRequester: (event: any) => recursiveRequester({ ...event, store: recursiveStore }) } : {}),
     // Every child is launched with the attested behavioral enforcement extension, which is what
     // makes effect-capable contracts admissible at all.
     behavioralEnforcement: "blocking_monitor",
@@ -601,6 +620,7 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[]): Promis
     currency,
     checkpointStore,
     defectStore,
+    recursiveStore,
   };
 }
 
@@ -620,6 +640,7 @@ export default function piDelegationBroker(pi: any) {
     promise: Promise<any>;
     deadlineTimer?: ReturnType<typeof setTimeout>;
   }>();
+  const recursiveContexts = new Map<string, any>();
   const activeWorkflows = new Map<string, {
     controller: AbortController;
     nodeIds: Set<string>;
@@ -1024,8 +1045,16 @@ export default function piDelegationBroker(pi: any) {
         // mean "this session", and an unhonourable contract must fail loudly rather than run cheap.
         const contract = resolveContract(initial.contract, ctx ?? lastCtx);
         const roleFraming = renderRoleFraming(contract.role);
+        const canaryEnabled = readJson(join(STATE_DIR, "recursion.json")).depth2ReadOnlyCanary === true;
+        const recursionPolicy = initial.recursion?.mode === "depth2_readonly_canary" && canaryEnabled
+          && (initial.recursion.depth ?? 1) < (initial.recursion.maxDepth ?? 2)
+          ? { ...initial.recursion, rootId: initial.recursion.rootId ?? taskId, parentTaskId: taskId, depth: initial.recursion.depth ?? 1 }
+          : undefined;
+        const recursion = recursionPolicy ? { ...recursionPolicy, ctx, cwd: initial.cwd } : undefined;
+        if (recursion) recursiveContexts.set(taskId, recursion);
         result = await broker.runner.run({
           childId: taskId,
+          ...(initial.recursion?.maxAttempts ? { maxAttempts: initial.recursion.maxAttempts } : {}),
           promptDigest: createHash("sha256").update(initial.task).digest("hex"),
           trackForVerification: Boolean(initial.acceptance?.length),
           cwd: initial.cwd,
@@ -1038,6 +1067,7 @@ export default function piDelegationBroker(pi: any) {
             logicalId: taskId, rootId: taskId, kind: "task",
             role: contract.role?.name ?? "worker",
           },
+          ...(recursionPolicy ? { recursion: { mode: "depth2_readonly_canary", context: recursionPolicy } } : {}),
           capabilityRequest: {
             taskId,
             taskDescription: initial.task,
@@ -1050,6 +1080,7 @@ export default function piDelegationBroker(pi: any) {
         result = { status: "failed", error: (error as Error).message, route: [] };
       } finally {
         broker?.acceptancePlans.delete(taskId);
+        recursiveContexts.delete(taskId);
       }
 
       const durable = readJob(JOBS_DIR, taskId);
@@ -1064,6 +1095,7 @@ export default function piDelegationBroker(pi: any) {
       };
       if (durable?.status === "cancellation_requested" || reason === "cancel") {
         preserveArtifact();
+        if (initial.recursion?.rootId) runtime?.recursiveStore?.cancelDescendants(initial.recursion.rootId, taskId);
         return settleTaskWithoutChildResult(taskId, initial, "cancelled", "cancelled by controller");
       }
       if (reason === "deadline" || (initial.deadlineAt !== undefined && Date.now() >= initial.deadlineAt)) {
@@ -1098,6 +1130,9 @@ export default function piDelegationBroker(pi: any) {
           policyGeneration: result.selection?.policyGeneration ?? job.policyGeneration,
         };
       });
+      if (initial.recursion?.rootId && terminal) {
+        runtime?.recursiveStore?.settle(taskId, terminal.status === "completed" ? "completed" : terminal.status === "cancelled" ? "cancelled" : "failed");
+      }
       rememberFleetJob(terminal);
       const terminalReport = readReport(REPORTS_DIR, taskId);
       if (terminalReport) rememberFleetReport(terminalReport);
@@ -1147,6 +1182,11 @@ export default function piDelegationBroker(pi: any) {
         const task = workflowInputPrompt(node);
         const childId = `${workflowId}-${node.id}`;
         nodeIds.add(childId);
+        const canaryEnabled = readJson(join(STATE_DIR, "recursion.json")).depth2ReadOnlyCanary === true;
+        const recursionPolicy = node.recursion?.mode === "depth2_readonly_canary" && canaryEnabled
+          ? { ...node.recursion, rootId: node.recursion.rootId ?? workflowId, parentTaskId: childId, depth: node.recursion.depth ?? 1 }
+          : undefined;
+        if (recursionPolicy) recursiveContexts.set(childId, { ...recursionPolicy, ctx, cwd: initial.cwd });
         onUpdate?.({ content: [{ type: "text", text: `Running workflow stage ${node.id}…` }] });
         const startedAt = Date.now();
         let result: any;
@@ -1166,6 +1206,7 @@ export default function piDelegationBroker(pi: any) {
               workflowId, nodeId: node.id, kind: "workflow_node",
               role: nodeContract.role?.name ?? "worker",
             },
+            ...(recursionPolicy ? { recursion: { mode: "depth2_readonly_canary", context: recursionPolicy } } : {}),
             capabilityRequest: workflowObserveCapabilityRequest({ ...node, task }, childId),
             trackForVerification: Boolean(node.acceptance?.length),
           });
@@ -1173,6 +1214,7 @@ export default function piDelegationBroker(pi: any) {
           result = { status: "failed", error: (error as Error).message, route: [] };
         } finally {
           broker.acceptancePlans.delete(childId);
+          recursiveContexts.delete(childId);
           nodeIds.delete(childId);
         }
         return persistDelegationReport(broker, childId, task, startedAt, result, false, `${workflowId}/${node.id}`);
@@ -1248,6 +1290,73 @@ export default function piDelegationBroker(pi: any) {
     return promise;
   };
 
+  const handleRecursiveRequest = async ({ action, lease, params, store, signal }: any) => {
+    if (signal?.aborted) return { status: "cancelled", reason: "request_cancelled" };
+    const leaseTaskId = typeof lease?.taskId === "string" ? lease.taskId.replace(/-r[0-9]+$/, "") : "";
+    const parent = recursiveContexts.get(leaseTaskId);
+    if (!parent || parent.parentTaskId !== leaseTaskId || parent.depth !== 1 || parent.mode !== "depth2_readonly_canary") {
+      return { status: "denied", reason: "current_recursive_attempt_not_found" };
+    }
+    if (action === "cancelChild") {
+      const childJobId = typeof params?.childJobId === "string" ? params.childJobId : "";
+      const child = store.job(childJobId);
+      if (!child || child.rootId !== parent.rootId || child.parentTaskId !== leaseTaskId) return { status: "denied", reason: "child_is_not_owned_by_requester" };
+      const cancelled = store.cancelDescendants(parent.rootId, childJobId);
+      const active = activeTasks.get(childJobId);
+      active?.controller.abort("cancel");
+      return { ...cancelled, childJobId };
+    }
+    const policy = normalizeRecursivePolicy({ ...parent, mode: "depth2_readonly_canary" }, { canaryEnabled: true });
+    store.registerRoot({ rootId: parent.rootId, policy });
+    const admitted = store.admit({
+      rootId: parent.rootId,
+      parentTaskId: leaseTaskId,
+      parentDepth: parent.depth,
+      request: { ...params, rootId: parent.rootId, parentTaskId: leaseTaskId, depth: parent.depth + 1, maxDepth: policy.maxDepth },
+      idempotencyKey: params?.idempotencyKey,
+    });
+    if (admitted.status !== "admitted") return admitted;
+    if (readJob(JOBS_DIR, admitted.jobId)) return { ...admitted, status: "reused" };
+    const submittedAt = Date.now();
+    const recursion = {
+      ...policy,
+      rootId: parent.rootId,
+      parentTaskId: leaseTaskId,
+      depth: admitted.depth,
+    };
+    const job = {
+      schemaVersion: 1,
+      jobId: admitted.jobId,
+      kind: "task",
+      status: "queued",
+      cwd: parent.cwd,
+      task: admitted.request.task,
+      contract: normalizeContract({ thinking: "auto", route: "auto" }),
+      recursion,
+      submittedAt,
+      updatedAt: submittedAt,
+      policyGeneration: "recursive-canary",
+      idempotencyKey: `recursive:${parent.rootId}:${params.idempotencyKey}`,
+    };
+    try {
+      submitJob(JOBS_DIR, job);
+      store.start(admitted.jobId);
+      const abortDescendant = () => {
+        store.cancelDescendants(parent.rootId, admitted.jobId);
+        void Promise.resolve(runtime?.runner?.abort(admitted.jobId)).catch(() => undefined);
+      };
+      signal?.addEventListener?.("abort", abortDescendant, { once: true });
+      let result;
+      try { result = await runtime?.runner?.withYieldedCapacity?.(leaseTaskId, () => startTask(admitted.jobId, parent.ctx), signal); }
+      finally { signal?.removeEventListener?.("abort", abortDescendant); }
+      if (!result) throw new Error("recursive parent has no runnable capacity permit");
+      return { status: result.status === "completed" ? "completed" : result.status, childTaskId: admitted.jobId, rootId: parent.rootId, depth: admitted.depth, ...(result.status === "completed" ? { text: String(result.text ?? "").slice(0, 256 * 1024) } : {}) };
+    } catch (error) {
+      store.settle(admitted.jobId, "failed");
+      return { status: "failed", reason: String((error as Error).message).slice(0, 1000) };
+    }
+  };
+
   const pauseActiveTasks = async () => {
     const active = [...activeTasks.entries()];
     for (const [taskId, task] of active) {
@@ -1278,6 +1387,7 @@ export default function piDelegationBroker(pi: any) {
     current.stopCurrencyRefresh();
     await current.runner.dispose().catch(() => undefined);
     await current.supervisor.stop().catch(() => undefined);
+    current.recursiveStore?.close?.();
   };
 
   const ensureBroker = (ctx: any = lastCtx): Promise<BrokerRuntime> => {
@@ -1285,7 +1395,7 @@ export default function piDelegationBroker(pi: any) {
     if (!ctx) return Promise.reject(new Error("delegation broker has no active Pi context"));
     if (!starting) {
       const generation = startGeneration;
-      starting = startBroker(ctx, () => supplementalModels)
+      starting = startBroker(ctx, () => supplementalModels, handleRecursiveRequest)
         .then(async (started) => {
           if (generation !== startGeneration) {
             await disposeRuntime(started);
@@ -1851,6 +1961,7 @@ export default function piDelegationBroker(pi: any) {
       const job = requestJobCancellation(JOBS_DIR, params.id);
       if (!job) return { content: [{ type: "text", text: `No delegation job ${params.id}.` }], isError: true };
       rememberFleetJob(job);
+      if (job.recursion?.rootId) runtime?.recursiveStore?.cancelDescendants(job.recursion.rootId, params.id);
       const activeTask = activeTasks.get(params.id);
       if (activeTask && !isTerminalJobStatus(job.status)) {
         activeTask.controller.abort("cancel");

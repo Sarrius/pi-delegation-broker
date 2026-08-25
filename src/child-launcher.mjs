@@ -339,6 +339,7 @@ export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPi
     schema: spec.schema,
     toolReportPath,
     effectCapable: launchPolicy?.authorizationPolicy?.effectCapable === true,
+    ...(launchPolicy?.recursion ? { recursion: launchPolicy.recursion } : {}),
   }), { mode: 0o600 });
 
   const env = launchPolicy?.environment
@@ -399,7 +400,7 @@ const SAFE_INHERITED_ENVIRONMENT = [
 ];
 
 const ALLOWED_POLICY_ENVIRONMENT = new Set([
-  "PI_BROKER_SOCKET", "PI_BROKER_LEASE_ID", "PI_BROKER_FENCING_TOKEN", "PI_BROKER_CAPABILITY",
+  "PI_BROKER_SOCKET", "PI_BROKER_LEASE_ID", "PI_BROKER_FENCING_TOKEN", "PI_BROKER_CAPABILITY", "PI_BROKER_RECURSION",
   // Leased hard output cap; the shim clamps the provider payload with it.
   "PI_BROKER_MAX_OUTPUT_TOKENS",
   // Non-secret model identity used only by the explicit controller IPC proxy provider.

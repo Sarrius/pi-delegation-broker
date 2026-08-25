@@ -21,7 +21,7 @@ const STREAM_ALREADY_WRITTEN = Symbol("broker_stream_already_written");
 const CHILD_METHODS = new Set([
   "heartbeat", "release", "providerAttempt", "providerStream",
   "getEffectiveChildCapability", "declareBehavioralAction", "authorizeBehavioralAction", "observeBehavioralResult",
-  "publishCheckpoint",
+  "publishCheckpoint", "requestChild", "cancelChild",
 ]);
 const CONTROLLER_METHODS = new Set([
   "reserve", "submit", "dispatchPending", "pendingTasks", "queueWaitMetrics", "readyTasks", "claimReadyTask", "trackLeasedTask", "abandonClaimedTask", "releaseClaimedTaskForVerification", "finalizeVerifiedTask", "reschedulePending", "finishPending",
@@ -64,12 +64,13 @@ export class BrokerIpcServer {
   #routeResolver;
   #checkpointStore;
   #defectRecorder;
+  #recursiveRequester;
   #server;
   #connections = new Set();
   #controllerEpoch = randomUUID();
   #behavioralMonitors = new Map();
 
-  constructor({ broker, socketPath, controllerToken = randomBytes(32).toString("base64url"), fakeProvider, providerTransport, routeResolver, checkpointStore, defectRecorder }) {
+  constructor({ broker, socketPath, controllerToken = randomBytes(32).toString("base64url"), fakeProvider, providerTransport, routeResolver, checkpointStore, defectRecorder, recursiveRequester }) {
     if (!broker || !socketPath) throw new Error("Broker IPC server needs broker and socketPath");
     if ((providerTransport && !routeResolver) || (!providerTransport && routeResolver)) {
       throw new Error("real provider transport requires both providerTransport and routeResolver");
@@ -79,6 +80,7 @@ export class BrokerIpcServer {
     if (routeResolver && typeof routeResolver !== "function") throw new Error("routeResolver must be a function");
     if (checkpointStore !== undefined && typeof checkpointStore.publish !== "function") throw new Error("checkpointStore must publish checkpoints");
     if (defectRecorder !== undefined && typeof defectRecorder !== "function") throw new Error("defectRecorder must be a function");
+    if (recursiveRequester !== undefined && typeof recursiveRequester !== "function") throw new Error("recursiveRequester must be a function");
     this.#broker = broker;
     this.#socketPath = socketPath;
     this.#controllerToken = controllerToken;
@@ -87,6 +89,7 @@ export class BrokerIpcServer {
     this.#routeResolver = routeResolver;
     this.#checkpointStore = checkpointStore;
     this.#defectRecorder = defectRecorder;
+    this.#recursiveRequester = recursiveRequester;
     this.#server = createServer((socket) => {
       this.#connections.add(socket);
       socket.once("close", () => this.#connections.delete(socket));
@@ -248,6 +251,12 @@ export class BrokerIpcServer {
     if (method === "authorizeBehavioralAction") return this.#authorizeBehavioralAction(capability.lease, params, now);
     if (method === "observeBehavioralResult") return this.#observeBehavioralResult(capability.lease, params, now);
     if (method === "publishCheckpoint") return this.#publishCheckpoint(capability.lease, params, now);
+    if (method === "requestChild" || method === "cancelChild") {
+      if (!this.#recursiveRequester) throw new Error("recursive_request_unavailable");
+      const effective = this.#broker.effectiveChildCapabilityForLease?.(capability.lease.leaseId, capability.lease.fencingToken, now);
+      if (effective?.status !== "bound" || !effective.capability?.delegation) throw new Error("recursive_grant_required");
+      return this.#recursiveRequester({ action: method, lease: capability.lease, capability: effective.capability, params, now, signal });
+    }
     if (method === "providerStream") return this.#providerStream(capability.lease, params, signal, socket, request.id);
     return this.#providerAttempt(capability.lease, params.inputDigest, signal);
   }
