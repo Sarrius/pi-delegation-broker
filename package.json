@@ -28,7 +28,7 @@
     "node": ">=26.0.0"
   },
   "scripts": {
-    "check": "node --check src/*.mjs && node --check test/*.mjs && node scripts/check-public-tree.mjs",
+    "check": "node --check src/*.mjs && node --check test/*.mjs && node scripts/check-public-tree.mjs && node scripts/check-tracked-privacy.mjs",
     "test": "node --test test/*.test.mjs",
     "pack:check": "node scripts/check-package.mjs",
     "install:check": "node scripts/check-installed-package.mjs",
