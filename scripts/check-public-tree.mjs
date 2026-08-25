@@ -15,6 +15,12 @@ const secretPatterns = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /CANARY_SECRET_[A-Za-z0-9_-]+/,
 ];
+const personalPatterns = [
+  /@gmail\.com/i,
+  new RegExp(["vitalij", "simko"].join(""), "i"),
+  new RegExp(["jrnl", "drive"].join(""), "i"),
+  /\/Users\/(?!example|runner|shared)[A-Za-z]/,
+];
 
 function files(path) {
   const stat = statSync(path);
@@ -28,6 +34,9 @@ for (const relative of publicRoots) {
     const text = readFileSync(file, "utf8");
     if (secretPatterns.some((pattern) => pattern.test(text))) {
       throw new Error(`Potential secret marker found in publishable file: ${file}`);
+    }
+    if (personalPatterns.some((pattern) => pattern.test(text))) {
+      throw new Error(`Personal identifier found in publishable file: ${file}`);
     }
   }
 }

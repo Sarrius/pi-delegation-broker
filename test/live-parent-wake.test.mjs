@@ -40,7 +40,7 @@ test("live: terminal background task starts an automatic parent turn", { skip: !
     writeFileSync(join(brokerState, "enabled.json"), '{"enabled":true}\n', { mode: 0o600 });
     writeFileSync(join(agent, "settings.json"), `${JSON.stringify({
       packages: [
-        "/Users/example/.pi/dev/pi-multi-account",
+        process.env.PI_MULTI_ACCOUNT_PATH || join(ROOT, "..", "pi-multi-account"),
         ROOT,
       ],
       quietStartup: true,

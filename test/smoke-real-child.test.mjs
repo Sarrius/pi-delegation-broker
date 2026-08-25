@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,21 @@ const CONTROLLER_TOKEN = "s".repeat(48);
 const SHIM_PATH = new URL("../extensions/child-shim.ts", import.meta.url).pathname;
 const PARENT_AGENT_DIR = join(homedir(), ".pi", "agent");
 
+function skipRealChildSmoke() {
+  if (process.env.CI || process.env.GITHUB_ACTIONS) return "CI has no live child credentials";
+  const authPath = join(PARENT_AGENT_DIR, "auth.json");
+  if (!existsSync(authPath)) return "no live Pi agent dir";
+  try {
+    const auth = JSON.parse(readFileSync(authPath, "utf8"));
+    if (!auth || typeof auth !== "object" || Array.isArray(auth) || !Object.hasOwn(auth, "openai-codex")) {
+      return "openai-codex is not configured";
+    }
+  } catch {
+    return "live auth is unreadable";
+  }
+  return false;
+}
+
 function signedSupervisor(root, registry = fixtureRegistry()) {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const now = Date.now();
@@ -31,7 +46,7 @@ function signedSupervisor(root, registry = fixtureRegistry()) {
   });
 }
 
-test("smoke: spawn a real Pi child through the broker and close it cleanly", async () => {
+test("smoke: spawn a real Pi child through the broker and close it cleanly", { skip: skipRealChildSmoke() }, async () => {
   const root = mkdtempSync(join(tmpdir(), "smoke-"));
   let supervisor;
   try {

@@ -2,7 +2,7 @@
 
 ## Context
 
-Repository: `/Users/example/.pi/research/delegation-doctrine/publication/pi-delegation-broker`
+Repository: `pi-delegation-broker`
 
 This is a Pi delegation broker — a control plane that spawns isolated Pi child agents for subtasks. The broker owns leases, capacity, credentials, routing, and verification. Children receive only scoped capabilities and cannot select their own model, provider, account, or credentials.
 
@@ -138,7 +138,6 @@ Add `test/model-selector.test.mjs` with cases:
 ### Verification
 
 ```sh
-cd /Users/example/.pi/research/delegation-doctrine/publication/pi-delegation-broker
 npm run release:check
 ```
 
