@@ -41,6 +41,21 @@ test("semaphore abort cancels a queued acquire without granting a slot", async (
   assert.equal(sem.running, 0);
 });
 
+test("a runnable permit yields only scheduling capacity and reacquires with priority", async () => {
+  const sem = new Semaphore(1);
+  const parent = await sem.acquire();
+  let childRan = false;
+  await parent.withYieldedCapacity(undefined, async () => {
+    const child = await sem.acquire();
+    childRan = true;
+    child();
+  });
+  assert.equal(childRan, true);
+  assert.equal(sem.running, 1);
+  parent();
+  assert.equal(sem.running, 0);
+});
+
 test("semaphore resize admits queued waiters when capacity increases", async () => {
   const sem = new Semaphore(1);
   const r1 = await sem.acquire();

@@ -122,6 +122,15 @@ export class BrokeredLaunchResolver {
   async resolve(request) {
     if (!request || !CHILD_ID.test(request.childId ?? "")) throw new Error("Broker launch request has an invalid childId");
     if (this.#admissions.has(request.childId)) return { action: "deny", reason: "duplicate child admission" };
+    const recursion = request.recursion;
+    if (recursion !== undefined) {
+      const context = recursion?.context;
+      if (recursion?.mode !== "depth2_readonly_canary" || !context || context.maxDepth !== 2
+        || typeof context.rootId !== "string" || typeof context.parentTaskId !== "string"
+        || !Number.isSafeInteger(context.depth) || context.depth !== 1) {
+        return { action: "deny", reason: "recursive launch policy denied" };
+      }
+    }
 
     // A full capacity group is not "no compatible resource". The selector's first allow-list
     // is often one account (Cursor); a teammate already holding that slot must land elsewhere.
@@ -229,13 +238,26 @@ export class BrokeredLaunchResolver {
       const childModel = this.#controllerProxy && resolvedModel?.modelId
         ? Object.freeze({ provider: this.#controllerProxy.providerId, modelId: resolvedModel.modelId })
         : resolvedModel;
+      const baseAllowedTools = selection.contract.allowedTools ?? deriveAllowedTools(selection.contract.operationClass);
+      const delegation = recursion ? {
+        mode: "read_only_canary",
+        grantId: lease.leaseId,
+        rootTaskId: recursion.context.rootId,
+        parentTaskId: recursion.context.parentTaskId,
+        depth: recursion.context.depth,
+        maxDepth: recursion.context.maxDepth,
+        maxChildren: recursion.context.maxDirectChildren,
+        maxParallel: recursion.context.maxParallel,
+        maxAttemptsPerChild: recursion.context.maxAttempts ?? 1,
+        maxResultBytes: 256 * 1024,
+      } : undefined;
       const capability = createEffectiveChildCapability({
         schemaVersion: 1,
         taskId: lease.taskId,
         operationClass: selection.contract.operationClass,
         admissionClass: selection.contract.admissionClass,
         doneWhen: selection.contract.doneWhen,
-        allowedTools: selection.contract.allowedTools ?? deriveAllowedTools(selection.contract.operationClass),
+        allowedTools: Object.freeze([...new Set([...baseAllowedTools, ...(delegation ? ["broker_request_child", "broker_cancel_child"] : [])])]),
         profileSupports: selection.contract.capability.required,
         budget: {
           ...(lease.maxOutputTokens !== undefined ? { maxOutputTokens: lease.maxOutputTokens } : {}),
@@ -247,6 +269,7 @@ export class BrokeredLaunchResolver {
         promptDigest: selection.contract.promptDigest,
         behavioralEnforcement: lease.behavioralEnforcement,
         downgradePolicy: selection.contract.capability.downgradePolicy,
+        ...(delegation ? { delegation } : {}),
       });
       const compiled = compileEffectiveChildCapability(capability);
       const launcherAttestation = this.#launcherAttestationConfig === undefined ? undefined : createLauncherAttestation({
@@ -302,13 +325,15 @@ export class BrokeredLaunchResolver {
             : Object.freeze(launcherAttestation.extensions.map((extension) => extension.path)),
           ...(launcherAttestation === undefined ? {} : {
             launcherAttestation,
-            requiredActiveTools: ["broker_declare_action"],
+            requiredActiveTools: ["broker_declare_action", ...(delegation ? ["broker_request_child"] : [])],
           }),
+          ...(recursion ? { recursion: Object.freeze({ ...recursion.context }) } : {}),
           environment: {
             PI_BROKER_SOCKET: this.#socketPath,
             PI_BROKER_LEASE_ID: lease.leaseId,
             PI_BROKER_FENCING_TOKEN: String(lease.fencingToken),
             PI_BROKER_CAPABILITY: issued.capability,
+            ...(recursion ? { PI_BROKER_RECURSION: recursion.mode } : {}),
             // Pi's CLI has no max-tokens flag, so the leased hard output cap has to reach the
             // child's provider request itself; without it a child asks for the model maximum
             // and a low-balance account rejects the whole attempt.

@@ -19,6 +19,7 @@ import {
 
 const DECLARATION_TOOL = "broker_declare_action";
 const CHECKPOINT_TOOL = "broker_checkpoint";
+const RECURSIVE_TOOLS = new Set(["broker_request_child", "broker_cancel_child"]);
 const MAX_RESULT_BYTES = 128 * 1024;
 
 type ControllerCapability = {
@@ -178,7 +179,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event) => {
-    if (event.toolName === DECLARATION_TOOL || event.toolName === CHECKPOINT_TOOL) return undefined;
+    if (event.toolName === DECLARATION_TOOL || event.toolName === CHECKPOINT_TOOL || RECURSIVE_TOOLS.has(event.toolName)) return undefined;
     if (!runtime || runtime.failed) return failClosed(runtime?.failed ?? "broker behavioral monitor was not initialized");
     const pending = runtime.pending;
     if (!pending && isImplicitlyDeclaredObserveTool(event.toolName)) {

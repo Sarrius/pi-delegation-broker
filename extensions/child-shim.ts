@@ -11,8 +11,20 @@
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { Type } from "typebox";
 import { applyProposedPatch } from "../src/proposed-patch.mjs";
+import { requestChildIpc } from "../src/child-ipc-client.mjs";
 
 const SHIM_SPEC_ENV = "PI_SUBAGENT_SHIM_SPEC";
+
+interface RecursiveContext {
+  rootId: string;
+  parentTaskId: string;
+  depth: number;
+  maxDepth: number;
+  maxDirectChildren: number;
+  maxDescendants: number;
+  maxParallel: number;
+  maxRedundant: number;
+}
 
 interface ShimSpec {
   schema?: Record<string, unknown>;
@@ -20,6 +32,7 @@ interface ShimSpec {
   // The launcher derives this from the signed controller capability; the shim never trusts a
   // model's prompt to decide whether it should expose a mutation surface.
   effectCapable?: boolean;
+  recursion?: RecursiveContext;
 }
 
 function readShimSpec(path: string): ShimSpec {
@@ -79,6 +92,32 @@ export default function childShim(pi: any): void {
           content: [{ type: "text", text: `Patch applied in the isolated worktree for: ${result.changed.join(", ")}.` }],
           details: { changed: result.changed },
         };
+      },
+    });
+  }
+  if (spec.recursion?.maxDepth === 2 && process.env.PI_BROKER_RECURSION === "depth2_readonly_canary") {
+    const context = spec.recursion;
+    pi.registerTool({
+      name: "broker_request_child",
+      label: "Request read-only child",
+      description: "Ask the controller to admit one bounded read-only descendant; the controller owns lineage, budgets, routing and cancellation.",
+      parameters: Type.Object({
+        task: Type.String({ minLength: 1, maxLength: 262144 }),
+        idempotencyKey: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+      }, { additionalProperties: false }),
+      async execute(_id: string, params: Record<string, unknown>, signal: AbortSignal) {
+        const result = await requestChildIpc("requestChild", { ...params, idempotencyKey: params.idempotencyKey ?? _id, ...context }, { signal });
+        return { content: [{ type: "text", text: `Controller descendant result: ${String((result as any)?.status ?? "unknown")}.` }], details: result };
+      },
+    });
+    pi.registerTool({
+      name: "broker_cancel_child",
+      label: "Cancel own child",
+      description: "Request controller cancellation for a descendant admitted by this child.",
+      parameters: Type.Object({ childJobId: Type.String({ minLength: 1, maxLength: 200 }) }, { additionalProperties: false }),
+      async execute(_id: string, params: { childJobId: string }, signal: AbortSignal) {
+        const result = await requestChildIpc("cancelChild", { ...params, ...context }, { signal });
+        return { content: [{ type: "text", text: `Controller cancellation result: ${String((result as any)?.status ?? "unknown")}.` }], details: result };
       },
     });
   }

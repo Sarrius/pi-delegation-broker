@@ -32,7 +32,7 @@ export function canonicalDeclaredToolName(toolName, allowedTools) {
 }
 const CAPABILITY_FIELDS = [
   "schemaVersion", "taskId", "operationClass", "admissionClass", "doneWhen",
-  "allowedTools", "profileSupports", "budget", "latencyBudgetMs", "leaseTtlMs",
+  "allowedTools", "profileSupports", "budget", "latencyBudgetMs", "leaseTtlMs", "delegation",
   "promptDigest", "behavioralEnforcement", "downgradePolicy",
 ];
 
@@ -104,10 +104,28 @@ export function createEffectiveChildCapability(input) {
     promptDigest: typeof input.promptDigest === "string" && HEX64.test(input.promptDigest) ? input.promptDigest : (() => { throw new Error("promptDigest must be a SHA-256 hex digest"); })(),
     behavioralEnforcement: input.behavioralEnforcement === "unavailable" || input.behavioralEnforcement === "blocking_monitor" ? input.behavioralEnforcement : (() => { throw new Error("behavioralEnforcement must be unavailable or blocking_monitor"); })(),
     downgradePolicy: input.downgradePolicy === "forbid" ? input.downgradePolicy : (() => { throw new Error("only forbid downgrade policy is implemented"); })(),
+    ...(validateDelegation(input.delegation) ? { delegation: validateDelegation(input.delegation) } : {}),
   };
   const captured = captureLosslessJson(cap);
   const capabilityFingerprint = createHash("sha256").update(captured.canonical).digest("hex");
   return Object.freeze({ ...captured.value, capabilityFingerprint });
+}
+
+function validateDelegation(value) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("delegation must be an object");
+  const keys = Object.keys(value).sort();
+  const expected = ["depth", "grantId", "maxAttemptsPerChild", "maxChildren", "maxDepth", "maxParallel", "maxResultBytes", "mode", "parentTaskId", "rootTaskId"];
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) throw new Error("delegation has unsupported or missing fields");
+  if (value.mode !== "read_only_canary" || typeof value.grantId !== "string" || !TOOL_NAME.test(value.grantId)
+    || typeof value.rootTaskId !== "string" || !TOOL_NAME.test(value.rootTaskId)
+    || typeof value.parentTaskId !== "string" || !TOOL_NAME.test(value.parentTaskId)
+    || value.depth !== 1 || value.maxDepth !== 2
+    || !Number.isSafeInteger(value.maxChildren) || value.maxChildren < 1 || value.maxChildren > 4
+    || !Number.isSafeInteger(value.maxParallel) || value.maxParallel < 1 || value.maxParallel > 4
+    || !Number.isSafeInteger(value.maxAttemptsPerChild) || value.maxAttemptsPerChild < 1 || value.maxAttemptsPerChild > 4
+    || !Number.isSafeInteger(value.maxResultBytes) || value.maxResultBytes < 1 || value.maxResultBytes > 256 * 1024) throw new Error("delegation grant is invalid");
+  return Object.freeze({ ...value });
 }
 
 function validateBudget(budget) {
@@ -159,6 +177,7 @@ export function compileEffectiveChildCapability(cap) {
     `operation_class: ${cap.operationClass}`,
     `admission_class: ${cap.admissionClass}`,
     `allowed_tools: ${cap.allowedTools.join(", ")}`,
+    ...(cap.delegation ? [`delegation: read_only_canary depth=${cap.delegation.depth}/${cap.delegation.maxDepth} children=${cap.delegation.maxChildren}`] : []),
     "Invoke tools by the names above, never the mcp_pi_ prefix.",
     "Invoke read-only observe tools directly; the broker declares and authorizes those read-only actions automatically.",
     ...(effectTools.length > 0 ? [

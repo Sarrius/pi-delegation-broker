@@ -89,6 +89,7 @@ export class BrokeredChildRunner {
   #checkpointStore;
   #defectRecorder;
   #handles = new Map();
+  #permits = new Map();
   #admissions = new Map();
   #inflightSpawns = new Map();
   #activeRuns = new Set();
@@ -500,7 +501,7 @@ export class BrokeredChildRunner {
     finally { this.#inflightSpawns.delete(promise); }
   }
 
-  async #spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, attempts = 1, deferClosePolicy = false, roleFraming, skills }) {
+  async #spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, recursion, attempts = 1, deferClosePolicy = false, roleFraming, skills }) {
     if (this.#disposed) throw new Error("BrokeredChildRunner is disposed");
     if (this.#handles.has(childId)) throw new Error(`Duplicate child id: ${childId}`);
     if (!Number.isSafeInteger(attempts) || attempts < 1) throw new Error("brokered child attempt count must be a positive safe integer");
@@ -511,6 +512,7 @@ export class BrokeredChildRunner {
     let release;
     try { release = await this.#semaphore.acquire(admission.signal); }
     finally { this.#admissions.delete(admission); }
+    this.#permits.set(childId, release);
 
     try {
       if (this.#disposed) throw new Error("BrokeredChildRunner disposed before launch");
@@ -525,6 +527,7 @@ export class BrokeredChildRunner {
         // whatever it selected — so a caller cannot smuggle in an unapproved model either way.
         ...(model ? { model: { provider: model.provider, modelId: model.modelId, thinkingLevel: thinkingLevel ?? "off" } } : {}),
         ...(capabilityRequest ? { capabilityRequest } : {}),
+        ...(recursion ? { recursion } : {}),
         ...(tools ? { requestedTools: tools } : {}),
         ...(excludeTools ? { excludedTools: excludeTools } : {}),
       });
@@ -622,6 +625,7 @@ export class BrokeredChildRunner {
       handle.result = resultPromise;
       return handle;
     } catch (error) {
+      this.#permits.delete(childId);
       release();
       throw error;
     }
@@ -746,6 +750,7 @@ export class BrokeredChildRunner {
         catch { /* health recovery is best effort; the verified child result still stands */ }
       }
       handle.release();
+      this.#permits.delete(handle.id);
       await session.dispose().catch(() => undefined);
       // Consumption is the measure the controller can actually observe, so it travels with the
       // close event: the verifier turns it into a routing observation once a receipt exists.
@@ -781,6 +786,14 @@ export class BrokeredChildRunner {
     }
   }
 
+  async withYieldedCapacity(childId, fn, signal) {
+    if (this.#disposed) throw new Error("BrokeredChildRunner is disposed");
+    if (typeof fn !== "function") throw new Error("withYieldedCapacity requires a callback");
+    const permit = this.#permits.get(childId) ?? [...this.#permits.entries()].find(([id]) => id.replace(/-r[0-9]+$/, "") === childId)?.[1];
+    if (!permit?.withYieldedCapacity) throw new Error("no runnable permit is bound to this child");
+    return permit.withYieldedCapacity(signal, fn);
+  }
+
   async abort(childId) {
     // Only a live run may be flagged. Recording an abort for a finished id would leak entries
     // for the session and could pre-kill a later legitimate run that reuses the same id.
@@ -800,6 +813,7 @@ export class BrokeredChildRunner {
     this.#disposed = true;
     for (const admission of this.#admissions.keys()) admission.abort("runner disposed");
     this.#admissions.clear();
+    this.#permits.clear();
     // A launch already past admission can still register a handle after this point, so drain
     // in-flight spawns and newly registered handles until neither remains.
     for (let pass = 0; pass < 8; pass += 1) {

@@ -125,6 +125,8 @@ export { BrokeredChildRunner, classifyChildFailure } from "./brokered-runner.mjs
 export { spawnBrokeredChild, disposeBrokeredChildProcesses } from "./child-launcher.mjs";
 export { Semaphore } from "./semaphore.mjs";
 export { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionError } from "./worktree.mjs";
+export { RecursiveAdmissionStore, normalizeRecursivePolicy } from "./recursive-admission.mjs";
+export { requestChildIpc } from "./child-ipc-client.mjs";
 export {
   applyAcceptedProposal,
   applyIntegrationToTarget,

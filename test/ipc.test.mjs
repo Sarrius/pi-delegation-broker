@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteLeaseBroker, fixtureContract, fixtureRegistry } from "../src/broker.mjs";
 import { BrokerIpcServer, requestBrokerIpc } from "../src/ipc.mjs";
+import { createEffectiveChildCapability, deriveAllowedTools } from "../src/capability-compiler.mjs";
 import { ScriptedFakeProvider } from "../src/fake-provider.mjs";
 
 function createServer() {
@@ -107,6 +108,42 @@ test("IPC gives child only a lease-scoped capability, not controller authority",
     broker.close();
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("child recursive IPC is lease-scoped and controller-callback owned", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "delegation-broker-ipc-recursive-"));
+  const broker = new SqliteLeaseBroker({ path: join(directory, "broker.sqlite"), registry: fixtureRegistry() });
+  const calls = [];
+  const server = new BrokerIpcServer({
+    broker,
+    socketPath: join(directory, "broker.sock"),
+    recursiveRequester: async (event) => {
+      calls.push({ action: event.action, taskId: event.lease.taskId, params: event.params });
+      return { status: "admitted", jobId: "desc-test" };
+    },
+  });
+  await server.start();
+  try {
+    const { reservation, issued } = await reserveCapability(server, "recursive-parent");
+    const capability = createEffectiveChildCapability({
+      schemaVersion: 1, taskId: "recursive-parent", operationClass: "observe", admissionClass: "control",
+      doneWhen: ["return evidence"], allowedTools: [...deriveAllowedTools("observe"), "broker_request_child", "broker_cancel_child"],
+      profileSupports: ["code_reasoning", "repo_navigation"], budget: { maxInputTokens: 1000, maxOutputTokens: 100, enforcement: { input: "hard", output: "hard" } },
+      latencyBudgetMs: 120000, leaseTtlMs: 30000, promptDigest: "a".repeat(64), behavioralEnforcement: "unavailable", downgradePolicy: "forbid",
+      delegation: { mode: "read_only_canary", grantId: reservation.lease.leaseId, rootTaskId: "root", parentTaskId: "recursive-parent", depth: 1, maxDepth: 2, maxChildren: 1, maxParallel: 1, maxAttemptsPerChild: 1, maxResultBytes: 4096 },
+    });
+    const bound = await requestBrokerIpc({ socketPath: server.socketPath, authorization: server.controllerToken, method: "bindEffectiveChildCapability", params: { leaseId: reservation.lease.leaseId, fencingToken: reservation.lease.fencingToken, capability } });
+    assert.equal(bound.status, "bound");
+    const result = await requestBrokerIpc({
+      socketPath: server.socketPath,
+      authorization: issued.capability,
+      method: "requestChild",
+      params: { rootId: "root", parentTaskId: "recursive-parent", depth: 1, task: "read-only" },
+    });
+    assert.deepEqual(result, { status: "admitted", jobId: "desc-test" });
+    assert.deepEqual(calls[0], { action: "requestChild", taskId: "recursive-parent", params: { rootId: "root", parentTaskId: "recursive-parent", depth: 1, task: "read-only" } });
+    await assert.rejects(() => requestBrokerIpc({ socketPath: server.socketPath, authorization: "wrong", method: "requestChild", params: {} }), /unauthorized/);
+  } finally { await server.stop(); broker.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("IPC without an explicitly supplied provider transport fails closed", async () => {
