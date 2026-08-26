@@ -18,7 +18,16 @@ import {
 const ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$/;
 const TIER = new Set(["cheap", "standard", "frontier"]);
+const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,511}$/;
 function fail(message) { throw new Error(`task orchestrator: ${message}`); }
+function ownerSession(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !SESSION_ID.test(value)) fail("ownerSessionId is invalid");
+  return value;
+}
+function requireOwner(job, requested) {
+  if (job.ownerSessionId !== undefined && requested !== job.ownerSessionId) fail("workflow owner session does not match");
+}
 function oneLine(value, max = 500) {
   if (typeof value !== "string" || !value.trim()) return undefined;
   const text = value.replace(/\s+/g, " ").trim();
@@ -129,9 +138,10 @@ function normalizeNodes(nodes, { knownIds = [] } = {}) {
   return normalized;
 }
 
-export function appendWorkflowNodes(root, jobId, nodes, { joins = [], proposalId, expectedRevision, proposalDigest, now = () => Date.now() } = {}) {
+export function appendWorkflowNodes(root, jobId, nodes, { joins = [], proposalId, expectedRevision, proposalDigest, ownerSessionId, now = () => Date.now() } = {}) {
   const current = readJob(root, jobId);
   if (!current || current.kind !== "workflow") fail("workflow does not exist");
+  requireOwner(current, ownerSession(ownerSessionId));
   if (isTerminalJobStatus(current.status)) fail("cannot append to a terminal workflow");
   if (!current.team?.dynamic || current.team.acceptingAppends !== true || current.team.sealed === true) fail("workflow is not accepting dynamic appends");
   if (current.status !== "queued" && current.status !== "running") fail("workflow is not running");
@@ -193,8 +203,9 @@ export function appendWorkflowNodes(root, jobId, nodes, { joins = [], proposalId
   });
 }
 
-export function closeWorkflow(root, jobId, expectedRevision, now = () => Date.now()) {
+export function closeWorkflow(root, jobId, expectedRevision, now = () => Date.now(), ownerSessionId) {
   const updated = updateJob(root, jobId, (job) => {
+    requireOwner(job, ownerSession(ownerSessionId));
     if (!job.team?.dynamic) fail("workflow is not dynamic");
     if (isTerminalJobStatus(job.status)) return job;
     if (expectedRevision !== undefined && expectedRevision !== job.team.revision) fail(`workflow revision conflict: expected ${expectedRevision}, current ${job.team.revision}`);
@@ -206,8 +217,8 @@ export function closeWorkflow(root, jobId, expectedRevision, now = () => Date.no
 
 /** Durable read-only dependency scheduler. Model routing and verification remain controller-owned. */
 export class TaskOrchestrator {
-  #root; #jobId; #run; #concurrency; #now;
-  constructor({ root, jobId, path, run, concurrency = 4, now = () => Date.now() } = {}) {
+  #root; #jobId; #run; #concurrency; #now; #verifyControllerResult;
+  constructor({ root, jobId, path, run, concurrency = 4, now = () => Date.now(), verifyControllerResult } = {}) {
     if (path !== undefined) {
       if (typeof path !== "string" || !isAbsolute(path) || !path.endsWith(".json")) fail("path must be an absolute json path");
       root = dirname(path);
@@ -218,11 +229,13 @@ export class TaskOrchestrator {
     if (typeof run !== "function") fail("run must be a function");
     if (!Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 64) fail("concurrency must be 1..64");
     if (typeof now !== "function") fail("now must be a function");
-    this.#root = root; this.#jobId = jobId; this.#run = run; this.#concurrency = concurrency; this.#now = now;
+    if (verifyControllerResult !== undefined && typeof verifyControllerResult !== "function") fail("verifyControllerResult must be a function");
+    this.#root = root; this.#jobId = jobId; this.#run = run; this.#concurrency = concurrency; this.#now = now; this.#verifyControllerResult = verifyControllerResult;
   }
 
   initialize(nodes, metadata = {}) {
     const submittedAt = metadata.submittedAt ?? this.#now();
+    const ownerSessionId = ownerSession(metadata.ownerSessionId);
     const normalizedNodes = normalizeNodes(nodes);
     let team = normalizeTeamMetadata({
       jobId: this.#jobId,
@@ -246,6 +259,7 @@ export class TaskOrchestrator {
       kind: "workflow",
       status: "queued",
       cwd: metadata.cwd ?? process.cwd(),
+      ...(ownerSessionId === undefined ? {} : { ownerSessionId }),
       concurrency: this.#concurrency,
       nodes: admitted.added,
       team,
@@ -264,7 +278,7 @@ export class TaskOrchestrator {
     return appendWorkflowNodes(this.#root, this.#jobId, nodes, options);
   }
 
-  close() { return closeWorkflow(this.#root, this.#jobId); }
+  close(expectedRevision, ownerSessionId) { return closeWorkflow(this.#root, this.#jobId, expectedRevision, this.#now, ownerSessionId); }
 
   async execute({ signal } = {}) {
     let state = this.state();
@@ -413,7 +427,7 @@ export class TaskOrchestrator {
         const promise = launch(ready.shift()).finally(() => running.delete(promise));
         running.add(promise);
       }
-      if (state.team) state.team = { ...state.team, joinStates: evaluateTeamJoins(state.team.joins, state.nodes) };
+      if (state.team) state.team = { ...state.team, joinStates: evaluateTeamJoins(state.team.joins, state.nodes, { verifyControllerResult: this.#verifyControllerResult }) };
       persist();
       if (!running.size) {
         const current = this.state();
@@ -451,7 +465,7 @@ export class TaskOrchestrator {
     }
 
     const incomplete = state.nodes.filter((node) => node.state !== "completed");
-    const joinStates = state.team ? evaluateTeamJoins(state.team.joins, state.nodes) : [];
+    const joinStates = state.team ? evaluateTeamJoins(state.team.joins, state.nodes, { verifyControllerResult: this.#verifyControllerResult }) : [];
     if (state.team) state.team = { ...state.team, joinStates };
     const unresolvedJoins = joinStates.filter((join) => join.status !== "accepted");
     state.status = incomplete.length || unresolvedJoins.length ? "failed" : "completed";

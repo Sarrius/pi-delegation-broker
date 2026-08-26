@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { readJob, requestJobCancellation } from "../src/delegation-job-store.mjs";
-import { TaskOrchestrator, formatWorkflowSummary, workflowObserveCapabilityRequest } from "../src/workflow-scheduler.mjs";
+import { appendWorkflowNodes, closeWorkflow, TaskOrchestrator, formatWorkflowSummary, workflowObserveCapabilityRequest } from "../src/workflow-scheduler.mjs";
 
 test("workflow stages stay read-only even when their prompt says do not modify files", () => {
   const request = workflowObserveCapabilityRequest({
@@ -187,6 +187,17 @@ test("workflow acceptance stores only fixed controller checks and rejects argv i
     const { job } = o.initialize([{ id: "check", task: "verify", acceptance: [{ id: "npm-test" }] }]);
     assert.deepEqual(job.nodes[0].acceptance, [{ id: "npm-test", timeoutMs: 30_000 }]);
     assert.throws(() => o.initialize([{ id: "bad", task: "verify", acceptance: [{ id: "npm-test", argv: ["true"] }] }]), /unsupported or missing fields/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("workflow mutation requires the durable owner session binding", () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-owner-"));
+  try {
+    const o = new TaskOrchestrator({ root, jobId: "workflow-owner", run: async () => ({ status: "completed" }) });
+    o.initialize([{ id: "one", task: "one" }], { ownerSessionId: "session-a", dynamic: true, acceptingAppends: true });
+    assert.throws(() => appendWorkflowNodes(root, "workflow-owner", [{ id: "two", task: "two" }], { ownerSessionId: "session-b" }), /owner session/);
+    assert.throws(() => closeWorkflow(root, "workflow-owner", undefined, Date.now, "session-b"), /owner session/);
+    assert.doesNotThrow(() => appendWorkflowNodes(root, "workflow-owner", [{ id: "two", task: "two" }], { ownerSessionId: "session-a" }));
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

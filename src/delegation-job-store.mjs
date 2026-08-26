@@ -6,6 +6,7 @@ import { assertStoredContract } from "./child-contract.mjs";
 import { validateTeamState } from "./team.mjs";
 
 const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/;
+const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,511}$/;
 const JOB_KINDS = new Set(["task", "workflow"]);
 const JOB_STATUSES = new Set([
   "submitted", "queued", "running", "cancellation_requested", "completed", "failed", "cancelled", "expired",
@@ -39,6 +40,7 @@ function validate(job) {
     fail("idempotencyKey is invalid");
   }
   if (typeof job.cwd !== "string" || job.cwd.length < 1 || job.cwd.length > 4096 || /\0/.test(job.cwd)) fail("cwd is invalid");
+  if (job.ownerSessionId !== undefined && (typeof job.ownerSessionId !== "string" || !SESSION_ID.test(job.ownerSessionId))) fail("ownerSessionId is invalid");
   if (job.kind === "task" && (typeof job.task !== "string" || job.task.length < 1 || job.task.length > 256 * 1024)) fail("task text is invalid");
   // The contract is durable intent: a malformed one must not survive a restart and silently
   // resolve into different spending than the caller asked for. Node contracts are the same
@@ -122,8 +124,9 @@ export function updateJob(root, jobId, update, now = Date.now()) {
   return writeJob(root, { ...next, updatedAt: now });
 }
 
-export function requestJobCancellation(root, jobId, now = Date.now()) {
+export function requestJobCancellation(root, jobId, now = Date.now(), ownerSessionId) {
   return updateJob(root, jobId, (job) => {
+    if (job.ownerSessionId !== undefined && ownerSessionId !== job.ownerSessionId) fail("job owner session does not match");
     if (TERMINAL.has(job.status)) return job;
     return { ...job, status: "cancellation_requested", cancelRequestedAt: now };
   }, now);

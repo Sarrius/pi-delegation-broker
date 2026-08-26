@@ -239,28 +239,31 @@ export function admitTeamNodes(existingNodes, incomingNodes, { budgets, appendCo
   });
 }
 
-function nodeDisposition(node) {
+function nodeDisposition(node, verifyControllerResult) {
   if (!node || !["completed", "failed", "blocked"].includes(node.state)) return "pending";
   if (node.state !== "completed") return "rejected";
   const result = node.result ?? {};
   const status = result.semanticStatus ?? result.acceptanceStatus ?? result.verificationStatus
     ?? result.verification?.outcome?.status ?? result.artifact?.status;
-  if (status === "accepted" || status === "semantically_accepted" || status === "completed") return "accepted";
+  if (status === "accepted" || status === "semantically_accepted" || status === "completed") {
+    if (typeof verifyControllerResult !== "function" || verifyControllerResult(node) !== true) return "produced";
+    return "accepted";
+  }
   return "produced";
 }
 
-export function evaluateTeamJoin(join, nodes) {
+export function evaluateTeamJoin(join, nodes, { verifyControllerResult } = {}) {
   const normalized = normalizeTeamJoin(join);
   const byId = new Map((nodes ?? []).map((node) => [node.id, node]));
   const ids = [...normalized.members, ...(normalized.reviewerId ? [normalized.reviewerId] : []), ...(normalized.adjudicatorId ? [normalized.adjudicatorId] : [])];
   const missing = ids.filter((id) => !byId.has(id));
   if (missing.length) return Object.freeze({ id: normalized.id, kind: normalized.kind, policy: normalized.policy, status: "blocked", reason: "unknown_members", missing });
-  const members = normalized.members.map((id) => ({ id, disposition: nodeDisposition(byId.get(id)) }));
+  const members = normalized.members.map((id) => ({ id, disposition: nodeDisposition(byId.get(id), verifyControllerResult) }));
   const rejected = members.filter((entry) => entry.disposition === "rejected");
   if (rejected.length) return Object.freeze({ id: normalized.id, kind: normalized.kind, policy: normalized.policy, status: "rejected", rejected: rejected.map((entry) => entry.id) });
   const pending = members.filter((entry) => entry.disposition === "pending" || entry.disposition === "produced");
   if (normalized.kind === "reviewer") {
-    const reviewer = nodeDisposition(byId.get(normalized.reviewerId));
+    const reviewer = nodeDisposition(byId.get(normalized.reviewerId), verifyControllerResult);
     if (reviewer === "rejected") return Object.freeze({ id: normalized.id, kind: normalized.kind, policy: normalized.policy, status: "rejected", rejected: [normalized.reviewerId] });
     if (pending.length || reviewer === "pending" || reviewer === "produced") return Object.freeze({ id: normalized.id, kind: normalized.kind, policy: normalized.policy, status: "pending" });
     return Object.freeze({ id: normalized.id, kind: normalized.kind, policy: normalized.policy, status: "accepted", acceptedArtifacts: normalized.members, reviewerId: normalized.reviewerId });
@@ -276,8 +279,8 @@ export function evaluateTeamJoin(join, nodes) {
   return Object.freeze({ id: normalized.id, kind: normalized.kind, policy: normalized.policy, status: "accepted", acceptedArtifacts: normalized.members });
 }
 
-export function evaluateTeamJoins(joins, nodes) {
-  return Object.freeze((joins ?? []).map((join) => evaluateTeamJoin(join, nodes)));
+export function evaluateTeamJoins(joins, nodes, options = {}) {
+  return Object.freeze((joins ?? []).map((join) => evaluateTeamJoin(join, nodes, options)));
 }
 
 export function validateTeamState(team, nodes = []) {

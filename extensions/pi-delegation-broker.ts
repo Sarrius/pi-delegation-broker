@@ -292,6 +292,7 @@ interface BrokerRuntime {
   checkpointStore: any;
   defectStore: any;
   recursiveStore: any;
+  verificationAuthority: any;
 }
 
 function formatPreferences(tier: string) {
@@ -661,6 +662,7 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     checkpointStore,
     defectStore,
     recursiveStore,
+    verificationAuthority,
   };
 }
 
@@ -909,6 +911,12 @@ export default function piDelegationBroker(pi: any) {
       })) : [],
       reportTaskId: childId,
       ...(result.verification?.outcome?.status === "completed" ? { semanticStatus: "accepted", acceptanceStatus: "accepted" } : {}),
+      ...(result.verification?.verification && result.verification?.binding ? {
+        controllerVerification: {
+          receipt: result.verification.verification,
+          binding: result.verification.binding,
+        },
+      } : {}),
       ...(result.selection?.policyGeneration ? { policyGeneration: result.selection.policyGeneration } : {}),
       ...(result.selection?.billingPool ? { billingPool: result.selection.billingPool } : {}),
       ...(result.selection?.freshness ? { freshness: result.selection.freshness } : {}),
@@ -1215,6 +1223,13 @@ export default function piDelegationBroker(pi: any) {
       root: JOBS_DIR,
       jobId: workflowId,
       concurrency: initial.concurrency,
+      verifyControllerResult: (node: any) => {
+        const proof = node?.result?.controllerVerification;
+        return Boolean(node?.result?.status === "completed"
+          && proof?.receipt?.status === "accepted"
+          && proof?.binding
+          && runtime?.verificationAuthority?.verify?.(proof.receipt, proof.binding) === true);
+      },
       run: async (node: any) => {
         if (controller.signal.aborted) throw new Error("workflow paused before node dispatch");
         const broker = await ensureBroker(ctx);
@@ -1751,6 +1766,7 @@ export default function piDelegationBroker(pi: any) {
             // must re-resolve "inherit" against the session that actually runs it.
             contract: submittedContract,
             cwd: ctx.cwd,
+            ownerSessionId: currentSessionId(ctx),
             submittedAt,
             updatedAt: submittedAt,
             idempotencyKey: params.idempotencyKey ?? `tool:${toolCallId}`,
@@ -2008,8 +2024,8 @@ export default function piDelegationBroker(pi: any) {
     label: "Cancel delegation",
     description: "Request durable cancellation of a read-only background task or workflow. Repeating cancellation is safe.",
     parameters: Type.Object({ id: Type.String({ description: "Task or workflow id." }), reason: Type.Optional(Type.String({ maxLength: 500 })) }),
-    async execute(_toolCallId: string, params: { id: string; reason?: string }) {
-      const job = requestJobCancellation(JOBS_DIR, params.id);
+    async execute(_toolCallId: string, params: { id: string; reason?: string }, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      const job = requestJobCancellation(JOBS_DIR, params.id, Date.now(), currentSessionId(ctx));
       if (!job) return { content: [{ type: "text", text: `No delegation job ${params.id}.` }], isError: true };
       rememberFleetJob(job);
       if (job.recursion?.rootId) runtime?.recursiveStore?.cancelDescendants(job.recursion.rootId, params.id);
@@ -2063,6 +2079,7 @@ export default function piDelegationBroker(pi: any) {
       try {
         submission = orchestrator.initialize(params.nodes, {
           cwd: ctx.cwd,
+          ownerSessionId: currentSessionId(ctx),
           submittedAt,
           idempotencyKey: params.idempotencyKey ?? `tool:${toolCallId}`,
           dynamic: Boolean(params.dynamic),
@@ -2114,6 +2131,7 @@ export default function piDelegationBroker(pi: any) {
       try {
         const result = appendWorkflowNodes(JOBS_DIR, params.workflowId, params.nodes, {
           joins: params.joins ?? [],
+          ownerSessionId: currentSessionId(ctx),
           proposalId: params.proposalId,
           expectedRevision: params.expectedRevision,
           proposalDigest: params.proposalDigest,
@@ -2144,7 +2162,7 @@ export default function piDelegationBroker(pi: any) {
       if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
       lastCtx = ctx;
       try {
-        const job = closeWorkflow(JOBS_DIR, params.workflowId, params.expectedRevision);
+        const job = closeWorkflow(JOBS_DIR, params.workflowId, params.expectedRevision, Date.now, currentSessionId(ctx));
         rememberFleetJob(job);
         return { content: [{ type: "text", text: `Workflow ${params.workflowId} append window closed.` }], details: job };
       } catch (error) {

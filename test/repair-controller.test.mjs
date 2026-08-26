@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { generateKeyPairSync } from "node:crypto";
 import test from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CheckpointStore } from "../src/checkpoint-store.mjs";
 import { DefectStore } from "../src/defect-store.mjs";
+import { createHumanApproval, repairProposalDigest } from "../src/human-approval.mjs";
 import { RepairController, RepairStore } from "../src/repair-controller.mjs";
 
 function setup() {
@@ -56,6 +58,32 @@ test("validator/authority paths require a human gate and second-order proposals 
     assert.equal(gated.status, "human_review");
     release();
     assert.equal((await running).status, "verified");
+  } finally { rmSync(s.root, { recursive: true, force: true }); }
+});
+
+test("protected repairs require a signed, expiry-bound approval bound to the immutable proposal", async () => {
+  const s = setup();
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  try {
+    const controller = new RepairController({
+      defectStore: s.defects, checkpointStore: s.checkpoints, store: s.store,
+      humanApprovalPublicKey: publicKey,
+      verifyProposal: async () => ({ status: "passed" }),
+      freshProcessCanary: async () => ({ status: "passed" }),
+      reconcile: async () => ({ status: "reconciled" }),
+      resume: async () => undefined,
+    });
+    const proposal = controller.propose({ defectId: s.defect.defectId, rootId: "root", taskId: "task", summary: "repair acceptance", affectedPaths: ["src/acceptance-verifier.mjs"], tokenBudget: 100 });
+    assert.equal(proposal.status, "human_review");
+    assert.deepEqual(await controller.run(proposal.repairId), { status: "human_review", repairId: proposal.repairId });
+    const stored = s.store.read(proposal.repairId);
+    const approval = createHumanApproval({
+      privateKey, repairId: stored.repairId, defectId: stored.defectId, rootId: stored.rootId,
+      taskId: stored.taskId, proposalDigest: repairProposalDigest(stored), expiresAt: Date.now() + 10_000,
+    });
+    const tampered = { ...approval, proposalDigest: "0".repeat(64) };
+    assert.equal(controller.approve(proposal.repairId, tampered).status, "rejected");
+    assert.deepEqual(await controller.run(proposal.repairId, { approval }), { status: "verified", repairId: proposal.repairId });
   } finally { rmSync(s.root, { recursive: true, force: true }); }
 });
 
