@@ -9,9 +9,11 @@ import {
   ControllerLiveProviderApproval,
   ControllerRouteTable,
   createApprovedAnthropicProviderRoute,
+  createApprovedOpenAIProviderRoute,
   loadControllerRouteConfiguration,
 } from "../src/controller-provider-config.mjs";
 import { ANTHROPIC_MESSAGES_ADAPTER_ID } from "../src/anthropic-messages-transport.mjs";
+import { OPENAI_CHAT_COMPLETIONS_ADAPTER_ID } from "../src/openai-chat-completions-transport.mjs";
 import { fixtureContract, fixtureRegistry } from "../src/broker.mjs";
 import { requestBrokerIpc, streamProviderIpc } from "../src/ipc.mjs";
 import { SingleHostBrokerSupervisor } from "../src/supervisor.mjs";
@@ -173,5 +175,23 @@ test("controller route config rejects fallback-like ambiguity and secrets", () =
   assert.throws(() => new ControllerCredentialStore({ entries: [{ credentialRef: "bad", apiKey: "key", oauthAccess: "access" }] }), /exactly one supported/);
   assert.throws(() => new ControllerCredentialStore({ entries: [{ credentialRef: "bad", oauthAccess: "x\naccess" }] }), /oauthAccess/);
   assert.throws(() => table({ routes: routes({ endpoint: "https://key:secret@gateway.example/v1/messages" }) }), /credential-free/);
-  assert.throws(() => table({ routes: routes({ adapterId: "other" }) }), /approved Anthropic/);
+  assert.throws(() => table({ routes: routes({ adapterId: "other" }) }), /approved provider adapter/);
+  const loopback = table({ routes: routes({
+    resourceId: "C1", capacityGroup: "G-cheap", profile: "reasoning-high/v1", accountAlias: "cursor-a1",
+    provider: "cursor", model: "cursor-grok-4.6", apiDialect: "openai-completions",
+    endpointId: "cursor-local", endpoint: "http://127.0.0.1:52164/v1/chat/completions",
+    adapterId: OPENAI_CHAT_COMPLETIONS_ADAPTER_ID, credentialRef: "cursor-oauth", cacheRetention: "none",
+  }) });
+  const cursorCredentials = new ControllerCredentialStore({ entries: [{ credentialRef: "cursor-oauth", oauthAccess: "cursor-access-token" }] });
+  const cursorSnapshot = loopback.resolveForLease({ resourceId: "C1", capacityGroup: "G-cheap", profile: "reasoning-high/v1" }, cursorCredentials);
+  const cursorApproval = new ControllerLiveProviderApproval({ routeTableFingerprint: loopback.fingerprint, expiresAt: Date.now() + 10_000 });
+  const cursorPair = createApprovedOpenAIProviderRoute({
+    routeTable: loopback, credentialStore: cursorCredentials, liveApproval: cursorApproval,
+    fetchImpl: async (_url, options) => {
+      assert.equal(options.headers.authorization, "Bearer cursor-access-token");
+      return new Response("data: [DONE]\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  assert.equal(typeof cursorPair.providerTransport.stream, "function");
+  assert.equal(cursorSnapshot.apiDialect, "openai-completions");
 });

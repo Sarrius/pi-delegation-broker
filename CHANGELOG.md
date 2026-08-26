@@ -4,6 +4,7 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## Unreleased
 
+- **Cursor subscription routing is now supported by the controller proxy.** The controller keeps Cursor OAuth in memory, sends one bounded text-only request to the owner-run loopback bridge through a new OpenAI-compatible adapter, and the live canary completed without child credentials.
 - **Anthropic subscription OAuth is now supported by the controller proxy.** The controller accepts an exact current OAuth access token, sends Claude Code's Bearer/identity headers, never forwards a refresh token, and the owner can point the live canary at the existing provider entry in `auth.json`. Provider subscription-policy rejections are retained only as coarse, allowlisted classifications.
 - **External supervisor requirements are now explicit.** The package documents the launchd/systemd boundary, attestation-failure recovery and restart/reconciliation obligations; tmux/caffeinate are not represented as crash supervision.
 - **Workflow mutation is now bound to the owner session.** New task/workflow jobs persist the parent session identity; append, close and cancellation operations fail closed from another session, and workflow join acceptance requires a controller verification callback rather than trusting child semantic status.

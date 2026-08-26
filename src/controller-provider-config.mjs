@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { ANTHROPIC_MESSAGES_ADAPTER_ID, AnthropicMessagesTransport } from "./anthropic-messages-transport.mjs";
+import { OPENAI_CHAT_COMPLETIONS_ADAPTER_ID, OPENAI_CHAT_COMPLETIONS_DIALECT, OpenAIChatCompletionsTransport } from "./openai-chat-completions-transport.mjs";
 import { catalogToBrokerRegistry } from "./provider-catalog.mjs";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
@@ -9,6 +10,8 @@ const FINGERPRINT = /^[a-f0-9]{64}$/;
 const CACHE_RETENTION = new Set(["none", "short", "long"]);
 const ANTHROPIC_DIALECT = "anthropic-messages";
 const ANTHROPIC_ADAPTER = ANTHROPIC_MESSAGES_ADAPTER_ID;
+const OPENAI_DIALECT = OPENAI_CHAT_COMPLETIONS_DIALECT;
+const OPENAI_ADAPTER = OPENAI_CHAT_COMPLETIONS_ADAPTER_ID;
 
 function exactKeys(value, expected, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
@@ -54,14 +57,15 @@ function normalizeRoute(route) {
   if (route.reasoningEffort !== null && (typeof route.reasoningEffort !== "string" || !ID.test(route.reasoningEffort))) {
     throw new Error("controller route reasoningEffort is invalid");
   }
-  if (route.apiDialect !== ANTHROPIC_DIALECT || route.adapterId !== ANTHROPIC_ADAPTER) {
-    throw new Error("controller route is not an approved Anthropic Messages route");
-  }
+  const supportedAdapter = (route.apiDialect === ANTHROPIC_DIALECT && route.adapterId === ANTHROPIC_ADAPTER)
+    || (route.apiDialect === OPENAI_DIALECT && route.adapterId === OPENAI_ADAPTER);
+  if (!supportedAdapter) throw new Error("controller route is not an approved provider adapter route");
   if (!CACHE_RETENTION.has(route.cacheRetention)) throw new Error("controller route cacheRetention is invalid");
   let endpoint;
   try { endpoint = new URL(route.endpoint); } catch { throw new Error("controller route endpoint is invalid"); }
-  if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.hash || endpoint.search) {
-    throw new Error("controller route endpoint must be credential-free HTTPS without query or fragment");
+  const loopback = endpoint.hostname === "127.0.0.1" || endpoint.hostname === "localhost" || endpoint.hostname === "[::1]" || endpoint.hostname === "::1";
+  if ((endpoint.protocol !== "https:" && !(endpoint.protocol === "http:" && loopback)) || endpoint.username || endpoint.password || endpoint.hash || endpoint.search) {
+    throw new Error("controller route endpoint must be credential-free HTTPS or loopback HTTP without query or fragment");
   }
   return Object.freeze({ ...route, endpoint: endpoint.toString() });
 }
@@ -237,15 +241,15 @@ export class ControllerLiveProviderApproval {
 }
 
 /**
- * Construct the sole supported real provider injection. Authorization is
- * consumed before credential lookup/send, routes are exact, and no retry or
+ * Construct one approved real-provider injection. Authorization is consumed
+ * before credential lookup/send, routes are exact, and no retry or
  * account/model failover capability is exposed.
  */
-export function createApprovedAnthropicProviderRoute({ routeTable, credentialStore, liveApproval, fetchImpl, now } = {}) {
-  if (!(routeTable instanceof ControllerRouteTable)) throw new Error("approved Anthropic route requires a ControllerRouteTable");
-  if (!(credentialStore instanceof ControllerCredentialStore)) throw new Error("approved Anthropic route requires a ControllerCredentialStore");
-  if (!(liveApproval instanceof ControllerLiveProviderApproval)) throw new Error("approved Anthropic route requires a ControllerLiveProviderApproval");
-  const transport = new AnthropicMessagesTransport({
+function createApprovedProviderRoute({ routeTable, credentialStore, liveApproval, Transport, fetchImpl, now, label } = {}) {
+  if (!(routeTable instanceof ControllerRouteTable)) throw new Error(`approved ${label} route requires a ControllerRouteTable`);
+  if (!(credentialStore instanceof ControllerCredentialStore)) throw new Error(`approved ${label} route requires a ControllerCredentialStore`);
+  if (!(liveApproval instanceof ControllerLiveProviderApproval)) throw new Error(`approved ${label} route requires a ControllerLiveProviderApproval`);
+  const transport = new Transport({
     credentialResolver: async (snapshot) => routeTable.credentialFor(snapshot, credentialStore),
     endpointResolver: async (snapshot) => routeTable.endpointFor(snapshot),
     ...(fetchImpl === undefined ? {} : { fetchImpl }),
@@ -260,6 +264,14 @@ export function createApprovedAnthropicProviderRoute({ routeTable, credentialSto
     }),
     routeResolver: async (lease) => routeTable.resolveForLease(lease, credentialStore),
   });
+}
+
+export function createApprovedAnthropicProviderRoute(options = {}) {
+  return createApprovedProviderRoute({ ...options, Transport: AnthropicMessagesTransport, label: "Anthropic" });
+}
+
+export function createApprovedOpenAIProviderRoute(options = {}) {
+  return createApprovedProviderRoute({ ...options, Transport: OpenAIChatCompletionsTransport, label: "OpenAI-compatible" });
 }
 
 /**
