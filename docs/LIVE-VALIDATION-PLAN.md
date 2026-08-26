@@ -1,10 +1,10 @@
 # Owner-gated live validation plan
 
-**Status:** pre-registered procedure only. This repository has made no live provider request and this document is not approval to make one.
+**Status:** pre-registered procedure with owner-authorized canary evidence. The Anthropic subscription arm was rejected by Anthropic's extra-usage policy; the Cursor subscription arm completed successfully through the controller proxy. This document is not standing approval for future requests.
 
 ## Preconditions
 
-All conditions must be true before the controller constructs `createApprovedAnthropicProviderRoute` with a non-test credential:
+All conditions must be true before the controller constructs any approved provider route with a non-test credential:
 
 1. A reviewed first-party trusted launcher API (or accepted upstream replacement for the local patch) proves final behavioral-hook attestation. Effect-capable contracts remain denied until then.
 2. A signed registry identifies the one approved resource/profile/capacity group. The route table maps that same resource to one account/model/endpoint and opaque credential reference; its route-table fingerprint is recorded.
@@ -12,7 +12,7 @@ All conditions must be true before the controller constructs `createApprovedAnth
 4. The owner supplies a one-request `ControllerLiveProviderApproval` expiring within the pre-registered window. The controller records approval ID, route-table fingerprint and wall-clock bounds without recording a secret.
 5. The task is non-effectful/read-only, bounded by a lease, controller budget, known prompt digest, fixed verifier plan and a named recovery owner/deadline.
 
-The credentialless Pi-child canary harness is `test/live-controller-proxy-child.test.mjs`. It remains skipped unless the owner explicitly sets `LIVE_PROVIDER_TEST=1`, `LIVE_PROXY_CANARY_APPROVED=1`, and `LIVE_CONTROLLER_CREDENTIAL_FILE` to an existing owner-only file. The file may contain a raw API key, a single credential JSON object (`{"type":"oauth","access":"..."}` or `{"type":"api_key","key":"..."}`), or the owner-only Pi `auth.json`; for the latter, `LIVE_CONTROLLER_CREDENTIAL_PROVIDER` selects the exact provider and defaults to `anthropic`. Only the selected access/key value is injected into the in-memory `ControllerCredentialStore`; it is never passed to the child, route config, CLI arguments, or evidence. Anthropic OAuth requests use Bearer auth plus the Claude Code identity headers, including `oauth-2025-04-20`; refresh tokens are ignored. `LIVE_ANTHROPIC_MODEL` may select a currently listed model (default: `claude-haiku-4-5`), and `LIVE_ANTHROPIC_ENDPOINT` may select the endpoint (default: `https://api.anthropic.com/v1/messages`). This harness is still prohibited until preconditions 1–5 are independently approved.
+The credentialless Pi-child canary harnesses are `test/live-controller-proxy-child.test.mjs` (Anthropic Messages) and `test/live-cursor-controller-proxy-child.test.mjs` (Cursor's OpenAI-compatible loopback bridge). Both remain skipped unless the owner explicitly sets `LIVE_PROVIDER_TEST=1`, `LIVE_PROXY_CANARY_APPROVED=1`, and `LIVE_CONTROLLER_CREDENTIAL_FILE` to an existing owner-only file. The file may contain a raw API key, a single credential JSON object (`{"type":"oauth","access":"..."}` or `{"type":"api_key","key":"..."}`), or the owner-only Pi `auth.json`; for the latter, `LIVE_CONTROLLER_CREDENTIAL_PROVIDER` selects the exact provider. Only the selected access/key value is injected into the in-memory `ControllerCredentialStore`; it is never passed to the child, route config, CLI arguments, or evidence. Anthropic OAuth requests use Bearer auth plus Claude Code identity headers, including `oauth-2025-04-20`; Cursor OAuth is sent as Bearer auth to the owner-run loopback bridge; refresh tokens are ignored. `LIVE_ANTHROPIC_MODEL`/`LIVE_CURSOR_MODEL` select the model, while `LIVE_ANTHROPIC_ENDPOINT`/`LIVE_CURSOR_ENDPOINT` select the exact endpoint. The Cursor endpoint must be an owner-run loopback adapter. These harnesses remain prohibited until preconditions 1–5 are independently approved for each new run.
 
 ## Adversarial gate sequence
 

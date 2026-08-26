@@ -36,6 +36,7 @@ export {
   ControllerLiveProviderApproval,
   ControllerRouteTable,
   createApprovedAnthropicProviderRoute,
+  createApprovedOpenAIProviderRoute,
   loadControllerRouteConfiguration,
 } from "./controller-provider-config.mjs";
 export {
@@ -45,6 +46,13 @@ export {
   AnthropicMessagesTransportError,
   buildAnthropicMessagesRequest,
 } from "./anthropic-messages-transport.mjs";
+export {
+  OPENAI_CHAT_COMPLETIONS_ADAPTER_ID,
+  OPENAI_CHAT_COMPLETIONS_DIALECT,
+  OpenAIChatCompletionsTransport,
+  OpenAIChatCompletionsTransportError,
+  buildOpenAIChatCompletionsRequest,
+} from "./openai-chat-completions-transport.mjs";
 export { RoutingBoard } from "./routing-board.mjs";
 export { RoutingAuditJournal } from "./routing-audit-journal.mjs";
 export { ControllerVerifiedRoutingBoard } from "./verified-routing-board.mjs";
