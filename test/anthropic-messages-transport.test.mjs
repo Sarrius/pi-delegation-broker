@@ -152,12 +152,13 @@ test("Anthropic OAuth credentials use Claude Code bearer headers and identity", 
   assert.equal(events.at(-1).outcome, "succeeded_terminal");
   assert.equal(observed.options.headers.authorization, "Bearer sk-ant-oat-test-access");
   assert.equal(observed.options.headers["x-api-key"], undefined);
-  assert.equal(observed.options.headers["anthropic-beta"], "claude-code-20250219,oauth-2025-04-20");
+  assert.equal(observed.options.headers["anthropic-beta"], "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14");
   assert.equal(observed.options.headers["anthropic-dangerous-direct-browser-access"], "true");
   assert.equal(observed.options.headers["user-agent"], "claude-cli/2.1.75");
   assert.equal(observed.options.headers["x-app"], "cli");
   assert.equal(observed.body.system[0].text, "You are Claude Code, Anthropic's official CLI for Claude.");
   assert.equal(observed.body.system[1].text, "You are a careful coding agent.");
+  assert.deepEqual(observed.body.thinking, { type: "disabled" });
 });
 
 test("unsupported controller credential shapes fail closed before dispatch", async () => {
@@ -237,10 +238,12 @@ test("provider errors classify auth, quota, context, and unknown 4xx without lea
     { status: 400, body: { error: { type: "invalid_request_error", message: "prompt is too long" } }, outcome: "context_window_exceeded" },
     { status: 400, body: { error: { type: "invalid_request_error", message: "credit balance exhausted" } }, outcome: "quota_fatal" },
     { status: 422, body: { error: { type: "invalid_request_error", message: "bad input" } }, outcome: "rejected_before_send" },
+    { status: 400, body: { error: { type: "invalid_request_error", message: "Third-party apps now draw from your extra usage, not your plan limits." } }, outcome: "rejected_before_send", providerReason: "subscription_extra_usage_required" },
   ];
   for (const item of cases) {
     const events = await collect(adapter({ fetchImpl: async () => new Response(JSON.stringify(item.body), { status: item.status }) }));
     assert.equal(events.at(-1).outcome, item.outcome);
+    if (item.providerReason) assert.equal(events.at(-1).payload.providerReason, item.providerReason);
     assert.equal(JSON.stringify(events).includes("do not expose"), false);
   }
 });

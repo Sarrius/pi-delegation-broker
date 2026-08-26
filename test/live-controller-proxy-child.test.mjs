@@ -131,6 +131,7 @@ test("owner-gated live canary keeps provider credentials in the controller proxy
       selectContract: createSelectContract({
         registry, availability: () => supervisor.inventory(),
         currency: () => buildCurrencyMap({ resources: [{ provider: "anthropic", modelId: CANARY_MODEL }] }),
+        constraints: { budget: { maxInputTokens: 32_000, maxOutputTokens: 1_024 } },
       }),
     });
     const runner = new BrokeredChildRunner({ resolver, sessionsRoot: join(root, "sessions") });

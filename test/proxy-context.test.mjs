@@ -29,5 +29,6 @@ test("proxy terminal mapping never converts an unknown/failed provider terminal 
   assert.equal(proxyTerminalError({ payload: { outcome: "succeeded_terminal" } }), undefined);
   assert.equal(proxyTerminalError({ payload: { outcome: "rate_limited" } }), "controller provider terminal: rate_limited");
   assert.equal(proxyTerminalError({ payload: { outcome: "rejected_before_send", httpStatus: 400 } }), "controller provider terminal: rejected_before_send (400)");
+  assert.equal(proxyTerminalError({ payload: { outcome: "rejected_before_send", httpStatus: 400, providerReason: "invalid_model" } }), "controller provider terminal: rejected_before_send (400, invalid_model)");
   assert.equal(proxyTerminalError({ payload: { outcome: "bad value" } }), "controller provider returned an invalid terminal");
 });
