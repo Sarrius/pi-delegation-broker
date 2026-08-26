@@ -139,6 +139,37 @@ test("transport resolves exactly one named credential and makes exactly one raw 
   });
 });
 
+test("Anthropic OAuth credentials use Claude Code bearer headers and identity", async () => {
+  let observed;
+  const transport = adapter({
+    credentialResolver: async () => ({ type: "oauth", accessToken: "sk-ant-oat-test-access" }),
+    fetchImpl: async (url, options) => {
+      observed = { url, options, body: JSON.parse(options.body) };
+      return sse(successEvents());
+    },
+  });
+  const events = await collect(transport, snapshot({ cacheRetention: "short" }), context({ tools: [] }));
+  assert.equal(events.at(-1).outcome, "succeeded_terminal");
+  assert.equal(observed.options.headers.authorization, "Bearer sk-ant-oat-test-access");
+  assert.equal(observed.options.headers["x-api-key"], undefined);
+  assert.equal(observed.options.headers["anthropic-beta"], "claude-code-20250219,oauth-2025-04-20");
+  assert.equal(observed.options.headers["anthropic-dangerous-direct-browser-access"], "true");
+  assert.equal(observed.options.headers["user-agent"], "claude-cli/2.1.75");
+  assert.equal(observed.options.headers["x-app"], "cli");
+  assert.equal(observed.body.system[0].text, "You are Claude Code, Anthropic's official CLI for Claude.");
+  assert.equal(observed.body.system[1].text, "You are a careful coding agent.");
+});
+
+test("unsupported controller credential shapes fail closed before dispatch", async () => {
+  let sent = 0;
+  const transport = adapter({
+    credentialResolver: async () => ({ type: "oauth", accessToken: "not-valid\naccess" }),
+    fetchImpl: async () => { sent += 1; return sse(successEvents()); },
+  });
+  await assert.rejects(() => collect(transport), (error) => error instanceof AnthropicMessagesTransportError && error.reasonCode === "credential_unavailable");
+  assert.equal(sent, 0);
+});
+
 test("named credential miss fails closed even with an unrelated ambient API key", async () => {
   let sent = 0;
   const previous = process.env.ANTHROPIC_API_KEY;

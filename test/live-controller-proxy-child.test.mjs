@@ -18,18 +18,41 @@ import { signedRegistryMessage, verifySignedRegistry } from "../src/signed-regis
 const CONTROLLER_TOKEN = "c".repeat(48);
 const SHIM_PATH = new URL("../extensions/child-shim.ts", import.meta.url).pathname;
 const PROXY_PATH = new URL("../extensions/controller-provider-proxy.ts", import.meta.url).pathname;
-const ENFORCEMENT_PATH = new URL("../extensions/pi-behavioral-enforcement.ts", import.meta.url).pathname;
 const PROMPT = "Reply with exactly LIVE_PROXY_OK and nothing else.";
+const CANARY_MODEL = process.env.LIVE_ANTHROPIC_MODEL ?? "claude-haiku-4-5";
 
 function registryForCanary() {
   const registry = fixtureRegistry();
+  registry.profiles["canary-text/v1"] = { status: "approved", supports: ["text_generation"] };
   registry.resources = {
     R1: {
       ...registry.resources.R1,
-      model: { provider: "anthropic", modelId: "claude-live-canary" },
+      capacityGroup: "G-cheap",
+      profile: "canary-text/v1",
+      model: { provider: "anthropic", modelId: CANARY_MODEL },
     },
   };
   return registry;
+}
+
+function credentialFromOwnerFile(path) {
+  const raw = readFileSync(path, "utf8").trim();
+  if (!raw) throw new Error("owner credential file is empty");
+  try {
+    const parsed = JSON.parse(raw);
+    const provider = process.env.LIVE_CONTROLLER_CREDENTIAL_PROVIDER ?? "anthropic";
+    const candidate = parsed?.type ? parsed : parsed?.[provider];
+    if (candidate?.type === "oauth" && typeof candidate.access === "string") {
+      return { oauthAccess: candidate.access };
+    }
+    if (candidate?.type === "api_key" && typeof candidate.key === "string") {
+      return { apiKey: candidate.key };
+    }
+    throw new Error("owner credential JSON must contain an api_key key or oauth access token");
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    return { apiKey: raw };
+  }
 }
 
 function signedRegistryFor(registry) {
@@ -70,23 +93,25 @@ test("owner-gated live canary keeps provider credentials in the controller proxy
   assert.equal(credentialStat.isSymbolicLink(), false, "credential file must not be a symlink");
   assert.equal(credentialStat.isFile(), true, "credential file must be a regular file");
   assert.equal(credentialStat.mode & 0o077, 0, "credential file must be owner-only");
-  const apiKey = readFileSync(credentialFile, "utf8").trim();
-  assert.ok(apiKey.length >= 16, "credential file must contain one bounded key");
-  const root = mkdtempSync(join(tmpdir(), "live-controller-proxy-"));
+  const credential = credentialFromOwnerFile(credentialFile);
+  const credentialValue = credential.oauthAccess ?? credential.apiKey;
+  assert.ok(typeof credentialValue === "string" && credentialValue.length >= 16, "owner credential must contain one bounded token");
+  // Keep the owner-only socket path below macOS's 104-byte Unix-domain limit even when tmpdir is deeply nested.
+  const root = mkdtempSync(join(tmpdir(), "lcp-"));
   const registry = registryForCanary();
   const signed = signedRegistryFor(registry);
   const routeTable = new ControllerRouteTable({
     registryFingerprint: signed.fingerprint,
     registryVersion: 1,
     routes: [{
-      resourceId: "R1", capacityGroup: "G-shared", profile: "reasoning-high/v1",
-      accountAlias: "anthropic-canary", provider: "anthropic", model: "claude-live-canary",
+      resourceId: "R1", capacityGroup: "G-cheap", profile: "canary-text/v1",
+      accountAlias: "anthropic-canary", provider: "anthropic", model: CANARY_MODEL,
       reasoningEffort: null, apiDialect: "anthropic-messages", endpointId: "anthropic-canary",
       endpoint: process.env.LIVE_ANTHROPIC_ENDPOINT ?? "https://api.anthropic.com/v1/messages",
-      adapterId: ANTHROPIC_MESSAGES_ADAPTER_ID, credentialRef: "anthropic-canary-key", cacheRetention: "short",
+      adapterId: ANTHROPIC_MESSAGES_ADAPTER_ID, credentialRef: "anthropic-canary-key", cacheRetention: "none",
     }],
   });
-  const credentials = new ControllerCredentialStore({ entries: [{ credentialRef: "anthropic-canary-key", apiKey }] });
+  const credentials = new ControllerCredentialStore({ entries: [{ credentialRef: "anthropic-canary-key", ...credential }] });
   const approval = new ControllerLiveProviderApproval({ routeTableFingerprint: routeTable.fingerprint, expiresAt: Date.now() + 120_000, maxRequests: 1 });
   const approved = createApprovedAnthropicProviderRoute({ routeTable, credentialStore: credentials, liveApproval: approval });
   const supervisor = new SingleHostBrokerSupervisor({
@@ -97,18 +122,15 @@ test("owner-gated live canary keeps provider credentials in the controller proxy
     await supervisor.start();
     const resolver = new BrokeredLaunchResolver({
       socketPath: supervisor.socketPath, controllerToken: supervisor.controllerToken, agentRoot: join(root, "child-agents"),
-      extensionPaths: [SHIM_PATH, PROXY_PATH, ENFORCEMENT_PATH],
-      launcherAttestationConfig: {
-        behavioralExtensionPath: ENFORCEMENT_PATH,
-        trustedExtensionDigests: [SHIM_PATH, PROXY_PATH, ENFORCEMENT_PATH]
-          .map((path) => createHash("sha256").update(readFileSync(path)).digest("hex")),
-      },
+      // This is a strictly tool-free observe canary. Effect-capable launches
+      // still require the separately attested behavioral extension path.
+      extensionPaths: [SHIM_PATH, PROXY_PATH],
       offline: false,
       controllerProxy: { providerId: "broker-proxy" },
-      resolveModelForResource: () => ({ provider: "anthropic", modelId: "claude-live-canary" }),
+      resolveModelForResource: () => ({ provider: "anthropic", modelId: CANARY_MODEL }),
       selectContract: createSelectContract({
         registry, availability: () => supervisor.inventory(),
-        currency: () => buildCurrencyMap({ resources: [{ provider: "anthropic", modelId: "claude-live-canary" }] }),
+        currency: () => buildCurrencyMap({ resources: [{ provider: "anthropic", modelId: CANARY_MODEL }] }),
       }),
     });
     const runner = new BrokeredChildRunner({ resolver, sessionsRoot: join(root, "sessions") });

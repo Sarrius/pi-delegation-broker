@@ -37,7 +37,9 @@ export function proxyCanonicalContext(context) {
 export function proxyTerminalError(terminal) {
   const outcome = terminal?.payload?.outcome;
   if (outcome === "succeeded_terminal") return undefined;
-  return typeof outcome === "string" && /^[a-z_]+$/.test(outcome)
-    ? `controller provider terminal: ${outcome}`
-    : "controller provider returned an invalid terminal";
+  if (typeof outcome !== "string" || !/^[a-z_]+$/.test(outcome)) return "controller provider returned an invalid terminal";
+  const status = terminal?.payload?.httpStatus;
+  return Number.isSafeInteger(status) && status >= 100 && status <= 599
+    ? `controller provider terminal: ${outcome} (${status})`
+    : `controller provider terminal: ${outcome}`;
 }

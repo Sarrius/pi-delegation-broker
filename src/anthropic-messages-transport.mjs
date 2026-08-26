@@ -18,6 +18,8 @@ import { ProviderProtocolError } from "./provider-protocol.mjs";
 
 export const ANTHROPIC_MESSAGES_ADAPTER_ID = "anthropic-messages@1";
 export const ANTHROPIC_API_VERSION = "2023-06-01";
+export const ANTHROPIC_OAUTH_BETA = "claude-code-20250219,oauth-2025-04-20";
+export const ANTHROPIC_OAUTH_USER_AGENT = "claude-cli/2.1.75";
 
 const MAX_ERROR_BYTES = 32 * 1024;
 const MAX_RETRY_AFTER_MS = 86_400_000;
@@ -124,31 +126,51 @@ function normalizeTools(context) {
  * route snapshot and a lossless context snapshot. No optional provider state,
  * environment setting, or caller-owned mutable object is consulted later.
  */
-export function buildAnthropicMessagesRequest(snapshot, context) {
-  validateSnapshot(snapshot);
-  let captured;
+function captureRequestContext(snapshot, context) {
   try {
-    captured = captureProviderContext(context, { maxBytes: snapshot.maxInputBytes });
+    return captureProviderContext(context, { maxBytes: snapshot.maxInputBytes });
   } catch (error) {
     fail("context_invalid", error instanceof Error ? error.message : "context validation failed");
   }
+}
+
+function requestFromCapturedContext(snapshot, captured, oauth = false) {
   const value = captured.value;
   const systemPrompt = boundedText(value.systemPrompt, "systemPrompt", 256 * 1024);
+  const cacheControl = snapshot.cacheRetention === "none" ? undefined : {
+    type: "ephemeral",
+    ...(snapshot.cacheRetention === "long" ? { ttl: "1h" } : {}),
+  };
+  const system = oauth
+    ? [
+      { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude.", ...(cacheControl ? { cache_control: cacheControl } : {}) },
+      { type: "text", text: systemPrompt, ...(cacheControl ? { cache_control: cacheControl } : {}) },
+    ]
+    : cacheControl
+      ? [{ type: "text", text: systemPrompt, cache_control: cacheControl }]
+      : systemPrompt;
   const request = {
     model: snapshot.model,
     max_tokens: snapshot.maxOutputTokens,
     stream: true,
-    system: snapshot.cacheRetention === "none"
-      ? systemPrompt
-      : [{ type: "text", text: systemPrompt, cache_control: {
-        type: "ephemeral",
-        ...(snapshot.cacheRetention === "long" ? { ttl: "1h" } : {}),
-      } }],
+    system,
     messages: normalizeMessages(value),
   };
   const tools = normalizeTools(value);
   if (tools.length > 0) request.tools = tools;
   return Object.freeze({ request: captureLosslessJson(request).value, contextDigest: captured.digest });
+}
+
+/**
+ * Build one deterministic Anthropic Messages request from an already-frozen
+ * route snapshot and a lossless context snapshot. No optional provider state,
+ * environment setting, or caller-owned mutable object is consulted later.
+ * `oauth: true` adds the Claude Code identity system block required by
+ * Anthropic subscription OAuth access tokens.
+ */
+export function buildAnthropicMessagesRequest(snapshot, context, { oauth = false } = {}) {
+  validateSnapshot(snapshot);
+  return requestFromCapturedContext(snapshot, captureRequestContext(snapshot, context), oauth);
 }
 
 function parseUrl(value) {
@@ -349,6 +371,31 @@ function normalizedDelta(payload, block) {
  * controller-normalized facts, not child-facing frames. A caller must feed
  * each into ProviderStreamAssembler and persist its terminal settlement.
  */
+function authHeadersForCredential(credential) {
+  if (!isPlainObject(credential)) fail("credential_unavailable", "exact credential resolver returned an invalid credential");
+  const keys = Object.keys(credential).sort().join(",");
+  if (keys === "apiKey") {
+    if (typeof credential.apiKey !== "string" || credential.apiKey.length < 1 || credential.apiKey.length > 4_096 || /[\0\r\n]/.test(credential.apiKey)) {
+      fail("credential_unavailable", "exact credential resolver returned an invalid API key");
+    }
+    return Object.freeze({ "x-api-key": credential.apiKey, oauth: false });
+  }
+  if (keys === "accessToken,type" && credential.type === "oauth") {
+    if (typeof credential.accessToken !== "string" || credential.accessToken.length < 1 || credential.accessToken.length > 4_096 || /[\0\r\n]/.test(credential.accessToken)) {
+      fail("credential_unavailable", "exact credential resolver returned an invalid OAuth access token");
+    }
+    return Object.freeze({
+      authorization: `Bearer ${credential.accessToken}`,
+      "anthropic-beta": ANTHROPIC_OAUTH_BETA,
+      "anthropic-dangerous-direct-browser-access": "true",
+      "user-agent": ANTHROPIC_OAUTH_USER_AGENT,
+      "x-app": "cli",
+      oauth: true,
+    });
+  }
+  fail("credential_unavailable", "exact credential resolver returned an unsupported credential");
+}
+
 export class AnthropicMessagesTransport {
   #credentialResolver;
   #endpointResolver;
@@ -368,7 +415,7 @@ export class AnthropicMessagesTransport {
 
   async *stream(snapshot, context, { signal, onSendStarted } = {}) {
     validateSnapshot(snapshot);
-    const { request } = buildAnthropicMessagesRequest(snapshot, context);
+    const capturedContext = captureRequestContext(snapshot, context);
     if (signal?.aborted) {
       yield { type: "terminal", outcome: "cancelled_before_send", payload: {} };
       return;
@@ -378,9 +425,8 @@ export class AnthropicMessagesTransport {
     // process environment, keychain, or a fallback account; this adapter
     // performs no alternative lookup if it declines.
     const credential = await this.#credentialResolver(snapshot);
-    if (!credential || typeof credential.apiKey !== "string" || credential.apiKey.length < 1 || credential.apiKey.length > 4_096) {
-      fail("credential_unavailable", "exact credential resolver did not return an API key");
-    }
+    const auth = authHeadersForCredential(credential);
+    const { request } = requestFromCapturedContext(snapshot, capturedContext, auth.oauth);
     const endpoint = parseUrl(await this.#endpointResolver(snapshot));
     if (signal?.aborted) {
       yield { type: "terminal", outcome: "cancelled_before_send", payload: {} };
@@ -400,7 +446,7 @@ export class AnthropicMessagesTransport {
           "accept": "text/event-stream",
           "anthropic-version": ANTHROPIC_API_VERSION,
           "content-type": "application/json",
-          "x-api-key": credential.apiKey,
+          ...Object.fromEntries(Object.entries(auth).filter(([key]) => key !== "oauth")),
         },
         body: JSON.stringify(request),
       });
