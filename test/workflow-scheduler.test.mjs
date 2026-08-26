@@ -161,6 +161,16 @@ test("per-node contract axes survive normalization and invalid ones are refused"
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("workflow acceptance stores only fixed controller checks and rejects argv injection", () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-acceptance-"));
+  try {
+    const o = new TaskOrchestrator({ root, jobId: "workflow-acceptance", run: async () => ({ status: "completed" }) });
+    const { job } = o.initialize([{ id: "check", task: "verify", acceptance: [{ id: "npm-test" }] }]);
+    assert.deepEqual(job.nodes[0].acceptance, [{ id: "npm-test", timeoutMs: 30_000 }]);
+    assert.throws(() => o.initialize([{ id: "bad", task: "verify", acceptance: [{ id: "npm-test", argv: ["true"] }] }]), /unsupported or missing fields/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("workflow validation rejects cycles and undeclared dependency inputs", () => {
   const root = mkdtempSync(join(tmpdir(), "orchestrator-graph-"));
   try {

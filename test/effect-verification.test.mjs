@@ -42,13 +42,13 @@ test("a proposed patch is verified inside a scratch tree, leaving the real repos
       baseCommit,
       patch,
       changed,
-      checks: [{ id: "content", claim: "value is two", argv: ["grep", "-q", "two", "value.txt"] }],
+      checks: [{ id: "file-equals", path: "value.txt", content: "two\n" }],
     });
 
     assert.equal(receipt.applied, true);
     assert.equal(receipt.verified, true);
     assert.deepEqual([...receipt.changed], ["value.txt"]);
-    assert.deepEqual(receipt.checks.map((entry) => [entry.id, entry.ok]), [["content", true]]);
+    assert.deepEqual(receipt.checks.map((entry) => [entry.id, entry.ok]), [["file-equals", true]]);
 
     // The controller verified an effect without performing it: the caller's tree still reads
     // the base content and carries no leftover worktree.
@@ -70,7 +70,7 @@ test("a failing controller check denies verification even though the patch appli
       repoCwd: directory,
       baseCommit,
       patch,
-      checks: [{ id: "expected-three", argv: ["grep", "-q", "three", "value.txt"] }],
+      checks: [{ id: "file-equals", path: "value.txt", content: "three\n" }],
     });
     assert.equal(receipt.applied, true);
     assert.equal(receipt.verified, false);
@@ -104,7 +104,7 @@ test("a patch that does not apply to its declared base fails closed", async () =
       repoCwd: directory,
       baseCommit,
       patch: "diff --git a/absent.txt b/absent.txt\n--- a/absent.txt\n+++ b/absent.txt\n@@ -1 +1 @@\n-gone\n+changed\n",
-      checks: [{ id: "unreachable", argv: ["true"] }],
+      checks: [{ id: "npm-check" }],
     });
     assert.equal(receipt.applied, false);
     assert.equal(receipt.verified, false);
@@ -127,7 +127,7 @@ test("a child that under-reports the files it touched is not verified", async ()
       baseCommit,
       patch,
       changed: ["value.txt"],
-      checks: [{ id: "content", argv: ["grep", "-q", "two", "value.txt"] }],
+      checks: [{ id: "file-equals", path: "value.txt", content: "two\n" }],
     });
     assert.equal(receipt.verified, false);
     assert.equal(receipt.reason, "changed_set_mismatch");

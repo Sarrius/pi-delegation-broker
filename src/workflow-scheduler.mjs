@@ -1,4 +1,5 @@
 import { basename, dirname, isAbsolute } from "node:path";
+import { normalizeControllerAcceptanceSpecs } from "./acceptance-plan.mjs";
 import { normalizeContract } from "./child-contract.mjs";
 import {
   isTerminalJobStatus, readJob, submitJob, updateJob,
@@ -59,18 +60,8 @@ export function workflowObserveCapabilityRequest(node, taskId) {
 
 function normalizeAcceptance(value) {
   if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.length < 1 || value.length > 20) fail("acceptance must contain 1..20 fixed checks");
-  const checks = value.map((check) => {
-    if (!check || typeof check !== "object" || !ID.test(check.id ?? "") || typeof check.claim !== "string" || !check.claim.trim()
-      || !Array.isArray(check.argv) || check.argv.length < 1 || check.argv.length > 32
-      || check.argv.some((token) => typeof token !== "string" || !token || token.length > 4096)
-      || !Number.isSafeInteger(check.timeoutMs ?? 30_000) || (check.timeoutMs ?? 30_000) < 100 || (check.timeoutMs ?? 30_000) > 120_000) {
-      fail("acceptance check is invalid");
-    }
-    return { id: check.id, claim: check.claim.slice(0, 500), argv: [...check.argv], timeoutMs: check.timeoutMs ?? 30_000 };
-  });
-  if (new Set(checks.map((check) => check.id)).size !== checks.length) fail("acceptance check ids must be unique");
-  return checks;
+  try { return [...normalizeControllerAcceptanceSpecs(value)]; }
+  catch (error) { fail(error instanceof Error ? error.message : "acceptance checks are invalid"); }
 }
 
 function normalizeNodes(nodes, { knownIds = [] } = {}) {

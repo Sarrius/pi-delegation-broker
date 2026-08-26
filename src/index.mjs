@@ -138,6 +138,7 @@ export {
   createIntegrationWorktree,
   integrateAcceptedProposals,
 } from "./integration-worktree.mjs";
-export { verifyProposedPatch, spawnControllerArgv, EffectVerificationError } from "./effect-verification.mjs";
+export { verifyProposedPatch, EffectVerificationError } from "./effect-verification.mjs";
+export { controllerAcceptanceCheckIds, createControllerAcceptancePlan, normalizeControllerAcceptanceSpecs } from "./acceptance-plan.mjs";
 export { applyProposedPatch, proposedPatchPaths } from "./proposed-patch.mjs";
 export { proxyCanonicalContext, proxyTerminalError } from "./proxy-context.mjs";
