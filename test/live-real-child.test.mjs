@@ -40,7 +40,9 @@ function signedSupervisor(root, registry) {
   });
 }
 
-test("live: spawn Pi child, send prompt, get real response, verify, close", { skip: !process.env.LIVE_TEST }, async () => {
+// Legacy direct-child-auth coverage is deliberately never enabled by LIVE_TEST; live validation
+// must use test/live-controller-proxy-child.test.mjs and its owner-injected controller route.
+test("legacy live: spawn Pi child with scoped auth", { skip: process.env.LIVE_LEGACY_SCOPED_AUTH_TEST !== "1" }, async () => {
   const root = mkdtempSync(join(tmpdir(), "live-"));
   let supervisor;
   try {

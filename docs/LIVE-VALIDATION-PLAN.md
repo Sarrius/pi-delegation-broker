@@ -12,6 +12,8 @@ All conditions must be true before the controller constructs `createApprovedAnth
 4. The owner supplies a one-request `ControllerLiveProviderApproval` expiring within the pre-registered window. The controller records approval ID, route-table fingerprint and wall-clock bounds without recording a secret.
 5. The task is non-effectful/read-only, bounded by a lease, controller budget, known prompt digest, fixed verifier plan and a named recovery owner/deadline.
 
+The credentialless Pi-child canary harness is `test/live-controller-proxy-child.test.mjs`. It remains skipped unless the owner explicitly sets `LIVE_PROVIDER_TEST=1`, `LIVE_PROXY_CANARY_APPROVED=1`, and `LIVE_CONTROLLER_CREDENTIAL_FILE` to an existing owner-only file containing the key. The file path is read by the controller test process and the key is injected only into the in-memory `ControllerCredentialStore`; it is never passed to the child, route config, CLI arguments, or evidence. `LIVE_ANTHROPIC_ENDPOINT` may select the endpoint (default: `https://api.anthropic.com/v1/messages`). This harness is still prohibited until preconditions 1–5 are independently approved.
+
 ## Adversarial gate sequence
 
 Run one physical attempt per case; never re-run a case through another account/model automatically.
