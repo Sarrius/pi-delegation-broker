@@ -22,7 +22,6 @@
 
 import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +35,7 @@ import {
   disposeBrokeredChildProcesses,
   addModelPreference,
   activeAuthorizedProviders,
+  activeCredentialToken,
   ControllerAcceptanceVerifier,
   ControllerEvidenceStore,
   ControllerQueuedTaskVerifier,
@@ -71,6 +71,8 @@ import {
   updateJob,
   qualityForModel,
   parseResourceModel,
+  classifyProviderProbe,
+  isControllerProbeUrl,
   probeProviderModels,
   readCurrencyCache,
   readProviderRegistry,
@@ -116,7 +118,9 @@ const CHECKPOINTS_DIR = join(STATE_DIR, "checkpoints");
 const DEFECTS_DIR = join(STATE_DIR, "defects");
 const SESSION_BINDINGS_DIR = join(STATE_DIR, "session-bindings");
 const REGISTRY_KEY_ID = "controller";
-const CURRENCY_REFRESH_MS = 15 * 60 * 1_000;
+// Model-list probes are controller-only observations with credential-free results, not inference calls. Keep their cadence
+// short enough to notice recovered subscription capacity while avoiding a hot loop.
+const CURRENCY_REFRESH_MS = 60 * 1_000;
 const CURRENCY_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const FLEET_REFRESH_MS = 1_000;
 const FLEET_WIDGET_ROWS = 5;
@@ -353,17 +357,6 @@ function formatModels(registry: any, inventory: any[] | undefined, providerFilte
   }).join("\n") || "No catalog resources available.";
 }
 
-function runControllerArgv(argv: string[], cwd: string, signal: AbortSignal): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
-    const child = spawn(argv[0], argv.slice(1), { cwd, shell: false, signal, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "", stderr = "";
-    child.stdout.on("data", (data) => { stdout = (stdout + data).slice(0, 32_000); });
-    child.stderr.on("data", (data) => { stderr = (stderr + data).slice(0, 32_000); });
-    child.once("error", (error) => resolve({ exitCode: 127, stdout, stderr: String(error.message).slice(0, 32_000) }));
-    child.once("close", (code) => resolve({ exitCode: code ?? 1, stdout, stderr }));
-  });
-}
-
 function loadOrCreateRegistryKeys(): { publicKey: string; privateKey: string } {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   try {
@@ -399,7 +392,7 @@ function registryModels(registry: any): Array<{ provider: string; modelId: strin
 }
 
 /** Controller-only probe routes. These are API endpoints, not model allow-lists. */
-function probeRoutes(registry: any) {
+function probeRoutes(registry: any, now = Date.now()) {
   const auth = readJson(join(PARENT_AGENT_DIR, "auth.json"));
   const store = readJson(join(PARENT_AGENT_DIR, "models-store.json"));
   const configured = readJson(join(PARENT_AGENT_DIR, "models.json")).providers ?? {};
@@ -407,7 +400,10 @@ function probeRoutes(registry: any) {
   for (const { provider } of registryModels(registry)) {
     if (routes.has(provider)) continue;
     const credential = auth[provider];
-    if (credential?.type !== "api_key" || typeof credential.key !== "string" || !credential.key) continue;
+    // OAuth subscriptions were previously visible to selection but invisible to the controller
+    // preflight. Use only the short-lived access token; refresh tokens never enter this map.
+    const apiKey = activeCredentialToken(credential, now);
+    if (!apiKey) continue;
     const base = provider.replace(/-account-\d+$/, "");
     const firstModel = store[provider]?.models?.[0] ?? store[base]?.models?.[0];
     let baseUrl = configured[provider]?.baseUrl ?? configured[base]?.baseUrl ?? firstModel?.baseUrl;
@@ -417,7 +413,7 @@ function probeRoutes(registry: any) {
     if (provider === "minimax") baseUrl = "https://api.minimax.io/v1";
     if (provider === "kimi-coding") baseUrl = "https://api.kimi.com/coding/v1";
     if (provider === "zai") baseUrl = "https://api.z.ai/api/paas/v4";
-    if (typeof baseUrl === "string" && baseUrl.startsWith("https://")) routes.set(provider, { baseUrl, apiKey: credential.key });
+    if (typeof baseUrl === "string" && isControllerProbeUrl(baseUrl)) routes.set(provider, { baseUrl, apiKey });
   }
   return routes;
 }
@@ -442,7 +438,10 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     if (JSON.stringify(raw) !== JSON.stringify(normalized)) writeModelPreferences(PREFERENCES_PATH, normalized);
   }
   const keys = loadOrCreateRegistryKeys();
-  const registry = catalogToBrokerRegistry(liveProviderCatalog(ctx, getSupplementalModels()), { confidence: "observed" });
+  // An empty authorized fleet is a valid runtime state: all subscription credentials may be
+  // expired or temporarily unavailable. The signed controller registry then denies new work
+  // cleanly instead of retaining an account that is no longer usable.
+  const registry = catalogToBrokerRegistry(liveProviderCatalog(ctx, getSupplementalModels()), { confidence: "observed", allowEmpty: true });
   const now = Date.now();
   const payload = {
     registryVersion: `session-${now}`,
@@ -543,23 +542,41 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     const successfullyRefreshed = new Map<string, Map<string, number | undefined>>();
     await Promise.all([...routes].map(async ([provider, route]) => {
       const result = await probeProviderModels({ baseUrl: route.baseUrl, apiKey: route.apiKey });
-      if (result.status !== "ok") {
-        // A listing outage is not a delisting. Only controller-observed credential denial or
-        // throttling changes broker health; transport failures retain the prior route state.
-        if (result.status === "http_error" && (result.code === 401 || result.code === 403 || result.code === 429)) {
-          const resources = Object.entries(currentRegistry.resources ?? {})
-            .filter(([resourceId, resource]: [string, any]) => (resource.model ?? parseResourceModel(resourceId))?.provider === provider);
-          await Promise.all(resources.map(([resourceId]) => requestBrokerIpc({
-            socketPath: supervisor.socketPath, authorization: supervisor.controllerToken,
-            method: result.code === 429 ? "markRateLimited" : "markUnknown",
-            params: result.code === 429 ? { resourceId } : { resourceId, reason: "controller provider listing credential denied" },
-          })));
-        }
+      const resources = Object.entries(currentRegistry.resources ?? {})
+        .filter(([resourceId, resource]: [string, any]) => (resource.model ?? parseResourceModel(resourceId))?.provider === provider)
+        .map(([resourceId]) => resourceId);
+      // catalogToBrokerRegistry gives every model of one provider one capacity group, so one
+      // health transition is enough and avoids racing identical updates for every model.
+      const resourceId = resources[0];
+      if (!resourceId) return;
+      const health = classifyProviderProbe(result);
+      if (health.status === "available") {
+        const listing = new Map(result.models.map((id: string) => [id, result.created?.[id]]));
+        liveListings.set(provider, listing);
+        successfullyRefreshed.set(provider, listing);
+        // A successful listing/credential probe clears stale unknown resource state. It does not
+        // close a quota breaker: only a leased inference probe can prove that subscription quota
+        // has recovered after a 429/402.
+        await requestBrokerIpc({
+          socketPath: supervisor.socketPath, authorization: supervisor.controllerToken,
+          method: "markAvailabilityObserved",
+          params: { resourceId, scope: "capacity_group" },
+        }).catch(() => undefined);
         return;
       }
-      const listing = new Map(result.models.map((id: string) => [id, result.created?.[id]]));
-      liveListings.set(provider, listing);
-      successfullyRefreshed.set(provider, listing);
+      // A provider that cannot answer its controller probe is not currently selectable. This is
+      // deliberately pessimistic: retaining a previously healthy state routed the next child
+      // into a known-dead credential/network path. Unknown state has a bounded half-open retry.
+      await requestBrokerIpc({
+        socketPath: supervisor.socketPath, authorization: supervisor.controllerToken,
+        method: health.status === "rate_limited" ? "markRateLimited" : "markUnknown",
+        params: health.status === "rate_limited"
+          ? { resourceId, ...(health.retryAfterMs === undefined ? {} : { retryAfterMs: health.retryAfterMs }) }
+          : {
+            resourceId, reason: health.reason, scope: health.scope,
+            ...(health.retryAfterMs === undefined ? {} : { retryAfterMs: health.retryAfterMs }),
+          },
+      }).catch(() => undefined);
     }));
     // Persist only facts freshly observed in this pass. A provider that is currently unreachable
     // cannot refresh its old cache timestamp into a false declaration of liveness.
@@ -569,6 +586,9 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     try { routingAudit.recordCurrency(currency()); } catch { /* observability is best effort */ }
   };
   await refreshCurrency().catch(() => undefined);
+  // Provider subscription availability changes independently of auth/models files. Re-probe on a
+  // bounded cadence so a recovered account is usable without waiting for a new login or task
+  // failure; the broker still owns cooldowns and only a real inference probe closes quota breakers.
   const currencyTimer = setInterval(() => { refreshCurrency().catch(() => undefined); }, CURRENCY_REFRESH_MS);
   currencyTimer.unref?.();
   const baseSelectContract = createSelectContract({

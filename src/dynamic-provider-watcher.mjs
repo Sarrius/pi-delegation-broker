@@ -3,18 +3,32 @@ import { join } from "node:path";
 import { catalogToBrokerRegistry } from "./provider-catalog.mjs";
 
 const WATCH_DEBOUNCE_MS = 2_000;
+const DEFAULT_REFRESH_INTERVAL_MS = 30_000;
+
+function oauthExpiryMs(credential) {
+  const raw = credential?.expires ?? credential?.expiresAt ?? credential?.expires_at;
+  if (!Number.isSafeInteger(raw) || raw <= 0) return undefined;
+  // Pi has historically stored OAuth expiry in milliseconds, while a few provider adapters use
+  // Unix seconds. Normalize both so an apparently live token cannot survive for 55,000 years.
+  return raw < 100_000_000_000 ? raw * 1_000 : raw;
+}
+
+/** Return the one bearer/API token that the controller may use for a live preflight. */
+export function activeCredentialToken(credential, now = Date.now()) {
+  if (!credential || typeof credential !== "object" || Array.isArray(credential)) return undefined;
+  if ((credential.type === "api_key" || credential.type === "api-key")
+    && typeof credential.key === "string" && credential.key.length > 0) return credential.key;
+  if (credential.type === "oauth" && typeof credential.access === "string" && credential.access.length > 0
+    && (oauthExpiryMs(credential) ?? 0) > now + 30_000) return credential.access;
+  return undefined;
+}
 
 /** Credential-free admission preflight. Expired OAuth must not reach a child and discover a
- * dead refresh token after launch; a later auth-file refresh naturally re-admits the route. */
+ * dead refresh token after launch; the periodic watcher re-evaluates expiry even when auth.json
+ * itself does not change. */
 export function activeAuthorizedProviders(auth, now = Date.now()) {
   if (!auth || typeof auth !== "object" || Array.isArray(auth)) return Object.freeze([]);
-  return Object.freeze(Object.entries(auth).flatMap(([provider, credential]) => {
-    if (!credential || typeof credential !== "object" || Array.isArray(credential)) return [];
-    if ((credential.type === "api_key" || credential.type === "api-key") && typeof credential.key === "string" && credential.key.length > 0) return [provider];
-    if (credential.type === "oauth" && typeof credential.access === "string" && credential.access.length > 0
-      && Number.isSafeInteger(credential.expires) && credential.expires > now + 30_000) return [provider];
-    return [];
-  }));
+  return Object.freeze(Object.entries(auth).flatMap(([provider, credential]) => activeCredentialToken(credential, now) ? [provider] : []));
 }
 
 /**
@@ -183,17 +197,25 @@ export class DynamicProviderWatcher {
   #lastCatalogFingerprint;
   #lastRegistry;
   #readCatalog;
+  #refreshIntervalMs;
+  #refreshTimer;
   #running = false;
 
-  constructor({ agentDir, broker, onReload, readCatalog } = {}) {
+  constructor({ agentDir, broker, onReload, readCatalog, refreshIntervalMs = DEFAULT_REFRESH_INTERVAL_MS } = {}) {
     if (typeof agentDir !== "string") throw new Error("DynamicProviderWatcher requires agentDir");
-    if (!broker || typeof broker.reloadRegistry !== "function") throw new Error("DynamicProviderWatcher requires a broker with reloadRegistry");
+    if (!broker || (typeof broker.updateRegistry !== "function" && typeof broker.reloadRegistry !== "function")) {
+      throw new Error("DynamicProviderWatcher requires a broker with updateRegistry or reloadRegistry");
+    }
     if (onReload !== undefined && typeof onReload !== "function") throw new Error("DynamicProviderWatcher onReload must be a function");
     if (readCatalog !== undefined && typeof readCatalog !== "function") throw new Error("DynamicProviderWatcher readCatalog must be a function");
+    if (!Number.isSafeInteger(refreshIntervalMs) || refreshIntervalMs < 100 || refreshIntervalMs > 3_600_000) {
+      throw new Error("DynamicProviderWatcher refreshIntervalMs must be between 100 and 3600000");
+    }
     this.#agentDir = agentDir;
     this.#broker = broker;
     this.#onReload = onReload;
     this.#readCatalog = readCatalog ?? (() => readPiCatalog(this.#agentDir));
+    this.#refreshIntervalMs = refreshIntervalMs;
   }
 
   /**
@@ -202,7 +224,7 @@ export class DynamicProviderWatcher {
    */
   async refresh() {
     const catalog = this.#readCatalog();
-    if (catalog.length === 0) return this.#report({ status: "skipped", reason: "empty catalog" });
+    if (!Array.isArray(catalog)) throw new Error("provider catalog reader must return an array");
     // Fingerprint the models too, not just the provider names: a provider that gains or
     // loses a model is a different routing surface, and name-only fingerprinting reported
     // "unchanged" and never reloaded.
@@ -214,27 +236,34 @@ export class DynamicProviderWatcher {
 
     let registry;
     try {
-      registry = catalogToBrokerRegistry(catalog, { confidence: "observed" });
+      // Empty means that no credential is currently authorized. Keeping the previous registry
+      // here would route work to an expired account forever, so the broker must represent the
+      // empty fleet explicitly and deny new reservations until a provider returns.
+      registry = catalogToBrokerRegistry(catalog, { confidence: "observed", allowEmpty: true });
     } catch (error) {
       // A catalog the broker cannot represent leaves the previous registry in place. Say so:
       // a silently discarded failure looks exactly like a healthy dynamic registry, and the
       // controller would keep routing against a stale or fixture provider set.
       return this.#report({ status: "failed", reason: error.message });
     }
-    // Only commit the fingerprint once the catalog is known to be representable, so a
-    // transient bad read is retried rather than remembered as the current state.
-    this.#lastCatalogFingerprint = fingerprint;
-    this.#lastRegistry = registry;
-
     const now = Date.now();
-    const result = this.#broker.reloadRegistry(registry, now);
-    if (result.status === "reloaded") {
+    // Dynamic membership is safe to apply while leases are live: additions are admitted now,
+    // withdrawals drain, and only incompatible policy changes are deferred. The old full reload
+    // path rejected every catalog change during continuous work, making newly recovered accounts
+    // invisible until the fleet became idle.
+    const result = typeof this.#broker.updateRegistry === "function"
+      ? this.#broker.updateRegistry(registry, now)
+      : this.#broker.reloadRegistry(registry, now);
+    if (result.status === "updated" || result.status === "reloaded") {
+      // Commit only after the broker accepted the candidate. A rejected replacement must not
+      // leave selector state one generation ahead of SQLite admission.
+      this.#lastCatalogFingerprint = fingerprint;
+      this.#lastRegistry = registry;
       return this.#report({ status: "reloaded", providerCount: catalog.length, providers: catalog.map((e) => e.provider) });
     }
-    // A deferred reload must be retried when capacity frees up, so do not keep the
-    // fingerprint that would suppress the next attempt.
+    // A deferred/rejected update must be retried on the next periodic pass.
     this.#lastCatalogFingerprint = undefined;
-    return this.#report({ status: result.status, reason: "reload deferred — active leases or tasks" });
+    return this.#report({ status: result.status, reason: "provider registry update deferred" });
   }
 
   #report(outcome) {
@@ -248,6 +277,8 @@ export class DynamicProviderWatcher {
     if (this.#running) return;
     this.#running = true;
     this.#refreshAsync().catch(() => undefined);
+    this.#refreshTimer = setInterval(() => this.#refreshAsync(), this.#refreshIntervalMs);
+    this.#refreshTimer.unref?.();
     try {
       this.#watcher = watch(this.#agentDir, { persistent: false }, (eventType, filename) => {
         if (filename !== "auth.json" && filename !== "models-store.json" && filename !== "models.json") return;
@@ -269,6 +300,8 @@ export class DynamicProviderWatcher {
     this.#watcher = undefined;
     if (this.#debounceTimer) clearTimeout(this.#debounceTimer);
     this.#debounceTimer = undefined;
+    if (this.#refreshTimer) clearInterval(this.#refreshTimer);
+    this.#refreshTimer = undefined;
   }
 
   async #refreshAsync() {
@@ -289,8 +322,8 @@ export class DynamicProviderWatcher {
   currentRegistry() {
     if (this.#lastRegistry === undefined) {
       const catalog = this.#readCatalog();
-      if (catalog.length === 0) throw new Error("DynamicProviderWatcher has no provider catalog to build a registry from");
-      this.#lastRegistry = catalogToBrokerRegistry(catalog, { confidence: "observed" });
+      if (!Array.isArray(catalog)) throw new Error("DynamicProviderWatcher provider catalog is invalid");
+      this.#lastRegistry = catalogToBrokerRegistry(catalog, { confidence: "observed", allowEmpty: true });
     }
     return this.#lastRegistry;
   }

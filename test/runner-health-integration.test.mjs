@@ -17,6 +17,7 @@ import { signedRegistryMessage } from "../src/signed-registry.mjs";
 import { SingleHostBrokerSupervisor } from "../src/supervisor.mjs";
 import { BrokeredLaunchResolver } from "../src/trusted-launch-resolver.mjs";
 import { BrokeredChildRunner } from "../src/brokered-runner.mjs";
+import { requestBrokerIpc } from "../src/ipc.mjs";
 
 const MODEL = { provider: "broker-fake", modelId: "lease-fake" };
 const CONTROLLER_TOKEN = "h".repeat(48);
@@ -42,6 +43,29 @@ function signedSupervisor(root) {
     sweepIntervalMs: 100,
   });
 }
+
+test("availability preflight crosses controller IPC and cannot close an inference quota breaker", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-availability-ipc-"));
+  const supervisor = signedSupervisor(root);
+  try {
+    await supervisor.start();
+    const ipc = (method, params = {}) => requestBrokerIpc({
+      socketPath: supervisor.socketPath, authorization: supervisor.controllerToken, method, params,
+    });
+    const unknown = await ipc("markUnknown", { resourceId: "R1", reason: "listing outage", scope: "capacity_group" });
+    assert.equal(unknown.status, "unknown");
+    const available = await ipc("markAvailabilityObserved", { resourceId: "R1", scope: "capacity_group" });
+    assert.equal(available.status, "available");
+    assert.ok(supervisor.inventory().filter((row) => row.capacityGroup === "G-shared").every((row) => row.state === "healthy"));
+
+    await ipc("markRateLimited", { resourceId: "R1", retryAfterMs: 60_000 });
+    await ipc("markAvailabilityObserved", { resourceId: "R1", scope: "capacity_group" });
+    assert.equal(supervisor.inventory().find((row) => row.resourceId === "R1").breakerState, "cooling_down");
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("every throttled account is cooled in real broker state, including the last one tried", async () => {
   const root = mkdtempSync(join(tmpdir(), "runner-health-ipc-"));

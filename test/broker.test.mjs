@@ -435,6 +435,25 @@ test("cooldown default comes from registry and only one half-open probe is admit
   }, registry);
 });
 
+test("a successful availability preflight clears unknown resources but does not close a quota breaker", () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  registry.capacityGroups["G-shared"].cooldown = { defaultMs: 10_000, probeIntervalMs: 2_000 };
+  withBroker((broker) => {
+    broker.markUnknown("R1", 1_000, "temporary listing outage", "capacity_group");
+    const observed = broker.markAvailabilityObserved("R1", 1_001, "capacity_group");
+    assert.equal(observed.status, "available");
+    assert.equal(observed.alsoAffected, 1);
+    assert.ok(broker.inventory(1_001).every((row) => row.state === "healthy"));
+
+    broker.markRateLimited("R1", 10_000, 1_002);
+    broker.markAvailabilityObserved("R1", 1_003, "capacity_group");
+    const stillCooling = broker.inventory(1_003).find((row) => row.resourceId === "R1");
+    assert.equal(stillCooling.breakerState, "cooling_down", "a model-list probe cannot prove inference quota recovered");
+  }, registry);
+});
+
 test("an unknown route receives one delayed half-open probe and success restores it", () => {
   const registry = fixtureRegistry();
   delete registry.resources.R1_ALIAS;
