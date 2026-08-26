@@ -46,7 +46,7 @@ export function formatWorkflowSummary(workflowId, state) {
 }
 
 /** Workflow nodes are read-only by contract. */
-export function workflowObserveCapabilityRequest(node, taskId) {
+export function workflowObserveCapabilityRequest(node, taskId, controllerBudget) {
   if (!node || typeof node !== "object" || typeof node.task !== "string" || !node.task.trim()) fail("node is invalid");
   if (typeof taskId !== "string" || !TASK_ID.test(taskId)) fail("task id is invalid");
   return Object.freeze({
@@ -55,6 +55,7 @@ export function workflowObserveCapabilityRequest(node, taskId) {
     operationClass: "observe",
     ...(node.capabilities?.length ? { requiredCapabilities: Object.freeze([...node.capabilities]) } : {}),
     ...(node.tier ? { modelTier: node.tier } : {}),
+    ...(controllerBudget && typeof controllerBudget === "object" ? { budget: Object.freeze({ ...controllerBudget }) } : {}),
   });
 }
 
@@ -335,17 +336,38 @@ export class TaskOrchestrator {
       node.state = "running";
       delete node.error;
       delete node.result;
-      if (state.team) state.team = {
-        ...state.team,
-        usage: { ...state.team.usage, startedAttempts: state.team.usage.startedAttempts + 1 },
-      };
       persist();
       try {
+        const attemptBudget = state.team ? Object.freeze({
+          acquire: () => {
+            if (state.team.usage.startedAttempts >= state.team.budgets.maxAttempts) return Object.freeze({ granted: false });
+            state.team = {
+              ...state.team,
+              usage: { ...state.team.usage, startedAttempts: state.team.usage.startedAttempts + 1 },
+            };
+            persist();
+            return Object.freeze({ granted: true });
+          },
+        }) : undefined;
+        const remainingOutputTokens = state.team?.budgets.maxOutputTokens === undefined
+          ? undefined
+          : state.team.budgets.maxOutputTokens - state.team.usage.outputTokens;
+        if (remainingOutputTokens !== undefined && remainingOutputTokens < 1) {
+          node.state = "failed";
+          node.error = "root team maxOutputTokens budget exceeded";
+          persist();
+          return;
+        }
         const inputResults = node.inputs.map((fromNode) => Object.freeze({
           fromNode,
           result: structuredClone(byId.get(fromNode).result),
         }));
-        const result = await this.#run(Object.freeze({ ...structuredClone(node), inputResults: Object.freeze(inputResults) }));
+        const result = await this.#run(Object.freeze({
+          ...structuredClone(node),
+          inputResults: Object.freeze(inputResults),
+          ...(attemptBudget ? { attemptBudget } : {}),
+          ...(remainingOutputTokens !== undefined ? { controllerBudget: { maxOutputTokens: remainingOutputTokens } } : {}),
+        }));
         if (signal?.aborted) {
           node.state = "pending";
         } else {
@@ -386,7 +408,8 @@ export class TaskOrchestrator {
         if (node.state === "pending" && node.dependsOn.some((id) => ["failed", "blocked"].includes(byId.get(id).state))) node.state = "blocked";
       }
       const ready = state.nodes.filter((node) => node.state === "pending" && node.dependsOn.every((id) => byId.get(id).state === "completed"));
-      while (ready.length && running.size < this.#concurrency && !signal?.aborted) {
+      const parallelLimit = state.team?.budgets.maxParallel ?? this.#concurrency;
+      while (ready.length && running.size < parallelLimit && !signal?.aborted) {
         const promise = launch(ready.shift()).finally(() => running.delete(promise));
         running.add(promise);
       }

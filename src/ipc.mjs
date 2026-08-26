@@ -438,6 +438,11 @@ export class BrokerIpcServer {
     emit("attempt_accepted");
     settlement.transition("provider_send_started");
     emit("provider_send_started");
+    const usageResult = event.usage === undefined
+      ? { status: "recorded" }
+      : this.#broker.recordProviderUsage(lease.leaseId, lease.fencingToken, event.usage, observedAt, { inputReserved: false });
+    if (usageResult.status === "denied_lease") throw new Error("lease no longer active");
+    if (!["recorded", "budget_exceeded"].includes(usageResult.status)) throw new Error("provider usage could not be recorded");
 
     if (event.type === "succeeded") {
       settlement.transition("headers_seen");
@@ -447,7 +452,7 @@ export class BrokerIpcServer {
       emit("text_delta", { index: 0, delta: text });
       emit("block_end", { index: 0, value: text });
       emit("usage", { input: event.usage.input, output: event.usage.output });
-      if (lease.enforcement.output === "hard" && lease.maxOutputTokens !== undefined && event.usage.output > lease.maxOutputTokens) {
+      if (usageResult.status === "budget_exceeded" || (lease.enforcement.output === "hard" && lease.maxOutputTokens !== undefined && event.usage.output > lease.maxOutputTokens)) {
         this.#broker.release(lease.leaseId, lease.fencingToken, "hard output budget exceeded", observedAt);
         emit("terminal", { outcome: "budget_exceeded", usage: event.usage });
         settlement.settleTerminal("budget_exceeded", { facts: { usage: event.usage }, observedAt });
@@ -501,6 +506,21 @@ export class BrokerIpcServer {
     if (!context || typeof context !== "object") throw new Error("stream requires typed context");
     const captured = captureProviderContext(context, { maxBytes: 512 * 1024 });
     const inputDigest = createHash("sha256").update(captured.canonical).digest("hex");
+    const inputUpperBound = Buffer.byteLength(captured.canonical, "utf8");
+    const inputAdmission = this.#broker.reserveProviderInput(
+      lease.leaseId, lease.fencingToken, inputUpperBound, Date.now(),
+    );
+    if (inputAdmission.status !== "reserved") {
+      this.#broker.release(lease.leaseId, lease.fencingToken, "provider input budget admission failed", Date.now());
+      throw new Error(inputAdmission.status === "budget_exceeded" ? "input_budget_exceeded" : "provider input budget admission failed");
+    }
+    const outputUsed = lease.usage?.output ?? 0;
+    const outputCap = lease.maxOutputTokens;
+    if (lease.enforcement.output === "hard" && outputCap !== undefined && outputUsed >= outputCap) {
+      this.#broker.release(lease.leaseId, lease.fencingToken, "provider output budget exhausted", Date.now());
+      throw new Error("output_budget_exceeded");
+    }
+    const remainingOutputTokens = outputCap === undefined ? 8_000 : Math.max(1, outputCap - outputUsed);
 
     // Resolve a controller-owned route before admitting the stream. Route
     // selection failure is a controller admission failure, never an ambient
@@ -554,7 +574,7 @@ export class BrokerIpcServer {
       deadlineAt: lease.expiresAt,
       maxInputBytes: 512 * 1024,
       maxOutputBytes: 1_000_000,
-      maxOutputTokens: lease.maxOutputTokens ?? 8_000,
+      maxOutputTokens: remainingOutputTokens,
       });
     } catch (error) {
       releaseRouteFailure();
@@ -579,6 +599,7 @@ export class BrokerIpcServer {
     let headersSeen = false;
     let streaming = false;
     let terminalSeen = false;
+    let latestUsage;
     const emit = (type, payload = {}) => {
       const frame = { protocolVersion: 1, ...identity, seq, type, payload };
       const validated = assembler.accept(frame);
@@ -604,7 +625,18 @@ export class BrokerIpcServer {
       const observedAt = Date.now();
       let outcome = event.outcome;
       let payload = event.payload ?? {};
-      const usage = payload.usage;
+      const usage = payload.usage ?? latestUsage;
+      if (usage) {
+        const usageResult = this.#broker.recordProviderUsage(
+          lease.leaseId, lease.fencingToken, usage, Date.now(), { inputReserved: true },
+        );
+        if (usageResult.status === "denied_lease") throw new Error("lease no longer active");
+        if (!["recorded", "budget_exceeded"].includes(usageResult.status)) throw new Error("provider usage could not be recorded");
+        if (usageResult.status === "budget_exceeded") {
+          outcome = "budget_exceeded";
+          payload = { usage };
+        }
+      }
       if (outcome === "succeeded_terminal" && lease.enforcement.output === "hard" && lease.maxOutputTokens !== undefined && usage?.output > lease.maxOutputTokens) {
         outcome = "budget_exceeded";
         payload = { usage };
@@ -660,11 +692,14 @@ export class BrokerIpcServer {
         }
         if (["block_start", "text_delta", "reasoning_delta", "tool_call_delta", "block_end", "usage"].includes(event.type)) {
           transitionStreaming();
+          if (event.type === "usage") latestUsage = event.payload;
           emit(event.type, event.payload ?? {});
           continue;
         }
         if (event.type === "terminal") {
-          settleAndApply(event);
+          settleAndApply(event.payload?.usage === undefined && latestUsage
+            ? { ...event, payload: { ...(event.payload ?? {}), usage: latestUsage } }
+            : event);
           break;
         }
         throw new Error("provider transport emitted unknown normalized event");

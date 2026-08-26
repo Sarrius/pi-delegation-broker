@@ -548,6 +548,18 @@ test("high-risk work cannot omit a hard token budget dimension", () => withBroke
   assert.equal(broker.leases().length, 0);
 }, fixtureRegistry(), { behavioralEnforcement: "blocking_monitor" }));
 
+test("controller accounts cumulative input reservations and output usage before accepting a lease result", () => withBroker((broker) => {
+  const lease = leased(broker, fixtureContract({
+    budget: { maxInputTokens: 100, maxOutputTokens: 10, enforcement: { input: "hard", output: "hard" } },
+  }));
+  assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 60, 1_001).status, "reserved");
+  assert.equal(broker.recordProviderUsage(lease.leaseId, lease.fencingToken, { input: 1, output: 6 }, 1_002, { inputReserved: true }).status, "recorded");
+  assert.equal(broker.recordProviderUsage(lease.leaseId, lease.fencingToken, { input: 1, output: 5 }, 1_003, { inputReserved: true }).status, "budget_exceeded");
+  assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 41, 1_004).status, "budget_exceeded");
+  assert.deepEqual(broker.leaseForCapability("not-issued", 1_005), { status: "denied_capability" });
+  broker.release(lease.leaseId, lease.fencingToken, "test", 1_006);
+}));
+
 test("typed effect receipts are approval-bound and idempotent", () => {
   const registry = fixtureRegistry();
   withBroker((broker) => {
