@@ -2,25 +2,32 @@ import { randomUUID } from "node:crypto";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const EVIDENCE_REF = /^controller:[0-9a-f-]{36}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
+const COMMIT = /^[0-9a-f]{7,64}$/;
 const RECEIPT_SCHEMA = "controller-verification-receipt/v1";
 
-function exactKeys(value, expected, label) {
+function exactKeys(value, allowed, label, required = allowed) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
-  const actual = Object.keys(value).sort();
-  const wanted = [...expected].sort();
-  if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
+  const actual = Object.keys(value);
+  if (actual.some((key) => !allowed.includes(key)) || required.some((key) => !actual.includes(key))) {
     throw new Error(`${label} has unsupported or missing fields`);
   }
 }
 
 function normalizeBinding(value) {
-  exactKeys(value, ["taskId", "leaseId", "fencingToken"], "verification binding");
+  exactKeys(value, ["taskId", "leaseId", "fencingToken", "targetDigest", "expectedHead"], "verification binding", ["taskId", "leaseId", "fencingToken"]);
   if (typeof value.taskId !== "string" || !ID.test(value.taskId)
     || typeof value.leaseId !== "string" || !ID.test(value.leaseId)
-    || !Number.isSafeInteger(value.fencingToken) || value.fencingToken < 1) {
+    || !Number.isSafeInteger(value.fencingToken) || value.fencingToken < 1
+    || (value.targetDigest !== undefined && (typeof value.targetDigest !== "string" || !SHA256.test(value.targetDigest)))
+    || (value.expectedHead !== undefined && (typeof value.expectedHead !== "string" || !COMMIT.test(value.expectedHead)))) {
     throw new Error("verification binding is invalid");
   }
-  return Object.freeze({ taskId: value.taskId, leaseId: value.leaseId, fencingToken: value.fencingToken });
+  return Object.freeze({
+    taskId: value.taskId, leaseId: value.leaseId, fencingToken: value.fencingToken,
+    ...(value.targetDigest ? { targetDigest: value.targetDigest } : {}),
+    ...(value.expectedHead ? { expectedHead: value.expectedHead } : {}),
+  });
 }
 
 function normalizeReceipt(value) {
@@ -130,7 +137,9 @@ export class ControllerVerificationAuthority {
       || artifact.evidenceRefs.some((ref, index) => ref !== normalized.evidenceRefs[index])
       || artifact.binding?.taskId !== taskBinding.taskId
       || artifact.binding?.leaseId !== taskBinding.leaseId
-      || artifact.binding?.fencingToken !== taskBinding.fencingToken) return false;
+      || artifact.binding?.fencingToken !== taskBinding.fencingToken
+      || artifact.binding?.targetDigest !== taskBinding.targetDigest
+      || artifact.binding?.expectedHead !== taskBinding.expectedHead) return false;
     const descriptors = this.#descriptors(normalized.evidenceRefs);
     return descriptors.length === normalized.evidenceRefs.length
       && descriptors.every((item) => this.#evidenceStore.verify(item) && ["command", "test"].includes(item.kind));
@@ -197,7 +206,7 @@ export class ControllerQueuedTaskVerifier {
           routing = Object.freeze({ status: "not_recorded" });
         }
       }
-      return Object.freeze({ verification: receipt, outcome, ...(routing === undefined ? {} : { routing }) });
+      return Object.freeze({ verification: receipt, binding, outcome, ...(routing === undefined ? {} : { routing }) });
     } finally {
       this.#running.delete(leaseId);
     }

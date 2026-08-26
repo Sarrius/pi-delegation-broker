@@ -40,14 +40,18 @@ async function writePatch(patch) {
 }
 async function removePatch(path) { await rm(path, { force: true }).catch(() => undefined); }
 
-function acceptedProposal(proposal) {
-  if (!proposal || typeof proposal !== "object" || Array.isArray(proposal)) return false;
-  return proposal.acceptanceStatus === "accepted"
-    || proposal.semanticStatus === "accepted"
-    || proposal.semanticStatus === "semantically_accepted"
-    || proposal.verificationStatus === "completed"
-    || proposal.verification?.status === "accepted"
-    || proposal.accepted === true;
+function controllerVerifiedProposal(proposal, verificationAuthority) {
+  if (!verificationAuthority || typeof verificationAuthority.verify !== "function"
+    || !proposal?.controllerVerification || !proposal?.verificationBinding
+    || typeof proposal.patch !== "string" || proposal.patch.length === 0) return false;
+  const targetDigest = createHash("sha256").update(proposal.patch).digest("hex");
+  try {
+    return verificationAuthority.verify(proposal.controllerVerification, {
+      ...proposal.verificationBinding,
+      targetDigest,
+      expectedHead: proposal.baseCommit,
+    }) === true;
+  } catch { return false; }
 }
 
 function proposalIdentity(proposal) {
@@ -96,13 +100,15 @@ export async function createIntegrationWorktree(repoCwd, path, { baseCommit } = 
   });
 }
 
-export async function applyAcceptedProposal(integration, proposal) {
+export async function applyAcceptedProposal(integration, proposal, { verificationAuthority } = {}) {
   if (!integration || typeof integration.path !== "string" || !isAbsolute(integration.path)) fail("integration state is invalid");
   const proposalId = proposalIdentity(proposal);
-  if (!acceptedProposal(proposal)) return Object.freeze({ status: "blocked", reason: "proposal_not_semantically_accepted", proposalId });
   if (integration.appliedProposals?.includes(proposalId)) return Object.freeze({ status: "already_applied", proposalId, currentCommit: integration.currentCommit });
   const baseCommit = commit(proposal.baseCommit, "proposal baseCommit");
   if (typeof proposal.patch !== "string" || !proposal.patch) return Object.freeze({ status: "blocked", reason: "empty_patch", proposalId });
+  if (!controllerVerifiedProposal(proposal, verificationAuthority)) {
+    return Object.freeze({ status: "blocked", reason: "controller_verification_required", proposalId });
+  }
   if (Buffer.byteLength(proposal.patch, "utf8") > MAX_PATCH_BYTES) return Object.freeze({ status: "blocked", reason: "patch_too_large", proposalId });
   const changed = proposalChanged(proposal);
   const patchPath = await writePatch(proposal.patch);
@@ -183,11 +189,11 @@ function orderProposals(proposals) {
   return ordered;
 }
 
-export async function integrateAcceptedProposals(integration, proposals) {
+export async function integrateAcceptedProposals(integration, proposals, { verificationAuthority } = {}) {
   let current = integration;
   const applied = [];
   for (const proposal of orderProposals(proposals)) {
-    const result = await applyAcceptedProposal(current, proposal);
+    const result = await applyAcceptedProposal(current, proposal, { verificationAuthority });
     if (result.status === "blocked") return Object.freeze({ status: "blocked", integration: current, applied: Object.freeze(applied), conflict: result });
     if (result.status === "integrated") {
       current = result.integration;
@@ -223,7 +229,10 @@ function writeReceipt(path, receipt) {
   return Object.freeze(receipt);
 }
 
-export async function applyIntegrationToTarget({ repoCwd, integration, expectedHead, idempotencyKey, receiptPath } = {}) {
+export async function applyIntegrationToTarget({
+  repoCwd, integration, expectedHead, idempotencyKey, receiptPath,
+  verificationAuthority, verification, verificationBinding,
+} = {}) {
   if (typeof repoCwd !== "string" || !isAbsolute(repoCwd)) fail("repoCwd must be absolute");
   if (!integration?.path || !integration.baseCommit) fail("integration state is invalid");
   bounded(idempotencyKey, "idempotencyKey", 200);
@@ -239,6 +248,19 @@ export async function applyIntegrationToTarget({ repoCwd, integration, expectedH
   const { patch, baseCommit } = await collectIntegrationPatch(integration);
   const patchDigest = createHash("sha256").update(patch).digest("hex");
   if (!patch) return Object.freeze({ status: "empty", baseCommit, targetHead });
+  if (!verificationAuthority || typeof verificationAuthority.verify !== "function"
+    || !verification || !verificationBinding) {
+    return Object.freeze({ status: "blocked", reason: "controller_verification_required", patchDigest });
+  }
+  let authenticated = false;
+  try {
+    authenticated = verificationAuthority.verify(verification, {
+      ...verificationBinding,
+      targetDigest: patchDigest,
+      expectedHead: expected,
+    }) === true;
+  } catch { authenticated = false; }
+  if (!authenticated) return Object.freeze({ status: "blocked", reason: "controller_verification_failed", patchDigest });
   const staged = (await git(repoCwd, ["diff", "--cached", "--binary"])).stdout;
   if (staged && createHash("sha256").update(staged).digest("hex") === patchDigest) {
     const receipt = writeReceipt(path, { schemaVersion: 1, idempotencyKey, baseCommit, expectedHead: expected, targetHead, patchDigest, reconciled: true, appliedAt: Date.now() });

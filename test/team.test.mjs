@@ -39,10 +39,12 @@ test("sectioning, ensemble and reviewer joins require semantically accepted arti
     { id: "c", state: "completed", result: { status: "completed" } },
     { id: "review", state: "completed", result: { status: "completed", acceptanceStatus: "accepted" } },
   ];
-  assert.equal(evaluateTeamJoin({ id: "sections", kind: "sectioning", members: ["a", "b"] }, nodes).status, "accepted");
-  assert.equal(evaluateTeamJoin({ id: "ensemble", kind: "ensemble", members: ["a", "b", "c"], policy: "majority" }, nodes).status, "accepted");
-  assert.equal(evaluateTeamJoin({ id: "reviewed", kind: "reviewer", members: ["a"], reviewerId: "review" }, nodes).status, "accepted");
-  assert.equal(evaluateTeamJoin({ id: "not-accepted", kind: "sectioning", members: ["a", "c"] }, nodes).status, "pending");
+  const verifyControllerResult = () => true;
+  assert.equal(evaluateTeamJoin({ id: "sections", kind: "sectioning", members: ["a", "b"] }, nodes, { verifyControllerResult }).status, "accepted");
+  assert.equal(evaluateTeamJoin({ id: "ensemble", kind: "ensemble", members: ["a", "b", "c"], policy: "majority" }, nodes, { verifyControllerResult }).status, "accepted");
+  assert.equal(evaluateTeamJoin({ id: "reviewed", kind: "reviewer", members: ["a"], reviewerId: "review" }, nodes, { verifyControllerResult }).status, "accepted");
+  assert.equal(evaluateTeamJoin({ id: "not-accepted", kind: "sectioning", members: ["a", "c"] }, nodes, { verifyControllerResult }).status, "pending");
+  assert.equal(evaluateTeamJoin({ id: "sections", kind: "sectioning", members: ["a", "b"] }, nodes).status, "pending");
   assert.throws(() => normalizeTeamJoin({ id: "bad", kind: "ensemble", members: ["a"] }), /at least two/);
 });
 

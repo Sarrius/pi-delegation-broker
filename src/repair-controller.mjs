@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { captureLosslessJson } from "./lossless-json.mjs";
+import { repairProposalDigest, verifyHumanApproval } from "./human-approval.mjs";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,319}$/;
@@ -10,7 +11,7 @@ const TERMINAL = new Set(["verified", "rejected", "failed"]);
 const TRANSITIONS = new Map([
   ["proposed", new Set(["queued", "human_review", "verifying", "rejected"])],
   ["queued", new Set(["human_review", "verifying", "rejected"])],
-  ["human_review", new Set(["verifying", "rejected"])],
+  ["human_review", new Set(["queued", "verifying", "rejected"])],
   ["verifying", new Set(["verified", "failed", "human_review"])],
   ["verified", new Set()], ["rejected", new Set()], ["failed", new Set()],
 ]);
@@ -89,8 +90,17 @@ export class RepairStore {
     const record = json(file(this.#root, repairId)); if (!record) return undefined;
     const marker = json(stateFile(this.#root, repairId));
     try { validateProposal(record); } catch { return undefined; }
-    if (marker && (!STATES.has(marker.status) || marker.repairId !== repairId)) return undefined;
-    return Object.freeze({ ...record, status: marker?.status ?? "proposed", ...(marker?.reason ? { statusReason: marker.reason } : {}), ...(marker?.at ? { statusAt: marker.at } : {}) });
+    if (marker && (!STATES.has(marker.status) || marker.repairId !== repairId
+      || (marker.approvalDigest !== undefined && !/^[a-f0-9]{64}$/.test(marker.approvalDigest))
+      || (marker.approvalReceipt !== undefined && (typeof marker.approvalReceipt !== "object" || Array.isArray(marker.approvalReceipt) || JSON.stringify(marker.approvalReceipt).length > 16_384)))) return undefined;
+    return Object.freeze({
+      ...record,
+      status: marker?.status ?? "proposed",
+      ...(marker?.reason ? { statusReason: marker.reason } : {}),
+      ...(marker?.at ? { statusAt: marker.at } : {}),
+      ...(marker?.approvalDigest ? { approvalDigest: marker.approvalDigest } : {}),
+      ...(marker?.approvalReceipt ? { approvalReceipt: structuredClone(marker.approvalReceipt) } : {}),
+    });
   }
   list({ rootId, statuses } = {}) {
     const wanted = statuses ? new Set(statuses) : undefined; const out = [];
@@ -98,23 +108,41 @@ export class RepairStore {
     for (const name of readdirSync(this.#records)) { if (!name.endsWith(".json")) continue; const raw = json(join(this.#records, name)); const value = raw && this.read(raw.repairId); if (!value || (rootId && value.rootId !== rootId) || (wanted && !wanted.has(value.status))) continue; out.push(value); }
     return Object.freeze(out.sort((a, b) => a.createdAt - b.createdAt || a.repairId.localeCompare(b.repairId)));
   }
-  transition(repairId, status, { reason, at = Date.now() } = {}) {
+  transition(repairId, status, { reason, approvalDigest, approvalReceipt, at = Date.now() } = {}) {
     if (!STATES.has(status)) fail("repair status is invalid"); const current = this.read(repairId); if (!current) return undefined;
     if (current.status === status) return current;
     if (!TRANSITIONS.get(current.status)?.has(status)) fail(`transition ${current.status} -> ${status} is not allowed`);
-    atomic(stateFile(this.#root, repairId), { schemaVersion: 1, repairId, status, at, ...(reason ? { reason: bounded(reason, "reason", 2_000) } : {}) });
+    if (approvalDigest !== undefined && !/^[a-f0-9]{64}$/.test(approvalDigest)) fail("approvalDigest is invalid");
+    if (approvalReceipt !== undefined && (typeof approvalReceipt !== "object" || Array.isArray(approvalReceipt) || JSON.stringify(approvalReceipt).length > 16_384)) fail("approvalReceipt is invalid");
+    atomic(stateFile(this.#root, repairId), {
+      schemaVersion: 1, repairId, status, at,
+      ...(reason ? { reason: bounded(reason, "reason", 2_000) } : {}),
+      ...(approvalDigest ? { approvalDigest } : {}),
+      ...(approvalReceipt ? { approvalReceipt: structuredClone(approvalReceipt) } : {}),
+    });
     return this.read(repairId);
   }
 }
 
 export class RepairController {
-  #defects; #checkpoints; #store; #verify; #canary; #reconcile; #resume; #active;
-  constructor({ defectStore, checkpointStore, store, verifyProposal, freshProcessCanary, reconcile, resume } = {}) {
+  #defects; #checkpoints; #store; #verify; #canary; #reconcile; #resume; #active; #humanApprovalVerifier;
+  constructor({ defectStore, checkpointStore, store, verifyProposal, freshProcessCanary, reconcile, resume, humanApprovalVerifier, humanApprovalPublicKey } = {}) {
     if (!defectStore || typeof defectStore.read !== "function") fail("defectStore is required");
     if (!checkpointStore || typeof checkpointStore.acceptedFor !== "function") fail("checkpointStore is required");
     if (!store || typeof store.reserve !== "function") fail("repair store is required");
     if (typeof verifyProposal !== "function" || typeof freshProcessCanary !== "function" || typeof reconcile !== "function" || typeof resume !== "function") fail("controller gates are required");
+    if (humanApprovalVerifier !== undefined && typeof humanApprovalVerifier !== "function") fail("humanApprovalVerifier must be a function");
+    if (humanApprovalVerifier === undefined && humanApprovalPublicKey !== undefined && !humanApprovalPublicKey) fail("humanApprovalPublicKey is invalid");
     this.#defects = defectStore; this.#checkpoints = checkpointStore; this.#store = store; this.#verify = verifyProposal; this.#canary = freshProcessCanary; this.#reconcile = reconcile; this.#resume = resume;
+    this.#humanApprovalVerifier = humanApprovalVerifier ?? (humanApprovalPublicKey
+      ? (receipt, proposal) => verifyHumanApproval(receipt, {
+        publicKey: humanApprovalPublicKey,
+        expected: {
+          repairId: proposal.repairId, defectId: proposal.defectId, rootId: proposal.rootId,
+          taskId: proposal.taskId, proposalDigest: repairProposalDigest(proposal),
+        },
+      })
+      : undefined);
   }
   propose({ defectId, rootId, taskId, summary, affectedPaths, tokenBudget = 1_000, metadata } = {}) {
     const defect = this.#defects.read(defectId); if (!defect || defect.rootId !== rootId || defect.taskId !== taskId) return { status: "rejected", reason: "defect_binding" };
@@ -129,10 +157,34 @@ export class RepairController {
     }
     return Object.freeze({ status: "proposed", repairId: proposal.repairId });
   }
-  async run(repairId) {
+  approve(repairId, receipt) {
+    const proposal = this.#store.read(repairId);
+    if (!proposal) return { status: "rejected", reason: "unknown_repair" };
+    if (proposal.status !== "human_review") return { status: proposal.status, repairId };
+    const verifier = this.#humanApprovalVerifier;
+    let valid = false;
+    try { valid = typeof verifier === "function" && verifier(receipt, proposal) === true; } catch { valid = false; }
+    if (!valid) return Object.freeze({ status: "rejected", reason: "human_approval_invalid", repairId });
+    const receiptDigest = createHash("sha256").update(JSON.stringify(receipt)).digest("hex");
+    this.#store.transition(repairId, "queued", { reason: "signed human approval recorded", approvalDigest: receiptDigest, approvalReceipt: receipt });
+    return Object.freeze({ status: "approved", repairId, approvalDigest: receiptDigest });
+  }
+
+  async run(repairId, { approval } = {}) {
     if (this.#active) return Object.freeze({ status: "queued", repairId, reason: "another repair is active" });
-    const proposal = this.#store.read(repairId); if (!proposal) return { status: "rejected", reason: "unknown_repair" };
-    if (proposal.status === "human_review") return { status: "human_review", repairId };
+    let proposal = this.#store.read(repairId); if (!proposal) return { status: "rejected", reason: "unknown_repair" };
+    const protectedPath = proposal.affectedPaths.find((path) => PROTECTED.some((pattern) => pattern.test(path)));
+    if (proposal.status === "human_review") {
+      if (approval === undefined) return { status: "human_review", repairId };
+      const approved = this.approve(repairId, approval);
+      if (approved.status !== "approved") return approved;
+      proposal = this.#store.read(repairId);
+    }
+    if (protectedPath) {
+      let approvalStillValid = false;
+      try { approvalStillValid = proposal.approvalDigest !== undefined && this.#humanApprovalVerifier?.(proposal.approvalReceipt, proposal) === true; } catch { approvalStillValid = false; }
+      if (!approvalStillValid) return { status: "human_review", repairId };
+    }
     if (proposal.status !== "proposed" && proposal.status !== "queued") return { status: proposal.status, repairId };
     const attempt = this.#store.attempt(); if (attempt.status !== "reserved") return attempt;
     this.#active = repairId;
