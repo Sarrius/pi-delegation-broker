@@ -44,6 +44,8 @@ import {
   ModelAffinityJournal,
   RoutingBoard,
   RoutingAuditJournal,
+  RepairController,
+  RepairStore,
   TaskOrchestrator,
   appendWorkflowNodes,
   closeWorkflow,
@@ -158,6 +160,19 @@ const RECURSION_POLICY = Type.Object({
   maxAttempts: Type.Optional(Type.Integer({ minimum: 1, maximum: 256 })),
   deadlineAt: Type.Optional(Type.Integer({ minimum: 1 })),
 });
+const HUMAN_APPROVAL = Type.Object({
+  schemaVersion: Type.Literal(1),
+  approvalId: Type.String({ maxLength: 80 }),
+  repairId: Type.String({ maxLength: 80 }),
+  defectId: Type.String({ maxLength: 80 }),
+  rootId: Type.String({ maxLength: 320 }),
+  taskId: Type.String({ maxLength: 320 }),
+  proposalDigest: Type.String({ minLength: 64, maxLength: 64 }),
+  expiresAt: Type.Integer({ minimum: 1 }),
+  decision: Type.Literal("approve"),
+  signature: Type.String({ minLength: 32, maxLength: 4096 }),
+});
+
 const ACCEPTANCE_CHECK = Type.Object({
   id: StringEnum([...controllerAcceptanceCheckIds]),
   path: Type.Optional(Type.String({ maxLength: 1024, description: "Relative path for the fixed file-equals check only." })),
@@ -293,6 +308,8 @@ interface BrokerRuntime {
   defectStore: any;
   recursiveStore: any;
   verificationAuthority: any;
+  repairStore: any;
+  repairController: any;
 }
 
 function formatPreferences(tier: string) {
@@ -434,6 +451,17 @@ function controllerProviderPair(ctx: any) {
   return Object.freeze({ providerTransport: value.providerTransport, routeResolver: value.routeResolver });
 }
 
+function controllerRepairAdapter(ctx: any) {
+  const value = ctx?.controllerRepair;
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).some((key) => !["verifyProposal", "freshProcessCanary", "reconcile", "resume", "humanApprovalVerifier", "humanApprovalPublicKey"].includes(key))
+    || ["verifyProposal", "freshProcessCanary", "reconcile", "resume"].some((key) => typeof value[key] !== "function")) {
+    throw new Error("controllerRepair must be an owner-injected repair gate adapter");
+  }
+  return Object.freeze({ ...value });
+}
+
 function liveProviderCatalog(ctx: any, supplementalModels: any[] = []) {
   const runtimeModels = ctx?.modelRegistry?.getAll?.() ?? ctx?.modelRegistry?.getAvailable?.();
   if (!Array.isArray(runtimeModels)) throw new Error("Pi live model registry is unavailable");
@@ -455,6 +483,7 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
   }
   const keys = loadOrCreateRegistryKeys();
   const controllerProvider = controllerProviderPair(ctx);
+  const controllerRepair = controllerRepairAdapter(ctx);
   // An empty authorized fleet is a valid runtime state: all subscription credentials may be
   // expired or temporarily unavailable. The signed controller registry then denies new work
   // cleanly instead of retaining an account that is no longer usable.
@@ -483,6 +512,17 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
   });
   recursiveStore.reconcile();
   const verificationAuthority = new ControllerVerificationAuthority({ evidenceStore });
+  const repairStore = new RepairStore({ root: join(STATE_DIR, "repairs") });
+  const deniedRepairGate = async () => ({ status: "denied", reason: "controller_repair_adapter_not_configured" });
+  const repairController = new RepairController({
+    defectStore, checkpointStore, store: repairStore,
+    verifyProposal: controllerRepair?.verifyProposal ?? deniedRepairGate,
+    freshProcessCanary: controllerRepair?.freshProcessCanary ?? deniedRepairGate,
+    reconcile: controllerRepair?.reconcile ?? deniedRepairGate,
+    resume: controllerRepair?.resume ?? deniedRepairGate,
+    ...(controllerRepair?.humanApprovalVerifier ? { humanApprovalVerifier: controllerRepair.humanApprovalVerifier } : {}),
+    ...(controllerRepair?.humanApprovalPublicKey ? { humanApprovalPublicKey: controllerRepair.humanApprovalPublicKey } : {}),
+  });
   const supervisor = new SingleHostBrokerSupervisor({
     stateDir: STATE_DIR,
     // Without this the controller token alone would be trusted, and every verified completion
@@ -663,6 +703,8 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     defectStore,
     recursiveStore,
     verificationAuthority,
+    repairStore,
+    repairController,
   };
 }
 
@@ -699,6 +741,10 @@ export default function piDelegationBroker(pi: any) {
   const sessionBindings = new SessionBindingStore({ root: SESSION_BINDINGS_DIR });
 
   const currentSessionId = (ctx: any = lastCtx) => sessionIdentity(ctx);
+  const assertRepairOwner = (proposal: any, ctx: any) => {
+    const owner = proposal?.metadata?.ownerSessionId;
+    if (owner !== undefined && owner !== currentSessionId(ctx)) throw new Error("repair owner session does not match");
+  };
   const activeRootJobs = () => {
     try {
       return listJobs(JOBS_DIR)
@@ -2146,6 +2192,88 @@ export default function piDelegationBroker(pi: any) {
         };
       } catch (error) {
         return { content: [{ type: "text", text: `Workflow append rejected: ${(error as Error).message}` }], isError: true };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_repair_propose",
+    label: "Propose controller repair",
+    description: "Create a proposal-only controller repair. Protected paths remain in signed human review until an owner receipt is supplied.",
+    parameters: Type.Object({
+      defectId: Type.String({ maxLength: 80 }), rootId: Type.String({ maxLength: 320 }), taskId: Type.String({ maxLength: 320 }),
+      summary: Type.String({ minLength: 1, maxLength: 2_000 }),
+      affectedPaths: Type.Array(Type.String({ minLength: 1, maxLength: 1_024 }), { minItems: 1, maxItems: 256 }),
+      tokenBudget: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_000_000 })),
+    }),
+    async execute(_toolCallId: string, params: { defectId: string; rootId: string; taskId: string; summary: string; affectedPaths: string[]; tokenBudget?: number }, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
+      lastCtx = ctx;
+      try {
+        const broker = await ensureBroker(ctx);
+        const result = broker.repairController.propose({ ...params, metadata: { ownerSessionId: currentSessionId(ctx) } });
+        return { content: [{ type: "text", text: `Repair proposal ${result.repairId ?? "not admitted"}: ${result.status}.` }], details: result };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Repair proposal rejected: ${(error as Error).message}` }], isError: true };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_repair_approve",
+    label: "Approve controller repair",
+    description: "Submit an already signed, expiry-bound owner receipt for a protected controller repair.",
+    parameters: Type.Object({ repairId: Type.String({ maxLength: 80 }), approval: HUMAN_APPROVAL }),
+    async execute(_toolCallId: string, params: { repairId: string; approval: any }, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
+      lastCtx = ctx;
+      try {
+        const broker = await ensureBroker(ctx);
+        const proposal = broker.repairStore.read(params.repairId);
+        assertRepairOwner(proposal, ctx);
+        const result = broker.repairController.approve(params.repairId, params.approval);
+        return { content: [{ type: "text", text: `Repair ${params.repairId}: ${result.status}.` }], details: result, isError: result.status === "rejected" };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Repair approval rejected: ${(error as Error).message}` }], isError: true };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_repair_run",
+    label: "Run controller repair",
+    description: "Run a controller-owned proposal through verification, fresh-process canary, reconciliation and resume gates.",
+    parameters: Type.Object({ repairId: Type.String({ maxLength: 80 }), approval: Type.Optional(HUMAN_APPROVAL) }),
+    async execute(_toolCallId: string, params: { repairId: string; approval?: any }, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
+      lastCtx = ctx;
+      try {
+        const broker = await ensureBroker(ctx);
+        const proposal = broker.repairStore.read(params.repairId);
+        assertRepairOwner(proposal, ctx);
+        const result = await broker.repairController.run(params.repairId, { approval: params.approval });
+        return { content: [{ type: "text", text: `Repair ${params.repairId}: ${result.status}.` }], details: result, isError: ["failed", "rejected"].includes(result.status) };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Repair run rejected: ${(error as Error).message}` }], isError: true };
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "delegate_repair_status",
+    label: "Inspect controller repair",
+    description: "Read a bounded controller repair proposal status.",
+    parameters: Type.Object({ repairId: Type.String({ maxLength: 80 }) }),
+    async execute(_toolCallId: string, params: { repairId: string }, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
+      lastCtx = ctx;
+      try {
+        const broker = await ensureBroker(ctx);
+        const proposal = broker.repairStore.read(params.repairId);
+        assertRepairOwner(proposal, ctx);
+        return { content: [{ type: "text", text: proposal ? `Repair ${params.repairId}: ${proposal.status}.` : "Repair not found." }], details: proposal, isError: !proposal };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Repair status rejected: ${(error as Error).message}` }], isError: true };
       }
     },
   });
