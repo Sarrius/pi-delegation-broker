@@ -207,7 +207,7 @@ function checkUsageMonotonic(previous, next) {
 
 function validateTerminalPayload(payload) {
   if (!payload || typeof payload !== "object") fail("frame_payload_invalid", "terminal payload must be an object");
-  const allowed = new Set(["outcome", "finishReason", "providerRequestId", "httpStatus", "retryAfterMs", "usage", "evidenceRefs"]);
+  const allowed = new Set(["outcome", "finishReason", "providerRequestId", "providerReason", "httpStatus", "retryAfterMs", "usage", "evidenceRefs"]);
   for (const key of Object.keys(payload)) {
     if (!allowed.has(key)) fail("frame_payload_invalid", `unknown terminal field ${key}`);
   }
@@ -215,6 +215,9 @@ function validateTerminalPayload(payload) {
   if (payload.finishReason !== undefined) boundedText(payload.finishReason, "finishReason", 64);
   if (payload.providerRequestId !== undefined && (typeof payload.providerRequestId !== "string" || !ID.test(payload.providerRequestId))) {
     fail("frame_payload_invalid", "providerRequestId must be a bounded identifier");
+  }
+  if (payload.providerReason !== undefined && (typeof payload.providerReason !== "string" || !/^[a-z_]{1,64}$/.test(payload.providerReason))) {
+    fail("frame_payload_invalid", "providerReason must be a bounded classification");
   }
   if (payload.httpStatus !== undefined && (!Number.isInteger(payload.httpStatus) || payload.httpStatus < 100 || payload.httpStatus > 599)) {
     fail("frame_payload_invalid", "httpStatus must be an integer between 100 and 599");
@@ -422,6 +425,7 @@ export class ProviderStreamAssembler {
         outcome: payload.outcome,
         finishReason: payload.finishReason ?? null,
         providerRequestId: payload.providerRequestId ?? null,
+        ...(payload.providerReason === undefined ? {} : { providerReason: payload.providerReason }),
         httpStatus: payload.httpStatus ?? null,
         retryAfterMs: payload.retryAfterMs ?? null,
         usage: payload.usage ? Object.freeze(validateUsage(payload.usage, this.#limits)) : null,

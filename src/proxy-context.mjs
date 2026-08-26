@@ -39,7 +39,11 @@ export function proxyTerminalError(terminal) {
   if (outcome === "succeeded_terminal") return undefined;
   if (typeof outcome !== "string" || !/^[a-z_]+$/.test(outcome)) return "controller provider returned an invalid terminal";
   const status = terminal?.payload?.httpStatus;
-  return Number.isSafeInteger(status) && status >= 100 && status <= 599
-    ? `controller provider terminal: ${outcome} (${status})`
-    : `controller provider terminal: ${outcome}`;
+  const reason = terminal?.payload?.providerReason;
+  const safeReason = typeof reason === "string" && /^[a-z_]{1,64}$/.test(reason) ? reason : undefined;
+  const detail = [
+    Number.isSafeInteger(status) && status >= 100 && status <= 599 ? String(status) : undefined,
+    safeReason,
+  ].filter(Boolean).join(", ");
+  return detail ? `controller provider terminal: ${outcome} (${detail})` : `controller provider terminal: ${outcome}`;
 }

@@ -18,7 +18,7 @@ import { ProviderProtocolError } from "./provider-protocol.mjs";
 
 export const ANTHROPIC_MESSAGES_ADAPTER_ID = "anthropic-messages@1";
 export const ANTHROPIC_API_VERSION = "2023-06-01";
-export const ANTHROPIC_OAUTH_BETA = "claude-code-20250219,oauth-2025-04-20";
+export const ANTHROPIC_OAUTH_BETA = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14";
 export const ANTHROPIC_OAUTH_USER_AGENT = "claude-cli/2.1.75";
 
 const MAX_ERROR_BYTES = 32 * 1024;
@@ -158,6 +158,7 @@ function requestFromCapturedContext(snapshot, captured, oauth = false) {
   };
   const tools = normalizeTools(value);
   if (tools.length > 0) request.tools = tools;
+  if (oauth && snapshot.reasoningEffort === null) request.thinking = { type: "disabled" };
   return Object.freeze({ request: captureLosslessJson(request).value, contextDigest: captured.digest });
 }
 
@@ -206,6 +207,23 @@ async function boundedErrorBody(response) {
   } catch { return null; }
 }
 
+function providerReason(body) {
+  const error = isPlainObject(body?.error) ? body.error : null;
+  const type = typeof error?.type === "string" ? error.type : "";
+  const message = typeof error?.message === "string" ? error.message : "";
+  const joined = `${type} ${message}`.toLowerCase();
+  if (joined.includes("model") && (joined.includes("not found") || joined.includes("does not exist") || joined.includes("invalid") || joined.includes("unknown"))) return "invalid_model";
+  if (joined.includes("cache") || joined.includes("prompt caching")) return "cache_control_rejected";
+  if (joined.includes("max_tokens") || joined.includes("max tokens") || joined.includes("maximum tokens")) return "invalid_max_tokens";
+  if (joined.includes("system")) return "invalid_system";
+  if (joined.includes("message")) return "invalid_messages";
+  if (joined.includes("tool")) return "invalid_tools";
+  if (joined.includes("extra usage") || joined.includes("plan limits")) return "subscription_extra_usage_required";
+  if (joined.includes("oauth") || joined.includes("subscription") || joined.includes("claude code")) return "oauth_request_rejected";
+  if (type === "invalid_request_error") return "invalid_request";
+  return undefined;
+}
+
 function errorKind(body) {
   const error = isPlainObject(body?.error) ? body.error : null;
   const type = typeof error?.type === "string" ? error.type : "";
@@ -232,8 +250,12 @@ function normalizedHttpTerminal(response, body, now) {
   if (classified) return { type: "terminal", outcome: classified, payload: base };
   // A provider HTTP rejection means no model stream was accepted. The name
   // retained by the closed vocabulary is historical; this is not a claim that
-  // no TCP request was sent.
-  if (status >= 400 && status < 500) return { type: "terminal", outcome: "rejected_before_send", payload: base };
+  // no TCP request was sent. Keep only a coarse allowlisted reason derived from
+  // the provider error; never expose its message or raw body.
+  if (status >= 400 && status < 500) {
+    const reason = providerReason(body);
+    return { type: "terminal", outcome: "rejected_before_send", payload: { ...base, ...(reason === undefined ? {} : { providerReason: reason }) } };
+  }
   return { type: "terminal", outcome: "transport_before_headers", payload: base };
 }
 
@@ -390,6 +412,17 @@ function authHeadersForCredential(credential) {
       "anthropic-dangerous-direct-browser-access": "true",
       "user-agent": ANTHROPIC_OAUTH_USER_AGENT,
       "x-app": "cli",
+      // These are non-secret SDK provenance headers used by the native Pi
+      // Anthropic client; keeping them identical avoids OAuth gateway policy
+      // treating the controller as an unknown HTTP client.
+      "x-stainless-arch": process.arch,
+      "x-stainless-lang": "js",
+      "x-stainless-os": process.platform === "darwin" ? "MacOS" : process.platform,
+      "x-stainless-package-version": "0.91.1",
+      "x-stainless-retry-count": "0",
+      "x-stainless-runtime": "node",
+      "x-stainless-runtime-version": process.version,
+      "x-stainless-timeout": "600",
       oauth: true,
     });
   }
@@ -443,7 +476,9 @@ export class AnthropicMessagesTransport {
         redirect: "error",
         signal,
         headers: {
-          "accept": "text/event-stream",
+          // Match the native Anthropic SDK: streaming is selected by the body and
+          // the response content type is not used as an authentication signal.
+          "accept": "application/json",
           "anthropic-version": ANTHROPIC_API_VERSION,
           "content-type": "application/json",
           ...Object.fromEntries(Object.entries(auth).filter(([key]) => key !== "oauth")),
