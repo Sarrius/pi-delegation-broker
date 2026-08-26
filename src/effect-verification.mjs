@@ -1,8 +1,9 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createControllerAcceptancePlan, normalizeControllerAcceptanceSpecs } from "./acceptance-plan.mjs";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -10,7 +11,6 @@ const GIT_TIMEOUT_MS = 120_000;
 const MAX_PATCH_BYTES = 64 * 1024 * 1024;
 const MAX_OUTPUT_CHARS = 32_000;
 const MAX_CHECKS = 20;
-const DEFAULT_CHECK_TIMEOUT_MS = 30_000;
 const COMMIT = /^[0-9a-f]{7,64}$/;
 
 export class EffectVerificationError extends Error {
@@ -30,22 +30,6 @@ function commandError(error) {
 }
 
 /**
- * Default controller-side check executor: no shell, bounded output, hard timeout.
- */
-export function spawnControllerArgv({ argv, cwd, timeoutMs = DEFAULT_CHECK_TIMEOUT_MS }) {
-  return new Promise((settle) => {
-    const child = spawn(argv[0], argv.slice(1), {
-      cwd, shell: false, stdio: ["ignore", "pipe", "pipe"], signal: AbortSignal.timeout(timeoutMs),
-    });
-    let stdout = "", stderr = "";
-    child.stdout.on("data", (data) => { stdout = (stdout + data).slice(0, MAX_OUTPUT_CHARS); });
-    child.stderr.on("data", (data) => { stderr = (stderr + data).slice(0, MAX_OUTPUT_CHARS); });
-    child.once("error", (error) => settle({ exitCode: 127, stdout, stderr: truncate(String(error.message)) }));
-    child.once("close", (code) => settle({ exitCode: code ?? 1, stdout, stderr }));
-  });
-}
-
-/**
  * Verify a child-proposed patch without letting it reach the real tree.
  *
  * A child that edits files has produced a *claim*, not an effect: its own report that the change
@@ -58,18 +42,16 @@ export function spawnControllerArgv({ argv, cwd, timeoutMs = DEFAULT_CHECK_TIMEO
  * ordinary verification outcomes rather than controller faults.
  */
 export async function verifyProposedPatch({
-  repoCwd, baseCommit, patch, changed, checks = [], runArgv = spawnControllerArgv, scratchRoot,
+  repoCwd, baseCommit, patch, changed, checks = [], runArgv, scratchRoot,
 } = {}) {
   if (typeof repoCwd !== "string" || repoCwd.length === 0) throw new EffectVerificationError("repoCwd is required");
   if (typeof baseCommit !== "string" || !COMMIT.test(baseCommit)) throw new EffectVerificationError("baseCommit must be a git object id");
   if (patch !== undefined && typeof patch !== "string") throw new EffectVerificationError("patch must be a string");
+  if (runArgv !== undefined) throw new EffectVerificationError("caller-provided acceptance executors are not supported");
   if (!Array.isArray(checks) || checks.length > MAX_CHECKS) throw new EffectVerificationError(`checks must be an array of at most ${MAX_CHECKS} entries`);
-  for (const check of checks) {
-    if (typeof check?.id !== "string" || !check.id) throw new EffectVerificationError("each check requires an id");
-    if (!Array.isArray(check.argv) || check.argv.length === 0 || check.argv.some((token) => typeof token !== "string" || token.length === 0)) {
-      throw new EffectVerificationError(`check ${check.id} requires a non-empty argv of strings`);
-    }
-  }
+  let normalizedChecks;
+  try { normalizedChecks = normalizeControllerAcceptanceSpecs(checks); }
+  catch (error) { throw new EffectVerificationError(error instanceof Error ? error.message : "acceptance checks are invalid"); }
 
   const receipt = (fields) => Object.freeze({
     baseCommit, applied: false, verified: false, checks: Object.freeze([]), ...fields,
@@ -116,12 +98,13 @@ export async function verifyProposedPatch({
       }
     }
 
+    const plan = createControllerAcceptancePlan(normalizedChecks, { cwd: scratch });
     const results = [];
-    for (const check of checks) {
-      const outcome = await runArgv({ argv: check.argv, cwd: scratch, timeoutMs: check.timeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS });
+    for (const check of plan.checks) {
+      const outcome = await plan.runCheck(check);
       results.push(Object.freeze({
         id: check.id,
-        ...(check.claim ? { claim: check.claim } : {}),
+        claim: check.claim,
         exitCode: outcome.exitCode,
         ok: outcome.exitCode === 0,
         stdout: truncate(outcome.stdout),

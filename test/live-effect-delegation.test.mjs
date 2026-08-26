@@ -109,7 +109,7 @@ test("live: a child proposes a change and only a controller-verified patch comes
       baseCommit: result.baseCommit,
       patch: result.patch,
       changed: result.changed,
-      checks: [{ id: "value-is-two", claim: "value.txt contains two", argv: ["grep", "-qx", "two", "value.txt"] }],
+      checks: [{ id: "file-equals", path: "value.txt", content: "two\n" }],
     });
 
     assert.equal(receipt.verified, true, `controller must verify the patch, got: ${receipt.reason} ${JSON.stringify(receipt.checks)}`);

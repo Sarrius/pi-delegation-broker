@@ -72,7 +72,10 @@ import {
   qualityForModel,
   parseResourceModel,
   classifyProviderProbe,
+  controllerAcceptanceCheckIds,
+  createControllerAcceptancePlan,
   isControllerProbeUrl,
+  normalizeControllerAcceptanceSpecs,
   probeProviderModels,
   readCurrencyCache,
   readProviderRegistry,
@@ -155,11 +158,11 @@ const RECURSION_POLICY = Type.Object({
   deadlineAt: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 const ACCEPTANCE_CHECK = Type.Object({
-  id: Type.String(),
-  claim: Type.String(),
-  argv: Type.Array(Type.String(), { minItems: 1, maxItems: 32 }),
+  id: StringEnum([...controllerAcceptanceCheckIds]),
+  path: Type.Optional(Type.String({ maxLength: 1024, description: "Relative path for the fixed file-equals check only." })),
+  content: Type.Optional(Type.String({ maxLength: 1024 * 1024, description: "Expected UTF-8 content for the fixed file-equals check only." })),
   timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 120000 })),
-});
+}, { description: "Fixed controller-owned checks. Executable argv and caller-supplied claims are not accepted." });
 
 const WORKFLOW_NODE = Type.Object({
   id: Type.String({ description: "Stable workflow node id." }),
@@ -281,7 +284,7 @@ const DELEGATE_PARAMS = Type.Object({
 interface BrokerRuntime {
   supervisor: any;
   runner: any;
-  acceptancePlans: Map<string, Array<{ id: string; claim: string; argv: string[]; timeoutMs: number }>>;
+  acceptancePlans: Map<string, any>;
   stopCurrencyRefresh: () => void;
   lastRoute?: { summary: string; at: number };
   routingAudit: any;
@@ -484,7 +487,7 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     sweepIntervalMs: 1_000,
   });
   await supervisor.start();
-  const acceptancePlans = new Map<string, Array<{ id: string; claim: string; argv: string[]; timeoutMs: number }>>();
+  const acceptancePlans = new Map<string, any>();
   const affinityJournal = new ModelAffinityJournal({ path: join(STATE_DIR, "model-affinity.json") });
   const routingAudit = new RoutingAuditJournal({ path: ROUTING_AUDIT_PATH });
   const verifiedRouting = new ControllerVerifiedRoutingBoard({
@@ -497,12 +500,8 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
       if (!plan) throw new Error("no controller acceptance plan registered for tracked task");
       return new ControllerAcceptanceVerifier({
         evidenceStore,
-        checks: plan.map(({ id, claim, timeoutMs }) => ({ id, claim, kind: "command", timeoutMs })),
-        runCheck: (check: { id: string }, { signal }: { signal: AbortSignal }) => {
-          const item = plan.find((entry) => entry.id === check.id);
-          if (!item) throw new Error("controller acceptance plan check missing");
-          return runControllerArgv(item.argv, PARENT_AGENT_DIR, signal);
-        },
+        checks: plan.checks,
+        runCheck: plan.runCheck,
       });
     },
     finalize: ({ taskId, leaseId, fencingToken, verification }: any) => requestBrokerIpc({
@@ -1058,7 +1057,7 @@ export default function piDelegationBroker(pi: any) {
         broker = await ensureBroker(ctx);
         if (controller.signal.aborted) throw new Error("background task paused before child dispatch");
         if (Array.isArray(initial.acceptance) && initial.acceptance.length > 0) {
-          broker.acceptancePlans.set(taskId, initial.acceptance);
+          broker.acceptancePlans.set(taskId, createControllerAcceptancePlan(initial.acceptance, { cwd: initial.cwd }));
         }
         // The contract is resolved against the session that is alive now, not the one that
         // submitted the job: after a restart the recorded axes still apply, but inherit has to
@@ -1211,7 +1210,9 @@ export default function piDelegationBroker(pi: any) {
         const startedAt = Date.now();
         let result: any;
         try {
-          if (node.acceptance?.length) broker.acceptancePlans.set(childId, node.acceptance);
+          if (node.acceptance?.length) {
+            broker.acceptancePlans.set(childId, createControllerAcceptancePlan(node.acceptance, { cwd: initial.cwd }));
+          }
           const nodeContract = resolveContract(node.contract ?? normalizeContract(node), ctx ?? lastCtx);
           const nodeRoleFraming = renderRoleFraming(nodeContract.role);
           result = await broker.runner.run({
@@ -1684,7 +1685,7 @@ export default function piDelegationBroker(pi: any) {
       "Read-only delegation is asynchronous by default. Keep working after submission; the controller wakes the parent once the terminal report is durable, then collect it and continue the owner task.",
     ],
     parameters: DELEGATE_PARAMS,
-    async execute(toolCallId: string, params: { task: string; capabilities?: string[]; tier?: "cheap" | "standard" | "frontier"; background?: boolean; wait?: boolean; idempotencyKey?: string; deadlineMs?: number; acceptance?: Array<{ id: string; claim: string; argv: string[]; timeoutMs?: number }>; proposeChangesIn?: string }, _signal: AbortSignal, onUpdate: any, ctx: any) {
+    async execute(toolCallId: string, params: { task: string; capabilities?: string[]; tier?: "cheap" | "standard" | "frontier"; background?: boolean; wait?: boolean; idempotencyKey?: string; deadlineMs?: number; acceptance?: Array<{ id: string; path?: string; content?: string; timeoutMs?: number }>; proposeChangesIn?: string }, _signal: AbortSignal, onUpdate: any, ctx: any) {
       // An effect nobody can check is not delegable: without controller-owned checks the only
       // evidence a patch is good would be the child's own word for it.
       if (params.proposeChangesIn && !params.acceptance?.length) {
@@ -1703,6 +1704,12 @@ export default function piDelegationBroker(pi: any) {
         // Reject an unhonourable contract at submission, while the caller is still here to read
         // the reason, instead of failing later inside a background job.
         resolveContract(submittedContract, ctx);
+      } catch (error) {
+        return { content: [{ type: "text", text: (error as Error).message }], isError: true };
+      }
+      let normalizedAcceptance: readonly any[] = [];
+      try {
+        normalizedAcceptance = normalizeControllerAcceptanceSpecs(params.acceptance);
       } catch (error) {
         return { content: [{ type: "text", text: (error as Error).message }], isError: true };
       }
@@ -1728,9 +1735,7 @@ export default function piDelegationBroker(pi: any) {
             ...(params.deadlineMs ? { deadlineAt: submittedAt + params.deadlineMs } : {}),
             ...(params.capabilities?.length ? { capabilities: [...params.capabilities] } : {}),
             ...(params.tier ? { tier: params.tier } : {}),
-            ...(params.acceptance?.length ? {
-              acceptance: params.acceptance.map((check) => ({ ...check, timeoutMs: check.timeoutMs ?? 30_000 })),
-            } : {}),
+            ...(normalizedAcceptance.length ? { acceptance: structuredClone(normalizedAcceptance) } : {}),
             policyGeneration: "unresolved",
           });
         } catch (error) {
@@ -1764,13 +1769,17 @@ export default function piDelegationBroker(pi: any) {
       try { syncContract = resolveContract(normalizeContract(params), ctx); }
       catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
       const syncRoleFraming = renderRoleFraming(syncContract.role);
-      if (params.acceptance) broker.acceptancePlans.set(childId, params.acceptance.map((check) => ({ ...check, timeoutMs: check.timeoutMs ?? 30_000 })));
+      if (normalizedAcceptance.length > 0) {
+        broker.acceptancePlans.set(childId, createControllerAcceptancePlan(normalizedAcceptance, {
+          cwd: params.proposeChangesIn ?? ctx.cwd,
+        }));
+      }
       const runArgs = {
         childId,
         promptDigest,
         // Preserve one logical controller task id across provider failover. The resolver
         // tracks only the terminal successful attempt under this id, which finds this plan.
-        trackForVerification: Boolean(params.acceptance?.length && !params.proposeChangesIn),
+        trackForVerification: Boolean(normalizedAcceptance.length && !params.proposeChangesIn),
         cwd: params.proposeChangesIn ?? ctx.cwd,
         ...(params.proposeChangesIn ? { isolation: "worktree" as const } : {}),
         thinkingLevel: syncContract.requestedThinking,
@@ -1838,7 +1847,7 @@ export default function piDelegationBroker(pi: any) {
           baseCommit: result.baseCommit,
           patch: result.patch,
           changed: result.changed,
-          checks: params.acceptance!.map((check) => ({ id: check.id, claim: check.claim, argv: check.argv, timeoutMs: check.timeoutMs ?? 30_000 })),
+          checks: normalizedAcceptance,
         });
         const summary = receipt.checks.map((entry: any) => `${entry.ok ? "pass" : `fail(${entry.exitCode})`} ${entry.id}`).join(", ");
         if (!receipt.verified) {
