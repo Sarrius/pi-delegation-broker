@@ -96,11 +96,61 @@ export function assignGenerations(modelIds) {
   return generations;
 }
 
+/** Parse an HTTP Retry-After header into a bounded delay without retaining the header itself. */
+export function retryAfterMs(value, now = Date.now()) {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    if (Number.isFinite(seconds) && seconds > 0 && seconds <= 86_400) return Math.ceil(seconds * 1_000);
+    return undefined;
+  }
+  const timestamp = Date.parse(trimmed);
+  if (!Number.isFinite(timestamp) || !Number.isSafeInteger(now) || timestamp <= now) return undefined;
+  const delay = timestamp - now;
+  return delay <= 86_400_000 ? delay : undefined;
+}
+
 /**
- * Fetch one provider's live model list. Controller-side only: the credential never leaves
+ * Probe endpoints may be remote HTTPS or a local multi-account adapter. Plain HTTP is only
+ * accepted for loopback hosts; allowing arbitrary HTTP here would turn the availability sweep
+ * into an SSRF primitive and would also probe the wrong ambient service.
+ */
+export function isControllerProbeUrl(value) {
+  if (typeof value !== "string" || value.length < 1 || value.length > 2_048) return false;
+  try {
+    const parsed = new URL(value);
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) return false;
+    if (parsed.protocol === "https:") return true;
+    return parsed.protocol === "http:"
+      && (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "[::1]" || parsed.hostname === "::1");
+  } catch {
+    return false;
+  }
+}
+
+/** Map a model-list probe result to the broker health transition it justifies. */
+export function classifyProviderProbe(result) {
+  if (result?.status === "ok") return Object.freeze({ status: "available" });
+  if (result?.status === "http_error" && (result.code === 402 || result.code === 429)) {
+    // A model-list endpoint being throttled does not prove that inference quota is exhausted;
+    // quarantine the account with a short half-open retry rather than opening the long inference
+    // breaker. Actual inference 429s still use markRateLimited through the leased attempt path.
+    return Object.freeze({
+      status: "unknown", scope: "capacity_group", reason: "provider availability probe throttled",
+      ...(Number.isSafeInteger(result.retryAfterMs) ? { retryAfterMs: result.retryAfterMs } : {}),
+    });
+  }
+  if (result?.status === "http_error" && (result.code === 401 || result.code === 403)) {
+    return Object.freeze({ status: "unknown", scope: "capacity_group", reason: "provider probe auth denied" });
+  }
+  return Object.freeze({ status: "unknown", scope: "capacity_group", reason: "provider probe unavailable" });
+}
+
+/** Fetch one provider's live model list. Controller-side only: the credential never leaves
  * this process and the returned value carries only model ids.
  */
-export async function probeProviderModels({ baseUrl, apiKey, timeoutMs = 15_000, fetchImpl = fetch }) {
+export async function probeProviderModels({ baseUrl, apiKey, timeoutMs = 15_000, fetchImpl = fetch, now = Date.now() } = {}) {
   const url = `${baseUrl.replace(/\/+$/, "")}/models`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -109,7 +159,11 @@ export async function probeProviderModels({ baseUrl, apiKey, timeoutMs = 15_000,
       headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
       signal: controller.signal,
     });
-    if (!response.ok) return { status: "http_error", code: response.status, models: [] };
+    if (!response.ok) {
+      const header = response.headers?.get?.("retry-after") ?? response.headers?.get?.("Retry-After");
+      const delay = retryAfterMs(header, now);
+      return { status: "http_error", code: response.status, models: [], ...(delay === undefined ? {} : { retryAfterMs: delay }) };
+    }
     const body = await response.json();
     const rows = body?.data ?? body?.models ?? [];
     const created = {};

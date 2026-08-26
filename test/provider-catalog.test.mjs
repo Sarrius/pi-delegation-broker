@@ -71,6 +71,8 @@ test("broker registry from catalog can reserve and lease", () => {
 
 test("catalog rejects malformed provider entries", () => {
   assert.throws(() => catalogToBrokerRegistry([]), /non-empty array/);
+  const empty = catalogToBrokerRegistry([], { allowEmpty: true });
+  assert.deepEqual(empty, { profiles: {}, capacityGroups: {}, resources: {} });
   assert.throws(() => catalogToBrokerRegistry([{ provider: 123 }]), /bounded provider identifier/);
   assert.throws(() => catalogToBrokerRegistry([{ provider: "p1", baseUrl: "", api: "x", models: [] }]), /baseUrl/);
   assert.throws(() => catalogToBrokerRegistry([{ provider: "p1", baseUrl: "http://x", api: "x", models: [] }]), /1\.\.4096 models/);

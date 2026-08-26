@@ -75,7 +75,9 @@ function normalizedBrokerRegistry(registry) {
     if (new Set(supports).size !== supports.length) throw new Error(`profile ${id} has duplicate supports`);
     profiles[id] = { status: profile.status, supports };
   }
-  if (Object.keys(profiles).length === 0) throw new Error("Signed registry must contain a profile");
+  // An empty registry is a valid controller state when every currently authorized provider
+  // has expired or is unavailable. It must still verify and boot so the broker can deny new
+  // work cleanly and admit providers again when credentials recover.
 
   const capacityGroups = {};
   for (const [id, group] of Object.entries(registry.capacityGroups)) {
@@ -104,7 +106,6 @@ function normalizedBrokerRegistry(registry) {
       confidence: group.confidence,
     };
   }
-  if (Object.keys(capacityGroups).length === 0) throw new Error("Signed registry must contain a capacity group");
 
   const resources = {};
   for (const [id, resource] of Object.entries(registry.resources)) {
@@ -158,7 +159,6 @@ function normalizedBrokerRegistry(registry) {
     }
     resources[id] = { capacityGroup: resource.capacityGroup, profile: resource.profile, confidence: resource.confidence, enforcement };
   }
-  if (Object.keys(resources).length === 0) throw new Error("Signed registry must contain a resource");
 
   return {
     registryVersion: registry.registryVersion,

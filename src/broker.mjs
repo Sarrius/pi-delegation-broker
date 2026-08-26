@@ -717,16 +717,18 @@ export class SqliteLeaseBroker {
    * resource in the capacity group shares it. Unknown is nevertheless recoverable: after the
    * registry-defined probe interval one bounded half-open attempt may prove the route live again.
    */
-  markUnknown(resourceId, now, reason = "unknown", scope = "resource") {
+  markUnknown(resourceId, now, reason = "unknown", scope = "resource", retryAfterMs) {
     if (scope !== "resource" && scope !== "capacity_group") throw new Error("markUnknown scope must be resource or capacity_group");
     return this.#transaction(() => {
+      this.#assertNondecreasingTime(now);
       const resource = this.#db.prepare(`
         SELECT r.capacity_group, g.probe_interval_ms
         FROM resources r JOIN capacity_groups g ON g.id = r.capacity_group
         WHERE r.id = ?
       `).get(resourceId);
       if (!resource) throw new Error(`Unknown resource ${resourceId}`);
-      const retryAt = now + resource.probe_interval_ms;
+      const hasUsableRetryAfter = Number.isSafeInteger(retryAfterMs) && retryAfterMs > 0 && retryAfterMs <= Number.MAX_SAFE_INTEGER - now;
+      const retryAt = now + (hasUsableRetryAfter ? retryAfterMs : resource.probe_interval_ms);
       this.#db.prepare(`
         UPDATE resources SET state = 'unknown', cooldown_until = MAX(cooldown_until, ?)
         WHERE id = ?
@@ -749,6 +751,31 @@ export class SqliteLeaseBroker {
       // Return an explicit receipt: a void result is indistinguishable from "no reply" to a
       // controller waiting on the IPC response.
       return { status: "unknown", resourceId, retryAt };
+    });
+  }
+
+  /**
+   * Record a successful controller-side availability preflight without closing a quota breaker.
+   * A `/models` or credential probe proves that the route can answer the probe, not that an
+   * inference subscription has recovered; only a leased inference probe may close a cooling group.
+   */
+  markAvailabilityObserved(resourceId, now, scope = "capacity_group") {
+    if (scope !== "resource" && scope !== "capacity_group") throw new Error("markAvailabilityObserved scope must be resource or capacity_group");
+    return this.#transaction(() => {
+      this.#assertNondecreasingTime(now);
+      const resource = this.#db.prepare("SELECT capacity_group FROM resources WHERE id = ?").get(resourceId);
+      if (!resource) throw new Error(`Unknown resource ${resourceId}`);
+      this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0 WHERE id = ?").run(resourceId);
+      let alsoAffected = 0;
+      if (scope === "capacity_group") {
+        const siblings = this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0 WHERE capacity_group = ? AND id != ?")
+          .run(resource.capacity_group, resourceId);
+        alsoAffected = siblings.changes;
+      }
+      // Deliberately do not touch capacity_groups.breaker_state/cooldown_until: a successful
+      // listing probe cannot prove that a prior inference 429 or quota exhaustion has reset.
+      this.#record(now, "ProviderAvailabilityObserved", { resourceId, capacityGroup: resource.capacity_group, scope, alsoAffected });
+      return { status: "available", resourceId, capacityGroup: resource.capacity_group, alsoAffected };
     });
   }
 

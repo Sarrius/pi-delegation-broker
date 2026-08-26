@@ -4,7 +4,9 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fixtureRegistry, SqliteLeaseBroker } from "../src/broker.mjs";
-import { activeAuthorizedProviders, DynamicProviderWatcher, modelRegistryToProviderCatalog } from "../src/dynamic-provider-watcher.mjs";
+import { catalogToBrokerRegistry } from "../src/provider-catalog.mjs";
+import { selectModelForTask } from "../src/model-selector.mjs";
+import { activeAuthorizedProviders, activeCredentialToken, DynamicProviderWatcher, modelRegistryToProviderCatalog } from "../src/dynamic-provider-watcher.mjs";
 
 function modelsStore(providers) {
   const store = {};
@@ -27,14 +29,18 @@ function authJson(providers) {
 }
 
 test("credential preflight excludes expired OAuth before child launch and re-admits refreshed auth", () => {
-  const now = 1_000_000;
+  const now = 1_700_000_000_000;
   const auth = {
     api: { type: "api_key", key: "secret" },
     current: { type: "oauth", access: "access", refresh: "refresh", expires: now + 60_000 },
     expired: { type: "oauth", access: "access", refresh: "bad", expires: now - 1 },
     unknown: { type: "oauth", access: "access", refresh: "refresh" },
+    seconds: { type: "oauth", access: "access", refresh: "refresh", expires: Math.floor((now + 60_000) / 1_000) },
   };
-  assert.deepEqual([...activeAuthorizedProviders(auth, now)].sort(), ["api", "current"]);
+  assert.deepEqual([...activeAuthorizedProviders(auth, now)].sort(), ["api", "current", "seconds"]);
+  assert.equal(activeCredentialToken(auth.current, now), "access");
+  assert.equal(activeCredentialToken(auth.current, now).includes(auth.current.refresh), false);
+  assert.equal(activeCredentialToken(auth.expired, now), undefined);
   auth.expired.expires = now + 120_000;
   assert.ok(activeAuthorizedProviders(auth, now).includes("expired"));
 });
@@ -100,6 +106,93 @@ test("dynamic provider watcher reloads broker registry when catalog changes", as
     watcher.stop();
     broker.close();
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dynamic provider watcher applies recovered accounts while another account has a live lease", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dpw-live-update-"));
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  let catalog = modelRegistryToProviderCatalog([
+    { provider: "alpha", id: "test-model", api: "openai-completions", baseUrl: "https://alpha.example/v1", input: ["text"], reasoning: true },
+  ]);
+  const initialRegistry = catalogToBrokerRegistry(catalog, { confidence: "observed" });
+  const broker = new SqliteLeaseBroker({ path: join(root, "broker.sqlite"), registry: initialRegistry });
+  const watcher = new DynamicProviderWatcher({ agentDir, broker, readCatalog: () => catalog });
+  try {
+    await watcher.refresh();
+    const selected = selectModelForTask({
+      taskDescription: "read a file",
+      registry: watcher.currentRegistry(),
+      availability: broker.inventory(Date.now()),
+      constraints: { taskId: "held", promptDigest: "a".repeat(64) },
+    });
+    const held = broker.reserve(selected.contract, Date.now());
+    assert.equal(held.status, "leased");
+
+    catalog = modelRegistryToProviderCatalog([
+      { provider: "alpha", id: "test-model", api: "openai-completions", baseUrl: "https://alpha.example/v1", input: ["text"], reasoning: true },
+      { provider: "beta", id: "test-model", api: "openai-completions", baseUrl: "https://beta.example/v1", input: ["text"], reasoning: true },
+    ]);
+    const update = await watcher.refresh();
+    assert.equal(update.status, "reloaded");
+    assert.ok(broker.inventory(Date.now()).some((row) => row.resourceId === "beta/test-model"),
+      "a newly available account must be admitted without waiting for all existing work to drain");
+    broker.release(held.lease.leaseId, held.lease.fencingToken, "test", Date.now());
+  } finally {
+    watcher.stop();
+    broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dynamic provider watcher removes an empty authorized fleet instead of retaining expired accounts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dpw-empty-"));
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  let catalog = modelRegistryToProviderCatalog([
+    { provider: "alpha", id: "test-model", api: "openai-completions", baseUrl: "https://alpha.example/v1", input: ["text"], reasoning: true },
+  ]);
+  const broker = new SqliteLeaseBroker({
+    path: join(root, "broker.sqlite"),
+    registry: catalogToBrokerRegistry(catalog, { confidence: "observed" }),
+  });
+  const watcher = new DynamicProviderWatcher({ agentDir, broker, readCatalog: () => catalog });
+  try {
+    await watcher.refresh();
+    assert.ok(broker.inventory(Date.now()).length > 0);
+    catalog = [];
+    const result = await watcher.refresh();
+    assert.equal(result.status, "reloaded");
+    assert.equal(watcher.currentRegistry().resources && Object.keys(watcher.currentRegistry().resources).length, 0);
+    assert.equal(broker.inventory(Date.now()).length, 0, "expired credentials must not leave stale resources selectable");
+  } finally {
+    watcher.stop();
+    broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dynamic provider watcher periodically rechecks time-expiring credentials", async () => {
+  const root = mkdtempSync(join(tmpdir(), "dpw-expiry-"));
+  const agentDir = join(root, "agent");
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  let catalog = [{
+    provider: "alpha", baseUrl: "https://alpha.example/v1", api: "openai-completions",
+    models: [{ id: "test-model", contextWindow: 200_000, maxTokens: 8_000, reasoning: true, input: ["text"] }],
+  }];
+  const broker = new SqliteLeaseBroker({ path: join(root, "broker.sqlite"), registry: catalogToBrokerRegistry(catalog, { confidence: "observed" }) });
+  const watcher = new DynamicProviderWatcher({ agentDir, broker, readCatalog: () => catalog, refreshIntervalMs: 100 });
+  try {
+    await watcher.refresh();
+    catalog = [];
+    watcher.start();
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    assert.equal(broker.inventory(Date.now()).length, 0, "periodic refresh must catch expiry without an auth file event");
+  } finally {
+    watcher.stop();
+    broker.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

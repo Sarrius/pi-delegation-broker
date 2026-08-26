@@ -9,8 +9,11 @@ import {
   LEGACY_GENERATION,
   assignGenerations,
   buildCurrencyMap,
+  classifyProviderProbe,
+  isControllerProbeUrl,
   parseModelVersion,
   probeProviderModels,
+  retryAfterMs,
   readCurrencyCache,
   writeCurrencyCache,
   listingsFromCache,
@@ -128,6 +131,30 @@ test("legacy-only fleet is denied rather than silently routing work to an obsole
   assert.equal(selected.action, "deny");
 });
 
+test("controller probes allow HTTPS and loopback adapters but reject arbitrary HTTP", () => {
+  assert.equal(isControllerProbeUrl("https://provider.example/v1"), true);
+  assert.equal(isControllerProbeUrl("http://127.0.0.1:54103/account-2"), true);
+  assert.equal(isControllerProbeUrl("http://localhost:11434/v1"), true);
+  assert.equal(isControllerProbeUrl("http://10.0.0.5:8080/v1"), false);
+  assert.equal(isControllerProbeUrl("https://user:secret@provider.example/v1"), false);
+});
+
+test("availability probes classify transient outages and preserve bounded Retry-After", async () => {
+  assert.deepEqual(classifyProviderProbe({ status: "ok" }), { status: "available" });
+  assert.deepEqual(classifyProviderProbe({ status: "http_error", code: 401 }), {
+    status: "unknown", scope: "capacity_group", reason: "provider probe auth denied",
+  });
+  assert.deepEqual(classifyProviderProbe({ status: "http_error", code: 503 }), {
+    status: "unknown", scope: "capacity_group", reason: "provider probe unavailable",
+  });
+  assert.deepEqual(classifyProviderProbe({ status: "http_error", code: 429, retryAfterMs: 12_000 }), {
+    status: "unknown", scope: "capacity_group", reason: "provider availability probe throttled", retryAfterMs: 12_000,
+  });
+  assert.equal(retryAfterMs("12"), 12_000);
+  assert.equal(retryAfterMs("Wed, 21 Oct 2015 07:28:00 GMT", Date.parse("Wed, 21 Oct 2015 07:27:00 GMT")), 60_000);
+  assert.equal(retryAfterMs("86401"), undefined);
+});
+
 test("live probes preserve upstream creation dates without exposing credentials", async () => {
   const seen = [];
   const result = await probeProviderModels({
@@ -142,6 +169,21 @@ test("live probes preserve upstream creation dates without exposing credentials"
   assert.equal(seen[0].url, "https://provider.example/v1/models");
   assert.equal(seen[0].authorization, "Bearer secret-never-returned");
   assert.equal(JSON.stringify(result).includes("secret-never-returned"), false);
+});
+
+test("live probes retain a bounded Retry-After delay without retaining response headers", async () => {
+  const result = await probeProviderModels({
+    baseUrl: "https://provider.example/v1",
+    apiKey: "secret",
+    now: 1_000_000,
+    fetchImpl: async () => ({
+      ok: false,
+      status: 429,
+      headers: { get: () => "7" },
+    }),
+  });
+  assert.deepEqual(result, { status: "http_error", code: 429, models: [], retryAfterMs: 7_000 });
+  assert.equal(JSON.stringify(result).includes("secret"), false);
 });
 
 test("currency cache is atomically persisted as credential-free listing facts", () => {

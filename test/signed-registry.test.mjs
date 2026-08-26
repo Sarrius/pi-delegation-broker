@@ -53,6 +53,29 @@ test("valid Ed25519 registry has a deterministic fingerprint and frozen broker p
   assert.equal(verified.brokerRegistry.resources.R1.profile, "reasoning-high/v1");
 });
 
+test("an empty signed registry is a valid no-provider runtime state", async () => {
+  const currentNow = Date.now();
+  const { envelope, trustedKeys } = signedEnvelopeWithKey({
+    registryVersion: "empty-fleet-v1",
+    issuedAt: currentNow - 1_000,
+    expiresAt: currentNow + 60_000,
+    profiles: {}, capacityGroups: {}, resources: {},
+  });
+  const verified = verifySignedRegistry(envelope, { trustedKeys, now: currentNow });
+  assert.deepEqual(verified.brokerRegistry, { profiles: {}, capacityGroups: {}, resources: {} });
+  const stateDir = mkdtempSync(join(tmpdir(), "broker-empty-registry-"));
+  const supervisor = new SingleHostBrokerSupervisor({
+    stateDir, signedRegistry: envelope, trustedRegistryKeys: trustedKeys, controllerToken: "e".repeat(48), sweepIntervalMs: 100,
+  });
+  try {
+    await supervisor.start();
+    assert.deepEqual(supervisor.inventory(), []);
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("closed controller provenance metadata can be signed but is stripped from broker authority", () => {
   const registry = registryPayload();
   registry.resources.R1.provenance = {

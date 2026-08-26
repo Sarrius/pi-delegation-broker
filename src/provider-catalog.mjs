@@ -137,7 +137,8 @@ export function capabilityTierId(supports) {
  * `catalog` metadata; the broker ignores both and persists neither.
  */
 export function catalogToBrokerRegistry(catalog, options = {}) {
-  if (!Array.isArray(catalog) || catalog.length < 1) {
+  const allowEmpty = options.allowEmpty === true;
+  if (!Array.isArray(catalog) || (!allowEmpty && catalog.length < 1)) {
     throw new Error("broker registry catalog must be a non-empty array of provider entries");
   }
   const maxConcurrentPerProvider = Number.isSafeInteger(options.maxConcurrentPerProvider)

@@ -108,8 +108,11 @@ export {
   buildCurrencyMap,
   listingsFromCache,
   parseModelVersion,
+  classifyProviderProbe,
+  isControllerProbeUrl,
   probeProviderModels,
   readCurrencyCache,
+  retryAfterMs,
   writeCurrencyCache,
 } from "./provider-probe.mjs";
 export { compileEffectiveChildCapability, createEffectiveChildCapability, deriveAllowedTools, canonicalDeclaredToolName } from "./capability-compiler.mjs";
@@ -121,7 +124,7 @@ export { SessionBindingStore, formatSessionResumeStatus, sessionCursor, sessionI
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";
 export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
 export { BrokeredLaunchResolver } from "./trusted-launch-resolver.mjs";
-export { DynamicProviderWatcher, activeAuthorizedProviders, modelRegistryToProviderCatalog, readProviderRegistry } from "./dynamic-provider-watcher.mjs";
+export { DynamicProviderWatcher, activeAuthorizedProviders, activeCredentialToken, modelRegistryToProviderCatalog, readProviderRegistry } from "./dynamic-provider-watcher.mjs";
 export { BrokeredChildRunner, classifyChildFailure } from "./brokered-runner.mjs";
 export { spawnBrokeredChild, disposeBrokeredChildProcesses } from "./child-launcher.mjs";
 export { Semaphore } from "./semaphore.mjs";
