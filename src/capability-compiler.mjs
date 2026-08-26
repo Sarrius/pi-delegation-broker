@@ -131,7 +131,7 @@ function validateDelegation(value) {
 function validateBudget(budget) {
   if (!budget || typeof budget !== "object") throw new Error("budget must be an object");
   for (const key of Object.keys(budget)) {
-    if (!["maxOutputTokens", "maxInputTokens", "enforcement"].includes(key)) {
+    if (!["maxOutputTokens", "maxInputTokens", "maxAttempts", "enforcement"].includes(key)) {
       throw new Error(`unknown budget field: ${key}`);
     }
   }
@@ -143,6 +143,10 @@ function validateBudget(budget) {
   if (budget.maxInputTokens !== undefined) {
     if (!Number.isSafeInteger(budget.maxInputTokens) || budget.maxInputTokens < 1) throw new Error("maxInputTokens must be a positive safe integer");
     result.maxInputTokens = budget.maxInputTokens;
+  }
+  if (budget.maxAttempts !== undefined) {
+    if (!Number.isSafeInteger(budget.maxAttempts) || budget.maxAttempts < 1 || budget.maxAttempts > 32) throw new Error("maxAttempts must be an integer between 1 and 32");
+    result.maxAttempts = budget.maxAttempts;
   }
   if (budget.enforcement !== undefined) {
     if (!budget.enforcement || typeof budget.enforcement !== "object") throw new Error("enforcement must be an object");
@@ -194,6 +198,7 @@ export function compileEffectiveChildCapability(cap) {
   ];
   if (cap.budget.maxOutputTokens !== undefined) lines.push(`max_output_tokens: ${cap.budget.maxOutputTokens}`);
   if (cap.budget.maxInputTokens !== undefined) lines.push(`max_input_tokens: ${cap.budget.maxInputTokens}`);
+  if (cap.budget.maxAttempts !== undefined) lines.push(`max_attempts: ${cap.budget.maxAttempts}`);
   if (cap.budget.enforcement) {
     lines.push(`budget_enforcement: input=${cap.budget.enforcement.input} output=${cap.budget.enforcement.output}`);
   }

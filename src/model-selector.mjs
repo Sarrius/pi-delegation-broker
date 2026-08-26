@@ -38,7 +38,7 @@ const SAFE_REASON = /^[A-Za-z0-9 _.-]{1,120}$/;
 
 const DEFAULT_LATENCY_BUDGET_MS = 120_000;
 // No money dimension: the broker cannot observe spend, so it budgets what it can enforce.
-const DEFAULT_BUDGET = Object.freeze({ maxInputTokens: 200_000, maxOutputTokens: 16_000 });
+const DEFAULT_BUDGET = Object.freeze({ maxInputTokens: 200_000, maxOutputTokens: 16_000, maxAttempts: 8 });
 
 /**
  * Keyword evidence for each capability beyond plain text generation. Matching is intentionally
@@ -220,6 +220,9 @@ function buildBudget(constraints) {
   // fleet. What protects an effect is the blocking behavioral monitor, pinned extension
   // attestation, and controller verification of the result; efficiency is measured afterward
   // from verified tokens, latency, and attempts.
+  if (!Number.isSafeInteger(budget.maxAttempts) || budget.maxAttempts < 1 || budget.maxAttempts > 32) {
+    throw new Error("maxAttempts must be an integer between 1 and 32");
+  }
   if (Object.hasOwn(budget, "maxCostMicros") || Object.hasOwn(constraints.budget?.enforcement ?? {}, "cost")) {
     throw new Error("money budgets are not supported; constrain input/output tokens and learn efficiency from verified outcomes");
   }
@@ -227,6 +230,7 @@ function buildBudget(constraints) {
   return Object.freeze({
     ...(Number.isSafeInteger(budget.maxInputTokens) ? { maxInputTokens: budget.maxInputTokens } : {}),
     ...(Number.isSafeInteger(budget.maxOutputTokens) ? { maxOutputTokens: budget.maxOutputTokens } : {}),
+    maxAttempts: budget.maxAttempts,
     enforcement: Object.freeze({ ...enforcement }),
   });
 }

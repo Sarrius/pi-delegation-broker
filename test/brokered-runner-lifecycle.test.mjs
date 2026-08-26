@@ -76,6 +76,48 @@ test("every attempt is tracked while its lease lives, but only a completed one i
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("runner enforces cumulative output across failover and adopts the controller attempt cap", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-budget-"));
+  let spawned = 0;
+  const closed = [];
+  const resolver = {
+    async resolve(request) {
+      return {
+        action: "allow", resource: { id: `provider/model-${request.childId}` }, resolvedModel: MODEL,
+        policy: {
+          policyId: `budget-${request.childId}`, agentDir: root, environment: {},
+          authorizationPolicy: { budget: { maxInputTokens: 100, maxOutputTokens: 6, maxAttempts: 4, enforcement: { input: "hard", output: "hard" } } },
+          async onChildSessionOpened() {}, async onBeforeChildAbandoned() {},
+          async onChildSessionClosed(result) { closed.push(result.status); return { status: "released" }; },
+        },
+      };
+    },
+    async reportProviderRateLimited() {},
+  };
+  const spawnChild = async () => {
+    const attempt = ++spawned;
+    return {
+      resolved: MODEL,
+      session: {
+        usage: { input: 10, output: 4, cacheRead: 0, cacheWrite: 0, turns: 1 },
+        latestAssistantMessage: attempt === 1
+          ? { stopReason: "error", errorMessage: "429 rate limit" }
+          : { stopReason: "stop", content: [{ type: "text", text: "done" }] },
+        async prompt() {}, async dispose() {},
+      },
+    };
+  };
+  try {
+    const runner = new BrokeredChildRunner({ resolver, sessionsRoot: join(root, "sessions"), spawnChild });
+    const result = await runner.run({ childId: "budget-task", promptDigest: "a".repeat(64), cwd: root, prompt: "work", maxAttempts: 8 });
+    assert.equal(result.status, "failed");
+    assert.match(result.error, /cumulative output budget exceeded/);
+    assert.equal(spawned, 2, "the second route is attempted before the cumulative cap rejects the result");
+    assert.deepEqual(result.usage, { input: 20, output: 8, cacheRead: 0, cacheWrite: 0, turns: 2 });
+    assert.deepEqual(closed, ["failed", "failed"]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("temporary broker capacity waits for the live account instead of consuming an attempt", async () => {
   const root = mkdtempSync(join(tmpdir(), "runner-capacity-wait-"));
   let resolutions = 0;

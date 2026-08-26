@@ -81,6 +81,10 @@ function asLease(row) {
     probe: row.is_probe === 1,
     ...(row.max_input_tokens === null || row.max_input_tokens === undefined ? {} : { maxInputTokens: row.max_input_tokens }),
     ...(row.max_output_tokens === null || row.max_output_tokens === undefined ? {} : { maxOutputTokens: row.max_output_tokens }),
+    usage: Object.freeze({
+      input: row.input_tokens_used ?? 0,
+      output: row.output_tokens_used ?? 0,
+    }),
   };
 }
 
@@ -644,6 +648,62 @@ export class SqliteLeaseBroker {
     return row ? { status: "authorized", lease: asLease(row) } : { status: "denied_capability" };
   }
 
+  /**
+   * Reserve a conservative controller-side input upper bound before a real provider send.
+   * The real proxy supplies canonical UTF-8 bytes, which are an upper bound on token count and
+   * therefore intentionally reject some large-but-valid prompts rather than overspend a hard cap.
+   */
+  reserveProviderInput(leaseId, fencingToken, inputUpperBound, now) {
+    return this.#transaction(() => {
+      this.#assertNondecreasingTime(now);
+      const lease = this.#db.prepare("SELECT * FROM leases WHERE lease_id = ? AND fencing_token = ? AND expires_at > ?")
+        .get(leaseId, fencingToken, now);
+      if (!lease) return { status: "denied_lease" };
+      if (!Number.isSafeInteger(inputUpperBound) || inputUpperBound < 0) return { status: "denied_budget", reason: "invalid input upper bound" };
+      const enforcement = parseJson(lease.enforcement);
+      const used = lease.input_tokens_used ?? 0;
+      const next = used + inputUpperBound;
+      if (enforcement.input === "hard" && lease.max_input_tokens !== null && next > lease.max_input_tokens) {
+        this.#record(now, "BudgetExceeded", { leaseId, dimension: "input", used, requested: inputUpperBound, cap: lease.max_input_tokens });
+        return { status: "budget_exceeded", dimension: "input", used, requested: inputUpperBound, cap: lease.max_input_tokens };
+      }
+      if (inputUpperBound > 0) this.#db.prepare("UPDATE leases SET input_tokens_used = input_tokens_used + ? WHERE lease_id = ? AND fencing_token = ?")
+        .run(inputUpperBound, leaseId, fencingToken);
+      this.#record(now, "ProviderInputReserved", { leaseId, inputUpperBound, inputTokensUsed: next });
+      return { status: "reserved", inputTokensUsed: next };
+    });
+  }
+
+  /** Record observed provider usage and enforce cumulative per-lease output/input limits. */
+  recordProviderUsage(leaseId, fencingToken, usage, now, { inputReserved = false } = {}) {
+    return this.#transaction(() => {
+      this.#assertNondecreasingTime(now);
+      const lease = this.#db.prepare("SELECT * FROM leases WHERE lease_id = ? AND fencing_token = ? AND expires_at > ?")
+        .get(leaseId, fencingToken, now);
+      if (!lease) return { status: "denied_lease" };
+      if (!usage || typeof usage !== "object" || ["input", "output", "cacheRead", "cacheWrite"].some((key) => !Number.isSafeInteger(usage[key] ?? 0) || (usage[key] ?? 0) < 0)) {
+        return { status: "denied_budget", reason: "invalid provider usage" };
+      }
+      const enforcement = parseJson(lease.enforcement);
+      const inputObserved = (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
+      const inputDelta = inputReserved && enforcement.input === "hard" ? 0 : inputObserved;
+      const inputUsed = (lease.input_tokens_used ?? 0) + inputDelta;
+      const outputUsed = (lease.output_tokens_used ?? 0) + (usage.output ?? 0);
+      if (enforcement.input === "hard" && lease.max_input_tokens !== null && inputUsed > lease.max_input_tokens) {
+        this.#record(now, "BudgetExceeded", { leaseId, dimension: "input", used: inputUsed, cap: lease.max_input_tokens });
+        return { status: "budget_exceeded", dimension: "input", used: inputUsed, cap: lease.max_input_tokens };
+      }
+      if (enforcement.output === "hard" && lease.max_output_tokens !== null && outputUsed > lease.max_output_tokens) {
+        this.#record(now, "BudgetExceeded", { leaseId, dimension: "output", used: outputUsed, cap: lease.max_output_tokens });
+        return { status: "budget_exceeded", dimension: "output", used: outputUsed, cap: lease.max_output_tokens };
+      }
+      this.#db.prepare("UPDATE leases SET input_tokens_used = ?, output_tokens_used = ? WHERE lease_id = ? AND fencing_token = ?")
+        .run(inputUsed, outputUsed, leaseId, fencingToken);
+      this.#record(now, "ProviderUsageObserved", { leaseId, input: usage.input ?? 0, output: usage.output ?? 0, inputTokensUsed: inputUsed, outputTokensUsed: outputUsed });
+      return { status: "recorded", inputTokensUsed: inputUsed, outputTokensUsed: outputUsed };
+    });
+  }
+
   /** Record already-classified provider telemetry without retaining raw child input. */
   recordProviderEvent(leaseId, fencingToken, inputDigest, event, now) {
     return this.#transaction(() => {
@@ -937,6 +997,8 @@ export class SqliteLeaseBroker {
         max_input_tokens INTEGER,
         max_output_tokens INTEGER,
         max_cost_micros INTEGER,
+        input_tokens_used INTEGER NOT NULL DEFAULT 0,
+        output_tokens_used INTEGER NOT NULL DEFAULT 0,
         admission_class TEXT NOT NULL DEFAULT 'control' CHECK (admission_class IN ('control', 'verify', 'work')),
         behavioral_enforcement TEXT NOT NULL DEFAULT 'unavailable' CHECK (behavioral_enforcement IN ('unavailable', 'blocking_monitor')),
         is_probe INTEGER NOT NULL DEFAULT 0 CHECK (is_probe IN (0, 1))
@@ -984,6 +1046,8 @@ export class SqliteLeaseBroker {
     if (!leaseColumns.includes("max_input_tokens")) this.#db.exec("ALTER TABLE leases ADD COLUMN max_input_tokens INTEGER");
     if (!leaseColumns.includes("max_output_tokens")) this.#db.exec("ALTER TABLE leases ADD COLUMN max_output_tokens INTEGER");
     if (!leaseColumns.includes("max_cost_micros")) this.#db.exec("ALTER TABLE leases ADD COLUMN max_cost_micros INTEGER");
+    if (!leaseColumns.includes("input_tokens_used")) this.#db.exec("ALTER TABLE leases ADD COLUMN input_tokens_used INTEGER NOT NULL DEFAULT 0");
+    if (!leaseColumns.includes("output_tokens_used")) this.#db.exec("ALTER TABLE leases ADD COLUMN output_tokens_used INTEGER NOT NULL DEFAULT 0");
     if (!leaseColumns.includes("admission_class")) this.#db.exec("ALTER TABLE leases ADD COLUMN admission_class TEXT NOT NULL DEFAULT 'control'");
     if (!leaseColumns.includes("behavioral_enforcement")) this.#db.exec("ALTER TABLE leases ADD COLUMN behavioral_enforcement TEXT NOT NULL DEFAULT 'unavailable'");
     if (!leaseColumns.includes("is_probe")) this.#db.exec("ALTER TABLE leases ADD COLUMN is_probe INTEGER NOT NULL DEFAULT 0");
@@ -1582,6 +1646,10 @@ export class SqliteLeaseBroker {
     }
     if (!this.#profile(contract.capability.minimumProfile)) return "unknown or unapproved minimum profile";
     const requirements = contract.budget?.enforcement ?? {};
+    if (contract.budget?.maxAttempts !== undefined
+      && (!Number.isSafeInteger(contract.budget.maxAttempts) || contract.budget.maxAttempts < 1 || contract.budget.maxAttempts > 32)) {
+      return "maxAttempts must be an integer between 1 and 32";
+    }
     if (Object.values(requirements).some((value) => !Object.hasOwn(ENFORCEMENT, value))) return "unknown budget enforcement class";
     if (Object.hasOwn(contract.budget ?? {}, "maxCostMicros") || Object.hasOwn(requirements, "cost")) {
       return "money budgets are not supported; use token caps and verified efficiency observations";

@@ -203,6 +203,7 @@ const TEAM_BUDGETS = Type.Object({
   maxAppends: Type.Optional(Type.Integer({ minimum: 0, maximum: 1000 })),
   maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
   maxRedundant: Type.Optional(Type.Integer({ minimum: 0, maximum: 1000 })),
+  maxOutputTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 2000000000 })),
 });
 const TEAM_JOIN = Type.Object({
   id: Type.String(),
@@ -259,12 +260,10 @@ const DELEGATE_PARAMS = Type.Object({
   })),
   idempotencyKey: Type.Optional(Type.String({ maxLength: 200, description: "Stable submission key preventing duplicate child jobs." })),
   deadlineMs: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 86_400_000, description: "Whole-job safety deadline; never a parent wait budget." })),
-  acceptance: Type.Optional(Type.Array(Type.Object({
-    id: Type.String({ description: "Stable controller check id." }),
-    claim: Type.String({ description: "Controller-verifiable acceptance claim." }),
-    argv: Type.Array(Type.String({ description: "One literal argv token; no shell syntax." }), { minItems: 1, maxItems: 32 }),
-    timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 120000 })),
-  }), { minItems: 1, maxItems: 20, description: "Fixed controller-owned checks. Omit when no independent acceptance check exists; such work cannot train routing affinity." })),
+  acceptance: Type.Optional(Type.Array(ACCEPTANCE_CHECK, {
+    minItems: 1, maxItems: 20,
+    description: "Fixed controller-owned checks. Omit when no independent acceptance check exists; such work cannot train routing affinity.",
+  })),
   proposeChangesIn: Type.Optional(Type.String({
     description: "Absolute path to a git repository the child may edit. The child works in a throwaway worktree; the controller verifies the resulting patch in a scratch tree and returns it for review. Requires acceptance checks. Nothing is applied to this repository.",
   })),
@@ -1228,7 +1227,8 @@ export default function piDelegationBroker(pi: any) {
               role: nodeContract.role?.name ?? "worker",
             },
             ...(recursionPolicy ? { recursion: { mode: "depth2_readonly_canary", context: recursionPolicy } } : {}),
-            capabilityRequest: workflowObserveCapabilityRequest({ ...node, task }, childId),
+            capabilityRequest: workflowObserveCapabilityRequest({ ...node, task }, childId, node.controllerBudget),
+            ...(node.attemptBudget ? { attemptBudget: node.attemptBudget } : {}),
             trackForVerification: Boolean(node.acceptance?.length),
           });
         } catch (error) {

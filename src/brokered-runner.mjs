@@ -223,19 +223,49 @@ export class BrokeredChildRunner {
    *
    * Returns the terminal child result, plus a `route` trail of every attempt made.
    */
-  async run({ childId, maxAttempts = MAX_ROUTE_ATTEMPTS, trackForVerification = false, fleet, ...spec }) {
+  async run({ childId, maxAttempts = MAX_ROUTE_ATTEMPTS, trackForVerification = false, fleet, attemptBudget, ...spec }) {
     if (this.#disposed) throw new Error("BrokeredChildRunner is disposed");
     if (!CHILD_ID.test(childId ?? "")) throw new Error("BrokeredChildRunner requires a valid childId");
     if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) throw new Error("maxAttempts must be a positive safe integer");
     if (typeof trackForVerification !== "boolean") throw new Error("trackForVerification must be boolean");
+    if (attemptBudget !== undefined && (!attemptBudget || typeof attemptBudget.acquire !== "function")) throw new Error("attemptBudget must provide a controller-owned acquire function");
     if (fleet !== undefined && (fleet === null || typeof fleet !== "object" || Array.isArray(fleet))) {
       throw new Error("BrokeredChildRunner fleet metadata must be an object");
     }
 
     const fleetMeta = fleet ?? {};
     const excludeResources = [...(spec.capabilityRequest?.excludeResources ?? [])];
+    const requestedBudget = spec.capabilityRequest?.budget;
+    if (requestedBudget?.maxAttempts !== undefined
+      && (!Number.isSafeInteger(requestedBudget.maxAttempts) || requestedBudget.maxAttempts < 1 || requestedBudget.maxAttempts > MAX_ROUTE_ATTEMPTS)) {
+      throw new Error(`maxAttempts must be an integer between 1 and ${MAX_ROUTE_ATTEMPTS}`);
+    }
+    let routeAttemptLimit = Math.min(maxAttempts, requestedBudget?.maxAttempts ?? maxAttempts);
+    const cumulativeUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0 };
+    let usageObserved = false;
+    let effectiveBudget = requestedBudget ?? {};
+    const addUsage = (usage) => {
+      if (!usage || typeof usage !== "object") return;
+      usageObserved = true;
+      for (const key of ["input", "output", "cacheRead", "cacheWrite", "turns"]) {
+        if (Number.isSafeInteger(usage[key]) && usage[key] >= 0) {
+          cumulativeUsage[key] = Math.min(Number.MAX_SAFE_INTEGER, cumulativeUsage[key] + usage[key]);
+        }
+      }
+    };
+    const budgetExceeded = () => {
+      const inputUsed = cumulativeUsage.input + cumulativeUsage.cacheRead + cumulativeUsage.cacheWrite;
+      if (effectiveBudget.enforcement?.input === "hard" && Number.isSafeInteger(effectiveBudget.maxInputTokens) && inputUsed > effectiveBudget.maxInputTokens) {
+        return `controller cumulative input budget exceeded (${inputUsed} > ${effectiveBudget.maxInputTokens})`;
+      }
+      if (effectiveBudget.enforcement?.output === "hard" && Number.isSafeInteger(effectiveBudget.maxOutputTokens) && cumulativeUsage.output > effectiveBudget.maxOutputTokens) {
+        return `controller cumulative output budget exceeded (${cumulativeUsage.output} > ${effectiveBudget.maxOutputTokens})`;
+      }
+      return undefined;
+    };
     const route = [];
     const unavailableByCapacityGroup = new Map();
+    let attemptGrant;
     let requiredCapabilities = spec.capabilityRequest?.requiredCapabilities;
     let capacityWaitDeadline;
     let lastResult;
@@ -250,6 +280,7 @@ export class BrokeredChildRunner {
       // downgraded effort level is indistinguishable from one that was never requested.
       return Object.freeze({
         ...value,
+        ...(usageObserved ? { usage: Object.freeze({ ...cumulativeUsage }) } : {}),
         requestedThinking: spec.thinkingLevel ?? "off",
         ...(typeof fleetMeta.role === "string" ? { role: fleetMeta.role } : {}),
       });
@@ -261,13 +292,21 @@ export class BrokeredChildRunner {
 
     this.#abortedRuns.delete(childId);
     this.#activeRuns.add(childId);
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    for (let attempt = 1; attempt <= routeAttemptLimit; attempt++) {
+      const attemptId = attempt === 1 ? childId : `${childId}-r${attempt}`;
+      if (!attemptGrant && attemptBudget) {
+        attemptGrant = await attemptBudget.acquire({ childId, attempt });
+        if (!attemptGrant?.granted) {
+          const error = "controller root physical-attempt budget exceeded";
+          route.push({ attempt, childId: attemptId, outcome: "root_budget_exceeded", error });
+          return finish(Object.freeze({ id: childId, status: "failed", text: "", error, route: Object.freeze(route) }));
+        }
+      }
       if (abortedEarly()) return finish(Object.freeze({
         id: childId, status: "aborted", text: "",
         error: this.#disposed ? "brokered runner disposed" : "aborted before a child was launched",
         route: Object.freeze(route),
       }));
-      const attemptId = attempt === 1 ? childId : `${childId}-r${attempt}`;
       visibleAttemptId = attemptId;
       const attemptStartedAt = this.#now();
       this.#publishAttempt({
@@ -337,10 +376,12 @@ export class BrokeredChildRunner {
           route.push({ attempt, childId: attemptId, outcome: "capacity_wait_timeout", error: message });
           return finish(Object.freeze({ id: childId, status: "failed", text: "", error: message, route: Object.freeze(route) }));
         }
+        attemptGrant = undefined;
         // A policy/capability denial cannot be repaired by replaying the same contract.
         route.push({ attempt, childId: attemptId, outcome: "denied", error: error.message });
         return finish(Object.freeze({ id: childId, status: "failed", text: "", error: error.message, route: Object.freeze(route) }));
       }
+      attemptGrant = undefined;
 
       // Cancellation can land after the semaphore grant but before a handle existed, i.e. while
       // the resolver was still choosing a route. The child is real now, so stop it through the
@@ -370,6 +411,11 @@ export class BrokeredChildRunner {
         lastEventAt: this.#now(),
         lastEventType: "child_started",
       });
+      const policyBudget = handle.policy?.authorizationPolicy?.budget;
+      if (policyBudget && typeof policyBudget === "object") {
+        effectiveBudget = policyBudget;
+        if (Number.isSafeInteger(policyBudget.maxAttempts)) routeAttemptLimit = Math.min(routeAttemptLimit, policyBudget.maxAttempts);
+      }
       if (trackForVerification) {
         // The child releases its own lease when its session ends, so durable tracking has to
         // happen while the child is still running. Tracking is not acceptance: a failed attempt
@@ -387,7 +433,20 @@ export class BrokeredChildRunner {
         }
       }
       lastResult = await handle.result;
-      this.#updateAttempt(attemptId, { state: "verifying", lastEventAt: this.#now(), lastEventType: "child_terminal" });
+      addUsage(lastResult.usage);
+      const exceeded = budgetExceeded();
+      this.#updateAttempt(attemptId, {
+        state: exceeded ? "failed" : "verifying",
+        lastEventAt: this.#now(),
+        lastEventType: exceeded ? "budget_exceeded" : "child_terminal",
+        usage: { ...cumulativeUsage },
+      });
+      if (exceeded) {
+        const budgetResult = { ...lastResult, id: childId, status: "failed", error: exceeded };
+        await this.#closeAttempt(handle, budgetResult).catch(() => undefined);
+        route.push({ attempt, childId: attemptId, resourceId, outcome: "budget_exceeded", error: exceeded });
+        return finish(Object.freeze({ ...budgetResult, route: Object.freeze(route) }));
+      }
       let closure;
       try {
         closure = await this.#closeAttempt(handle, lastResult);
@@ -431,7 +490,7 @@ export class BrokeredChildRunner {
         if (kind !== "context_exhausted") excludeResources.push(resourceId);
       }
       if (resourceId !== undefined && kind === "incomplete") excludeResources.push(resourceId);
-      if (kind === "fatal" || attempt === maxAttempts) break;
+      if (kind === "fatal" || attempt === routeAttemptLimit) break;
 
       this.#clearAttempt(attemptId);
       visibleAttemptId = undefined;

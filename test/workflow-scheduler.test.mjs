@@ -17,6 +17,25 @@ test("workflow stages stay read-only even when their prompt says do not modify f
   assert.deepEqual(request.requiredCapabilities, ["large_context"]);
 });
 
+test("orchestrator supplies a controller-owned physical-attempt gate and root output remainder", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-budget-"));
+  const seen = [];
+  try {
+    const o = new TaskOrchestrator({ path: join(root, "tasks.json"), run: async (node) => {
+      seen.push({ hasGate: typeof node.attemptBudget?.acquire === "function", budget: node.controllerBudget });
+      const first = node.attemptBudget.acquire();
+      const second = node.attemptBudget.acquire();
+      return first.granted && !second.granted ? { status: "completed", usage: { output: 3 } } : { status: "failed" };
+    }});
+    o.initialize([{ id: "bounded", task: "bounded" }], { budgets: { maxAttempts: 1, maxOutputTokens: 5 } });
+    const state = await o.execute();
+    assert.deepEqual(seen, [{ hasGate: true, budget: { maxOutputTokens: 5 } }]);
+    assert.equal(state.team.usage.startedAttempts, 1);
+    assert.equal(state.team.usage.outputTokens, 3);
+    assert.equal(state.nodes[0].state, "completed");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("orchestrator runs independent work in parallel and blocks dependents after failure", async () => {
   const root = mkdtempSync(join(tmpdir(), "orchestrator-"));
   const seen = [];

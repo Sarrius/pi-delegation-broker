@@ -352,6 +352,56 @@ test("real controller transport path streams one exact route through the same fr
   }
 });
 
+test("real controller proxy enforces cumulative output on repeated streams under one lease", async () => {
+  let dispatches = 0;
+  const { directory, broker, server } = createRealServer({
+    fetchImpl: async () => {
+      dispatches += 1;
+      return anthropicSse([
+        { event: "message_start", data: { message: { usage: { input_tokens: 2 } } } },
+        { event: "content_block_start", data: { index: 0, content_block: { type: "text", text: "" } } },
+        { event: "content_block_delta", data: { index: 0, delta: { type: "text_delta", text: "done" } } },
+        { event: "content_block_stop", data: { index: 0 } },
+        { event: "message_delta", data: { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 4 } } },
+        { event: "message_stop", data: {} },
+      ]);
+    },
+  });
+  await server.start();
+  try {
+    const capability = await reserveCapability(server, "real-stream-cumulative-output", 6, { budget: { maxInputTokens: 1_000, maxOutputTokens: 6, enforcement: { input: "hard", output: "hard" } } });
+    const first = await streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: realContext() });
+    assert.equal(first.terminal.payload.outcome, "succeeded_terminal");
+    const second = await streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: realContext() });
+    assert.equal(second.terminal.payload.outcome, "budget_exceeded");
+    assert.equal(dispatches, 2);
+    assert.equal(broker.leases().length, 0);
+  } finally {
+    await server.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("real controller proxy rejects an input payload over the hard controller cap before provider dispatch", async () => {
+  let dispatches = 0;
+  const { directory, broker, server } = createRealServer({
+    fetchImpl: async () => { dispatches += 1; return anthropicSse([]); },
+  });
+  await server.start();
+  try {
+    const capability = await reserveCapability(server, "real-stream-input-budget", 100, { budget: { maxInputTokens: 100, maxOutputTokens: 100, enforcement: { input: "hard", output: "hard" } } });
+    await assert.rejects(
+      () => streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: realContext({ systemPrompt: "x".repeat(2_000) }) }),
+      /input_budget_exceeded/,
+    );
+    assert.equal(dispatches, 0);
+    assert.equal(broker.leases().length, 0);
+  } finally {
+    await server.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("real transport 429 is the only mocked provider result that cools the capacity group", async () => {
   let dispatches = 0;
   const { directory, broker, server } = createRealServer({
