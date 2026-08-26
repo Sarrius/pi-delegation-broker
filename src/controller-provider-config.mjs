@@ -24,12 +24,23 @@ function fingerprint(secret) {
 }
 
 function normalizeSecretEntry(entry) {
-  exactKeys(entry, ["credentialRef", "apiKey"], "credential entry");
-  if (typeof entry.credentialRef !== "string" || !ID.test(entry.credentialRef)) throw new Error("credential entry credentialRef is invalid");
-  if (typeof entry.apiKey !== "string" || entry.apiKey.length < 1 || entry.apiKey.length > 4_096 || /[\0\r\n]/.test(entry.apiKey)) {
-    throw new Error("credential entry apiKey is invalid");
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("credential entry must be an object");
+  const keys = Object.keys(entry).sort().join(",");
+  if (keys !== "apiKey,credentialRef" && keys !== "credentialRef,oauthAccess") {
+    throw new Error("credential entry must contain exactly one supported credential form");
   }
-  return Object.freeze({ credentialRef: entry.credentialRef, apiKey: entry.apiKey, credentialRefFingerprint: fingerprint(entry.apiKey) });
+  if (typeof entry.credentialRef !== "string" || !ID.test(entry.credentialRef)) throw new Error("credential entry credentialRef is invalid");
+  const credentialType = keys === "apiKey,credentialRef" ? "api_key" : "oauth";
+  const secret = credentialType === "api_key" ? entry.apiKey : entry.oauthAccess;
+  if (typeof secret !== "string" || secret.length < 1 || secret.length > 4_096 || /[\0\r\n]/.test(secret)) {
+    throw new Error(`credential entry ${credentialType === "oauth" ? "oauthAccess" : "apiKey"} is invalid`);
+  }
+  return Object.freeze({
+    credentialRef: entry.credentialRef,
+    credentialType,
+    ...(credentialType === "oauth" ? { oauthAccess: secret } : { apiKey: secret }),
+    credentialRefFingerprint: fingerprint(`${credentialType}:${secret}`),
+  });
 }
 
 function normalizeRoute(route) {
@@ -72,8 +83,8 @@ function sameRouteSnapshot(route, snapshot) {
 
 /**
  * An in-memory, exact-name credential store. It deliberately has no env,
- * keychain, OAuth, default-account or secondary-ref lookup. Callers inject
- * secrets at controller bootstrap; config files never contain an API key.
+ * keychain, OAuth refresh, default-account or secondary-ref lookup. Callers inject
+ * one exact API key or current OAuth access token at controller bootstrap; config files never contain credential material.
  */
 export class ControllerCredentialStore {
   #byRef = new Map();
@@ -103,7 +114,9 @@ export class ControllerCredentialStore {
   resolveExact(credentialRef, credentialRefFingerprint) {
     const entry = this.#byRef.get(credentialRef);
     if (!entry || entry.credentialRefFingerprint !== credentialRefFingerprint) return undefined;
-    return Object.freeze({ apiKey: entry.apiKey });
+    return Object.freeze(entry.credentialType === "oauth"
+      ? { type: "oauth", accessToken: entry.oauthAccess }
+      : { apiKey: entry.apiKey });
   }
 
   status() {
@@ -251,7 +264,7 @@ export function createApprovedAnthropicProviderRoute({ routeTable, credentialSto
 
 /**
  * Read a public controller route config from an owner-only regular file. The
- * schema deliberately has no secret field; API keys must be injected into the
+ * schema deliberately has no secret field; API keys or current OAuth access tokens must be injected into the
  * in-memory ControllerCredentialStore by the controller bootstrap.
  */
 export function loadControllerRouteConfiguration(path) {

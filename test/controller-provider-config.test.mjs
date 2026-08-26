@@ -81,6 +81,11 @@ test("controller credential store and route table resolve one exact credential-f
   assert.throws(() => routeTable.resolveForLease({ ...lease(), profile: "other" }, credentials), /not bound/);
   assert.equal(JSON.stringify(routeTable.routes()).includes("sk-controller-only-test-key"), false);
 
+  const oauthCredentials = new ControllerCredentialStore({ entries: [{ credentialRef: "anthropic-oauth", oauthAccess: "oauth-access-token" }] });
+  const oauthRoute = table({ routes: routes({ credentialRef: "anthropic-oauth", endpointId: "anthropic-oauth" }) });
+  const oauthSnapshot = oauthRoute.resolveForLease(lease(), oauthCredentials);
+  assert.deepEqual(oauthRoute.credentialFor(oauthSnapshot, oauthCredentials), { type: "oauth", accessToken: "oauth-access-token" });
+
   let now = 1_000;
   const approval = new ControllerLiveProviderApproval({ routeTableFingerprint: routeTable.fingerprint, expiresAt: 2_000, now: () => now });
   let sends = 0;
@@ -165,6 +170,8 @@ test("route configuration is owner-only, has no secret field, and inventory is o
 test("controller route config rejects fallback-like ambiguity and secrets", () => {
   assert.throws(() => table({ routes: [...routes(), { ...routes()[0], accountAlias: "second", endpointId: "second" }] }), /unique/);
   assert.throws(() => new ControllerCredentialStore({ entries: [{ credentialRef: "bad", apiKey: "x\nkey" }] }), /apiKey/);
+  assert.throws(() => new ControllerCredentialStore({ entries: [{ credentialRef: "bad", apiKey: "key", oauthAccess: "access" }] }), /exactly one supported/);
+  assert.throws(() => new ControllerCredentialStore({ entries: [{ credentialRef: "bad", oauthAccess: "x\naccess" }] }), /oauthAccess/);
   assert.throws(() => table({ routes: routes({ endpoint: "https://key:secret@gateway.example/v1/messages" }) }), /credential-free/);
   assert.throws(() => table({ routes: routes({ adapterId: "other" }) }), /approved Anthropic/);
 });

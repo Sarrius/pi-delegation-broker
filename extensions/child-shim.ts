@@ -132,8 +132,14 @@ export default function childShim(pi: any): void {
       },
     });
   }
-  pi.on("resources_discover", () => {
-    writeToolReport(spec.toolReportPath, { activeTools: pi.getActiveTools() });
+  // `resources_discover` runs before Pi has applied the active-tool set from all
+  // explicitly loaded extensions. Reporting there can race the behavioral
+  // enforcement extension and falsely publish an empty tool list. Session start
+  // is the first lifecycle point at which the final active surface is available.
+  pi.on("session_start", () => {
+    // The behavioral extension's session_start handler runs after this shim.
+    // Yield once so its final active-tool set is applied before reporting.
+    setImmediate(() => writeToolReport(spec.toolReportPath, { activeTools: pi.getActiveTools() }));
     return undefined;
   });
 }
