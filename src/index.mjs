@@ -123,6 +123,7 @@ export { RepairController, RepairStore } from "./repair-controller.mjs";
 export { createHumanApproval, repairProposalDigest, verifyHumanApproval } from "./human-approval.mjs";
 export { SessionBindingStore, formatSessionResumeStatus, sessionCursor, sessionIdentity } from "./session-binding-store.mjs";
 export { signedRegistryMessage, verifySignedRegistry } from "./signed-registry.mjs";
+export { createLauncherAttestation, LauncherAttestationError, verifyLauncherAttestation } from "./launcher-attestation.mjs";
 export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
 export { BrokeredLaunchResolver } from "./trusted-launch-resolver.mjs";
 export { DynamicProviderWatcher, activeAuthorizedProviders, activeCredentialToken, modelRegistryToProviderCatalog, readProviderRegistry } from "./dynamic-provider-watcher.mjs";

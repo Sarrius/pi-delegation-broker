@@ -4,6 +4,7 @@ All notable changes are documented here. This project follows [Semantic Versioni
 
 ## Unreleased
 
+- **External supervisor requirements are now explicit.** The package documents the launchd/systemd boundary, attestation-failure recovery and restart/reconciliation obligations; tmux/caffeinate are not represented as crash supervision.
 - **Workflow mutation is now bound to the owner session.** New task/workflow jobs persist the parent session identity; append, close and cancellation operations fail closed from another session, and workflow join acceptance requires a controller verification callback rather than trusting child semantic status.
 - **Integration now requires controller verification authority evidence.** Accepted-proposal semantic flags cannot authorize a worktree merge; proposal and final integration receipts are bound to the patch digest and expected head before any target mutation.
 - **Protected repair approvals are signed and expiry-bound.** Repair proposals persist the approved receipt and revalidate it against the immutable proposal before controller verification, fresh-process canary, reconciliation and resume. The parent extension now exposes controller-owned repair propose/approve/run/status tools; without an owner-injected repair adapter, run remains fail-closed.

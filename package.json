@@ -17,6 +17,7 @@
     "src",
     "extensions",
     "docs/INTEGRATION.md",
+    "docs/EXTERNAL-SUPERVISOR.md",
     "docs/LIVE-VALIDATION-PLAN.md",
     "docs/PROVIDER-PROXY-PROTOCOL.md",
     "README.md",

@@ -16,4 +16,4 @@ Use the repository's private GitHub Security Advisory reporting flow. If that fl
 
 ## Scope warning
 
-This is an alpha reference implementation. It intentionally has no real provider transport or credential storage. Do not treat its test-only fake transport, local Unix socket, lock file or signed-registry test keys as a production security boundary.
+This is an alpha reference implementation. It contains a controller-only raw Anthropic transport and in-memory credential store for owner-gated experiments, but has made no live provider request and is not a production provider service. Do not treat its test-only fake transport, local Unix socket, lock file, controller proxy or signed-registry test keys as a production security boundary.

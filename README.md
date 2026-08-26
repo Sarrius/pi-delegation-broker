@@ -51,14 +51,14 @@ The integration deliberately preserves the credential boundary:
 - The **parent** Pi session may load `pi-multi-account` and expose aliases such as `anthropic-account-2` or `openai-codex-account-6`.
 - The controller keeps that alias in lease, health, cooldown and audit data, so it knows exactly which account was spent.
 - A brokered child runs with `--no-extensions`; it never loads the parent's multi-account UI/rotation extension and never receives the parent `auth.json`.
-- Its isolated agent directory contains only the credential leased for that attempt. The launcher maps `*-account-N` to the canonical Pi provider (`anthropic`, `openai-codex`, …) solely inside that one-credential directory, because a fresh extension-isolated Pi process cannot resolve alias providers itself.
+- In the legacy compatibility path, its isolated agent directory contains only the credential leased for that attempt. The launcher maps `*-account-N` to the canonical Pi provider (`anthropic`, `openai-codex`, …) solely inside that one-credential directory, because a fresh extension-isolated Pi process cannot resolve alias providers itself. The approved controller-proxy path writes no provider credential or child `auth.json` at all.
 
 This means multi-account capacity and failover remain controller-owned while a child cannot select an account, invoke `pi.setModel()`, or access another credential. See [`docs/INTEGRATION.md`](docs/INTEGRATION.md#account-aliases-and-fresh-pi-processes) for the exact invariant and Hermes subprocess configuration.
 
 ## What it deliberately does **not** provide
 
 - A durable secret vault/rotation, unattended live-provider approval, or provider failover outside the broker's explicit leased Pi-child path. The library has a controller-owned proxy child path, but enabling it against a real provider still requires an explicit approved route/credential injection.
-- Multi-host coordination, automatic stale-lock recovery, production daemon/service management or dashboard.
+- Multi-host coordination, automatic stale-lock recovery, production daemon/service management or dashboard. See [`docs/EXTERNAL-SUPERVISOR.md`](docs/EXTERNAL-SUPERVISOR.md) for the required host-owned crash/reboot boundary; `tmux` and `caffeinate` are not substitutes.
 - A complete controller scheduler that turns every ready queued lease into a child launch. The reference exposes durable readiness; integration remains controller-owned.
 - Signing-key storage, rotation, revocation or registry distribution.
 - A stable upstream Pi launcher API. The [integration patch](https://github.com/Sarrius/pi-delegation-broker/tree/main/patches) is source-repository-only and is **not** installed by this package.
