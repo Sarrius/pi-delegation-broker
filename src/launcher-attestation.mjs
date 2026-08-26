@@ -7,6 +7,14 @@ const HEX64 = /^[a-f0-9]{64}$/;
 const FINGERPRINT_FIELDS = ["schemaVersion", "capabilityFingerprint", "extensions", "behavioralExtension"];
 const ATTESTATION_FIELDS = [...FINGERPRINT_FIELDS, "fingerprint"];
 
+export class LauncherAttestationError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = "LauncherAttestationError";
+    this.code = "launcher_attestation_failed";
+  }
+}
+
 function ownKeysExactly(value, expected, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
   const actual = Object.keys(value).sort();
@@ -49,7 +57,7 @@ function sourceRecord(path, expectedDigest, label) {
   const canonicalPath = canonicalExtension(path, label);
   const digest = hash(readFileSync(canonicalPath));
   if (digest !== boundedHash(expectedDigest, `${label} expected digest`)) {
-    throw new Error(`${label} digest does not match its pinned trusted digest`);
+    throw new LauncherAttestationError(`${label} digest does not match its pinned trusted digest`);
   }
   return Object.freeze({ path: canonicalPath, digest });
 }
@@ -126,7 +134,7 @@ export function verifyLauncherAttestation(attestation, { capabilityFingerprint }
   if (suppliedFingerprint !== fingerprint(payload)) throw new Error("Launcher attestation fingerprint is invalid");
   for (const [index, extension] of payload.extensions.entries()) {
     const actual = hash(readFileSync(extension.path));
-    if (actual !== extension.digest) throw new Error(`Launcher attestation extension ${index} changed after approval`);
+    if (actual !== extension.digest) throw new LauncherAttestationError(`Launcher attestation extension ${index} changed after approval`);
   }
   return Object.freeze({
     ...payload,
