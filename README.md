@@ -8,7 +8,7 @@ A single-host Node.js reference implementation for capability-scoped Pi child de
 trusted controller → signed registry → SQLite lease broker → scoped Unix-socket capability → isolated child policy
 ```
 
-The low-level packaged provider-proxy API fails closed without an explicitly injected provider transport. That library path may construct one exact Anthropic Messages route only from an in-memory `ControllerCredentialStore`, credential-free `ControllerRouteTable`, and bounded `ControllerLiveProviderApproval`; it has no ambient OAuth/account-rotation fallback. Separately, the Pi extension launches isolated children through the reviewed `pi-multi-account` inventory/lease integration and performs bounded route failover; no credential enters child prompts or fleet UI.
+The low-level packaged provider-proxy API fails closed without an explicitly injected provider transport. That library path may construct one exact Anthropic Messages route only from an in-memory `ControllerCredentialStore`, credential-free `ControllerRouteTable`, and bounded `ControllerLiveProviderApproval`; it has no ambient OAuth/account-rotation fallback. The Pi extension enters the same credentialless proxy path only when the owner host injects the approved `controllerProvider` pair; its scoped-auth compatibility fallback remains explicitly non-live-ready. Both paths use the reviewed `pi-multi-account` inventory/lease integration and bounded route failover; credentials never enter child prompts or fleet UI.
 
 ## Status
 

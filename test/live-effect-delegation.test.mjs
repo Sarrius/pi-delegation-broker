@@ -26,7 +26,9 @@ function git(cwd, ...args) {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
 }
 
-test("live: a child proposes a change and only a controller-verified patch comes back", { skip: !process.env.LIVE_TEST }, async () => {
+// Legacy direct-child-auth coverage is deliberately never enabled by LIVE_TEST; live validation
+// must use test/live-controller-proxy-child.test.mjs and its owner-injected controller route.
+test("legacy live: a child proposes a change with scoped child auth", { skip: process.env.LIVE_LEGACY_SCOPED_AUTH_TEST !== "1" }, async () => {
   const root = mkdtempSync(join(tmpdir(), "live-effect-"));
   const repo = join(root, "repo");
   let supervisor;

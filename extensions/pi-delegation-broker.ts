@@ -8,9 +8,9 @@
  * - The capability selector picks the weakest sufficient model class for the task.
  * - The broker leases one live resource in that class (escalating upward when the cheap
  *   class is throttled, never downward).
- * - The child authenticates with exactly the leased account's credential, written into its
- *   owner-only agent dir by the resolver's provisioning hook. It never sees this session's
- *   other accounts.
+ * - An owner-injected controller provider proxy can keep every upstream credential in the
+ *   controller process; proxy-mode children receive no provider auth or child `auth.json`.
+ *   The legacy scoped-auth compatibility path is not live-validation-ready.
  * - A provider failure mid-task is reported to the broker, the account cools down, and the
  *   task is retried on another account automatically.
  * - The provider catalog is watched live: logging into a new account makes it delegable
@@ -107,6 +107,7 @@ import { RecursiveAdmissionStore, normalizeRecursivePolicy } from "../src/recurs
 
 const EXTENSIONS_DIR = dirname(fileURLToPath(import.meta.url));
 const CHILD_SHIM_PATH = join(EXTENSIONS_DIR, "child-shim.ts");
+const CONTROLLER_PROXY_PATH = join(EXTENSIONS_DIR, "controller-provider-proxy.ts");
 const BEHAVIORAL_ENFORCEMENT_PATH = join(EXTENSIONS_DIR, "pi-behavioral-enforcement.ts");
 const PARENT_AGENT_DIR = join(homedir(), ".pi", "agent");
 const STATE_DIR = join(PARENT_AGENT_DIR, "delegation-broker");
@@ -420,6 +421,18 @@ function probeRoutes(registry: any, now = Date.now()) {
   return routes;
 }
 
+function controllerProviderPair(ctx: any) {
+  const value = ctx?.controllerProvider;
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.keys(value).sort().join(",") !== "providerTransport,routeResolver"
+    || !value.providerTransport || typeof value.providerTransport.stream !== "function"
+    || typeof value.routeResolver !== "function") {
+    throw new Error("controllerProvider must be an owner-injected providerTransport + routeResolver pair");
+  }
+  return Object.freeze({ providerTransport: value.providerTransport, routeResolver: value.routeResolver });
+}
+
 function liveProviderCatalog(ctx: any, supplementalModels: any[] = []) {
   const runtimeModels = ctx?.modelRegistry?.getAll?.() ?? ctx?.modelRegistry?.getAvailable?.();
   if (!Array.isArray(runtimeModels)) throw new Error("Pi live model registry is unavailable");
@@ -440,6 +453,7 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     if (JSON.stringify(raw) !== JSON.stringify(normalized)) writeModelPreferences(PREFERENCES_PATH, normalized);
   }
   const keys = loadOrCreateRegistryKeys();
+  const controllerProvider = controllerProviderPair(ctx);
   // An empty authorized fleet is a valid runtime state: all subscription credentials may be
   // expired or temporarily unavailable. The signed controller registry then denies new work
   // cleanly instead of retaining an account that is no longer usable.
@@ -481,6 +495,7 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     behavioralEnforcement: "blocking_monitor",
     signedRegistry,
     trustedRegistryKeys: { [REGISTRY_KEY_ID]: keys.publicKey },
+    ...(controllerProvider ?? {}),
     dynamicProviders: true,
     dynamicProviderCatalog: () => liveProviderCatalog(ctx, getSupplementalModels()),
     sweepIntervalMs: 1_000,
@@ -598,14 +613,15 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     enforceQuality: true,
     enforceProvenance: true,
   });
+  const childExtensions = [CHILD_SHIM_PATH, ...(controllerProvider ? [CONTROLLER_PROXY_PATH] : []), BEHAVIORAL_ENFORCEMENT_PATH];
   const resolver = new BrokeredLaunchResolver({
     socketPath: supervisor.socketPath,
     controllerToken: supervisor.controllerToken,
     agentRoot: join(STATE_DIR, "child-agents"),
-    extensionPaths: [CHILD_SHIM_PATH, BEHAVIORAL_ENFORCEMENT_PATH],
+    extensionPaths: childExtensions,
     launcherAttestationConfig: {
       behavioralExtensionPath: BEHAVIORAL_ENFORCEMENT_PATH,
-      trustedExtensionDigests: [CHILD_SHIM_PATH, BEHAVIORAL_ENFORCEMENT_PATH]
+      trustedExtensionDigests: childExtensions
         .map((path) => createHash("sha256").update(readFileSync(path)).digest("hex")),
     },
     offline: false,
@@ -615,10 +631,16 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     queuedTaskVerifier,
     trackImmediateTasks: false,
     resolveModelForResource: parseResourceModel,
-    provisionChildAuth: ({ agentDir, model }: { agentDir: string; model?: { provider: string; modelId: string } }) => {
-      if (!model?.provider) throw new Error("broker leased a resource with no resolvable model");
-      return writeScopedChildAuth({ agentDir, provider: model.provider, parentAgentDir: PARENT_AGENT_DIR });
-    },
+    ...(controllerProvider
+      ? { controllerProxy: { providerId: "broker-proxy" } }
+      : {
+        // Compatibility only: this writes one scoped auth record into the child and is not
+        // permitted by the live-validation gate. Owner hosts should inject controllerProvider.
+        provisionChildAuth: ({ agentDir, model }: { agentDir: string; model?: { provider: string; modelId: string } }) => {
+          if (!model?.provider) throw new Error("broker leased a resource with no resolvable model");
+          return writeScopedChildAuth({ agentDir, provider: model.provider, parentAgentDir: PARENT_AGENT_DIR });
+        },
+      }),
   });
 
   const runner = new BrokeredChildRunner({
