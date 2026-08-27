@@ -12,6 +12,7 @@ test("route-specific provider policy rejection is failover-eligible", () => {
   assert.equal(classifyChildFailure("controller provider terminal: auth_fatal (401)"), "auth_fatal");
   assert.equal(classifyChildFailure("controller provider terminal: rejected_before_send (400, subscription_extra_usage_required)"), "account_exhausted");
   assert.equal(classifyChildFailure("controller provider terminal: transport_before_headers"), "unavailable");
+  assert.equal(classifyChildFailure("controller provider terminal: controller_failure"), "unavailable");
 });
 
 // We test the runner's deny path and semaphore release without spawning a real Pi process.
@@ -63,6 +64,51 @@ test("brokered runner denies spawn when resolver denies and never takes a semaph
       /Broker denied launch/,
     );
     assert.equal(sem.running, 0, "semaphore released after denial");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("brokered runner does not spend a root attempt on a pre-admission denial", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-deny-budget-"));
+  try {
+    const { BrokeredChildRunner } = await import("../src/brokered-runner.mjs");
+    let acquisitions = 0;
+    const runner = new BrokeredChildRunner({
+      resolver: fakeResolver(false),
+      semaphore: new Semaphore(1),
+      sessionsRoot: join(root, "sessions"),
+    });
+    const result = await runner.run({
+      childId: "denied-budget-child", model: MODEL, cwd: root, prompt: "read-only",
+      maxAttempts: 1, attemptBudget: { acquire: async () => { acquisitions += 1; return { granted: true }; } },
+    });
+    assert.equal(result.status, "failed");
+    assert.equal(acquisitions, 0, "a route denied before lease admission is not a physical attempt");
+    assert.equal(result.route[0].outcome, "denied");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("brokered runner enforces the root budget after exact admission", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-admitted-budget-"));
+  try {
+    const { BrokeredChildRunner } = await import("../src/brokered-runner.mjs");
+    const sem = new Semaphore(1);
+    const runner = new BrokeredChildRunner({
+      resolver: fakeResolver(true),
+      semaphore: sem,
+      sessionsRoot: join(root, "sessions"),
+    });
+    const result = await runner.run({
+      childId: "admitted-budget-child", model: MODEL, cwd: root, prompt: "read-only",
+      maxAttempts: 1, attemptBudget: { acquire: async () => ({ granted: false }) },
+    });
+    assert.equal(result.status, "failed");
+    assert.equal(result.error, "controller root physical-attempt budget exceeded");
+    assert.equal(result.route[0].outcome, "root_budget_exceeded");
+    assert.equal(sem.running, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

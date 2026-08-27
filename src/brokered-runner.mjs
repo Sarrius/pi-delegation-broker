@@ -12,6 +12,7 @@ const DEFAULT_CAPACITY_WAIT_MS = 15 * 60_000;
 const DEFAULT_CAPACITY_RETRY_MS = 500;
 const MAX_ROUTE_ATTEMPTS = 32;
 const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
+const ROOT_ATTEMPT_BUDGET_CODE = "controller_root_physical_attempt_budget";
 
 /**
  * Terminal child failures split by who owns them. A provider that throttled or died is a
@@ -27,6 +28,10 @@ const FAILURE_SIGNATURES = Object.freeze([
   // Capability/organization policy rejection is route-specific: the same task can run on
   // another account/model, so quarantine this resource and let controller failover continue.
   Object.freeze({ kind: "unavailable", pattern: /\b(unsupported_value|reasoning summaries|organization must be verified|model is not supported)\b/i }),
+  // A controller route can disappear after catalog admission (for example, a model slot was
+  // replaced in Pi's live registry). This is route unavailability, not task failure: exclude the
+  // exact resource and let the controller try the remaining eligible pool.
+  Object.freeze({ kind: "unavailable", pattern: /\bcontroller provider terminal:\s*controller_failure\b/i }),
   // Provider catalogs are observations, not authority. A model can disappear between discovery
   // and launch; its 404 is a stale route and must fail over, not kill otherwise valid work.
   Object.freeze({ kind: "unavailable", pattern: /\bmodel\b[^\n]{0,200}\bnot found\b|\b404\b[^\n]{0,300}\bnot_found_error\b/i }),
@@ -265,7 +270,6 @@ export class BrokeredChildRunner {
     };
     const route = [];
     const unavailableByCapacityGroup = new Map();
-    let attemptGrant;
     let requiredCapabilities = spec.capabilityRequest?.requiredCapabilities;
     let capacityWaitDeadline;
     let lastResult;
@@ -294,14 +298,6 @@ export class BrokeredChildRunner {
     this.#activeRuns.add(childId);
     for (let attempt = 1; attempt <= routeAttemptLimit; attempt++) {
       const attemptId = attempt === 1 ? childId : `${childId}-r${attempt}`;
-      if (!attemptGrant && attemptBudget) {
-        attemptGrant = await attemptBudget.acquire({ childId, attempt });
-        if (!attemptGrant?.granted) {
-          const error = "controller root physical-attempt budget exceeded";
-          route.push({ attempt, childId: attemptId, outcome: "root_budget_exceeded", error });
-          return finish(Object.freeze({ id: childId, status: "failed", text: "", error, route: Object.freeze(route) }));
-        }
-      }
       if (abortedEarly()) return finish(Object.freeze({
         id: childId, status: "aborted", text: "",
         error: this.#disposed ? "brokered runner disposed" : "aborted before a child was launched",
@@ -351,9 +347,14 @@ export class BrokeredChildRunner {
       try {
         handle = await this.spawn({
           ...spec, childId: attemptId, prompt: attemptPrompt, promptDigest: attemptPromptDigest,
-          capabilityRequest, attempts: attempt, deferClosePolicy: true,
+          capabilityRequest, attempts: attempt, attemptBudget, deferClosePolicy: true,
         });
       } catch (error) {
+        if (error?.code === ROOT_ATTEMPT_BUDGET_CODE) {
+          const message = "controller root physical-attempt budget exceeded";
+          route.push({ attempt, childId: attemptId, outcome: "root_budget_exceeded", error: message });
+          return finish(Object.freeze({ id: childId, status: "failed", text: "", error: message, route: Object.freeze(route) }));
+        }
         if (abortedEarly()) return finish(Object.freeze({
           id: childId, status: "aborted", text: "",
           error: this.#disposed ? "brokered runner disposed" : "aborted before a child was launched",
@@ -376,13 +377,10 @@ export class BrokeredChildRunner {
           route.push({ attempt, childId: attemptId, outcome: "capacity_wait_timeout", error: message });
           return finish(Object.freeze({ id: childId, status: "failed", text: "", error: message, route: Object.freeze(route) }));
         }
-        attemptGrant = undefined;
         // A policy/capability denial cannot be repaired by replaying the same contract.
         route.push({ attempt, childId: attemptId, outcome: "denied", error: error.message });
         return finish(Object.freeze({ id: childId, status: "failed", text: "", error: error.message, route: Object.freeze(route) }));
       }
-      attemptGrant = undefined;
-
       // Cancellation can land after the semaphore grant but before a handle existed, i.e. while
       // the resolver was still choosing a route. The child is real now, so stop it through the
       // normal close path instead of leaving the operator paying for cancelled work.
@@ -560,7 +558,7 @@ export class BrokeredChildRunner {
     finally { this.#inflightSpawns.delete(promise); }
   }
 
-  async #spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, recursion, attempts = 1, deferClosePolicy = false, roleFraming, skills }) {
+  async #spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, recursion, attempts = 1, attemptBudget, deferClosePolicy = false, roleFraming, skills }) {
     if (this.#disposed) throw new Error("BrokeredChildRunner is disposed");
     if (this.#handles.has(childId)) throw new Error(`Duplicate child id: ${childId}`);
     if (!Number.isSafeInteger(attempts) || attempts < 1) throw new Error("brokered child attempt count must be a positive safe integer");
@@ -600,6 +598,22 @@ export class BrokeredChildRunner {
       if (policy.authorizationPolicy?.effectCapable === true && isolation !== "worktree") {
         await policy.onBeforeChildAbandoned?.("effect_requires_worktree");
         throw new Error("effect-capable brokered launch requires worktree isolation");
+      }
+      // Count a physical attempt only after provider snapshot/preflight and exact lease admission
+      // have succeeded. A denied/stale route must not consume the workflow root's attempt budget.
+      if (attemptBudget) {
+        let grant;
+        try { grant = await attemptBudget.acquire({ childId, attempt: attempts }); }
+        catch (error) {
+          await Promise.resolve(policy.onBeforeChildAbandoned?.("root_attempt_budget_gate_failed")).catch(() => undefined);
+          throw error;
+        }
+        if (!grant?.granted) {
+          await Promise.resolve(policy.onBeforeChildAbandoned?.("root_attempt_budget_exceeded")).catch(() => undefined);
+          const error = new Error("controller root physical-attempt budget exceeded");
+          error.code = ROOT_ATTEMPT_BUDGET_CODE;
+          throw error;
+        }
       }
       // The lease decides the model, not the request: the contract pins a capability class and
       // the broker picks a live resource inside it, which may not be the one predicted.

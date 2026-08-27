@@ -442,13 +442,21 @@ function probeRoutes(registry: any, now = Date.now()) {
 function controllerProviderPair(ctx: any) {
   const value = ctx?.controllerProvider;
   if (value === undefined) return undefined;
+  const keys = value && typeof value === "object" && !Array.isArray(value)
+    ? Object.keys(value).sort().join(",")
+    : "";
   if (!value || typeof value !== "object" || Array.isArray(value)
-    || Object.keys(value).sort().join(",") !== "providerTransport,routeResolver"
+    || keys !== "providerTransport,routePreflight,routeResolver"
     || !value.providerTransport || typeof value.providerTransport.stream !== "function"
-    || typeof value.routeResolver !== "function") {
-    throw new Error("controllerProvider must be an owner-injected providerTransport + routeResolver pair");
+    || typeof value.routeResolver !== "function"
+    || typeof value.routePreflight !== "function") {
+    throw new Error("controllerProvider must be an owner-injected providerTransport + routePreflight + routeResolver pair");
   }
-  return Object.freeze({ providerTransport: value.providerTransport, routeResolver: value.routeResolver });
+  return Object.freeze({
+    providerTransport: value.providerTransport,
+    routePreflight: value.routePreflight,
+    routeResolver: value.routeResolver,
+  });
 }
 
 function controllerRepairAdapter(ctx: any) {
@@ -644,6 +652,28 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
   // bounded cadence so a recovered account is usable without waiting for a new login or task
   // failure; the broker still owns cooldowns and only a real inference probe closes quota breakers.
   const currencyTimer = setInterval(() => { refreshCurrency().catch(() => undefined); }, CURRENCY_REFRESH_MS);
+  let providerStateRefreshInFlight: Promise<void> | undefined;
+  const refreshProviderState = async (): Promise<void> => {
+    if (providerStateRefreshInFlight) return providerStateRefreshInFlight;
+    const run = (async () => {
+      // Ask the owner-side catalog publisher for a fresh snapshot before reading the broker
+      // registry. This closes the window where models.json/auth.json changed but the long-lived
+      // Pi model registry had not yet reached the watcher.
+      try { ctx?.events?.emit?.(MODEL_CATALOG_REQUEST_EVENT); } catch { /* snapshot is best effort; readiness still fails closed */ }
+      const watcher = supervisor.providerWatcher;
+      if (!watcher) throw new Error("provider watcher is unavailable");
+      const registryRefresh = await watcher.refresh();
+      if (registryRefresh.status !== "reloaded" && registryRefresh.status !== "unchanged") {
+        throw new Error("provider registry refresh was not accepted");
+      }
+      await refreshCurrency();
+    })();
+    const settled = run.finally(() => {
+      if (providerStateRefreshInFlight === settled) providerStateRefreshInFlight = undefined;
+    });
+    providerStateRefreshInFlight = settled;
+    return settled;
+  };
   currencyTimer.unref?.();
   const baseSelectContract = createSelectContract({
     registry: () => supervisor.providerWatcher.currentRegistry(),
@@ -669,6 +699,10 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     // Tracking happens only after the runner knows which failover attempt actually completed.
     // Marking the first attempt here could verify stale work before a later route succeeds.
     selectContract: (request: any) => baseSelectContract(request),
+    ...(controllerProvider ? {
+      refreshProviderState,
+      routePreflight: controllerProvider.routePreflight,
+    } : {}),
     queuedTaskVerifier,
     trackImmediateTasks: false,
     resolveModelForResource: parseResourceModel,

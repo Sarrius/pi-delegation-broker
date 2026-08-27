@@ -43,7 +43,7 @@ function request(childId) {
   };
 }
 
-function resolverFor(supervisor, root, selectContract, launcherAttestationConfig, extensionPaths = [EXTENSION_PATH], queuedTaskVerifier) {
+function resolverFor(supervisor, root, selectContract, launcherAttestationConfig, extensionPaths = [EXTENSION_PATH], queuedTaskVerifier, routePreflight, refreshProviderState) {
   return new BrokeredLaunchResolver({
     socketPath: supervisor.socketPath,
     controllerToken: supervisor.controllerToken,
@@ -53,6 +53,8 @@ function resolverFor(supervisor, root, selectContract, launcherAttestationConfig
     selectContract,
     ...(launcherAttestationConfig === undefined ? {} : { launcherAttestationConfig }),
     ...(queuedTaskVerifier === undefined ? {} : { queuedTaskVerifier }),
+    ...(routePreflight === undefined ? {} : { routePreflight }),
+    ...(refreshProviderState === undefined ? {} : { refreshProviderState }),
   });
 }
 
@@ -367,6 +369,86 @@ test("denied_capacity on a full group retries on the next allow-listed account",
     await second.policy.onBeforeChildAbandoned("test_cleanup");
   } finally {
     await supervisor.stop().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolver refreshes provider state before selecting a launch route", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-refresh-"));
+  const supervisor = signedSupervisor(root);
+  let refreshes = 0;
+  let selections = 0;
+  try {
+    await supervisor.start();
+    const resolver = resolverFor(supervisor, root, () => {
+      selections += 1;
+      assert.equal(refreshes, selections, "selection must observe a completed provider refresh");
+      return { expectedModel: MODEL, contract: fixtureContract({ taskId: "refresh-task" }) };
+    }, undefined, [EXTENSION_PATH], undefined, undefined, async () => { refreshes += 1; });
+    const decision = await resolver.resolve(request("child_refresh"));
+    assert.equal(decision.action, "allow");
+    assert.equal(refreshes, 1);
+    await resolver.releaseUnhanded("child_refresh");
+  } finally {
+    await supervisor.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolver fails closed when the provider snapshot cannot be refreshed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-refresh-fail-"));
+  const supervisor = signedSupervisor(root);
+  let selections = 0;
+  try {
+    await supervisor.start();
+    const resolver = resolverFor(supervisor, root, () => {
+      selections += 1;
+      return { expectedModel: MODEL, contract: fixtureContract({ taskId: "refresh-fail-task" }) };
+    }, undefined, [EXTENSION_PATH], undefined, undefined, async () => { throw new Error("catalog unavailable"); });
+    assert.deepEqual(await resolver.resolve(request("child_refresh_fail")), {
+      action: "deny", reason: "controller provider snapshot unavailable",
+    });
+    assert.equal(selections, 0);
+    assert.equal(supervisor.auditSnapshot().leases.length, 0);
+  } finally {
+    await supervisor.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolver preflights exact routes before reservation and excludes stale resources", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-preflight-"));
+  const supervisor = signedSupervisor(root);
+  const calls = [];
+  const { model: _omit, ...requestWithoutModel } = request("child_preflight");
+  try {
+    await supervisor.start();
+    const resolver = resolverFor(supervisor, root, (input) => {
+      const excluded = new Set(input.capabilityRequest?.excludeResources ?? []);
+      const resourceId = excluded.has("R1") ? "R2" : "R1";
+      return {
+        expectedModel: MODEL,
+        contract: fixtureContract({
+          taskId: `task-${input.childId}`,
+          capability: { ...fixtureContract().capability, allowedResources: [resourceId] },
+        }),
+      };
+    }, undefined, [EXTENSION_PATH], undefined, async ({ resourceId }) => {
+      calls.push(resourceId);
+      return resourceId === "R1"
+        ? { status: "unavailable", reason: "model_not_registered", scope: "resource" }
+        : { status: "ready" };
+    });
+    const decision = await resolver.resolve(requestWithoutModel);
+    assert.equal(decision.action, "allow");
+    assert.deepEqual(calls, ["R1", "R2"]);
+    assert.equal(decision.resource.id, "R2");
+    assert.equal(supervisor.auditSnapshot().leases.length, 1);
+    assert.equal(supervisor.auditSnapshot().leases[0].resourceId, "R2");
+    assert.equal(supervisor.inventory().find((resource) => resource.resourceId === "R1").state, "unknown");
+    await resolver.releaseUnhanded("child_preflight");
+  } finally {
+    await supervisor.stop();
     rmSync(root, { recursive: true, force: true });
   }
 });
