@@ -155,6 +155,25 @@ test("supervisor reclaims a lock whose recorded pid is dead", async () => {
   }
 });
 
+test("supervisor reclaims a stale lock after its pid is reused by an unrelated live process", async () => {
+  const stateDir = stateDirectory("broker-sup-reused-pid-");
+  const lockPath = join(stateDir, "broker.lock");
+  // The recorded PID is alive, but the old broker socket is gone and the lock predates the
+  // startup grace window. This mirrors macOS reusing a dead Pi PID for another system service.
+  writeFileSync(lockPath, JSON.stringify({ instanceId: "dead-host", pid: process.pid, startedAt: Date.now() - 60_000 }) + "\n", { mode: 0o600 });
+  const supervisor = new SingleHostBrokerSupervisor({ stateDir, registry: fixtureRegistry(), allowUnsignedFixture: true, controllerToken: CONTROLLER_TOKEN });
+  try {
+    await supervisor.start();
+    const reclaimed = JSON.parse(readFileSync(lockPath, "utf8"));
+    assert.notEqual(reclaimed.instanceId, "dead-host");
+    assert.equal(reclaimed.pid, process.pid);
+    assert.equal(existsSync(join(stateDir, "broker.sock")), true);
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("supervisor fails closed on an unparseable lock without deleting it", async () => {
   const stateDir = stateDirectory("broker-sup-badjson-");
   const lockPath = join(stateDir, "broker.lock");

@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
+import { createConnection } from "node:net";
 import {
   chmodSync,
   closeSync,
@@ -26,6 +27,10 @@ const LOCK_NAME = "broker.lock";
 // macOS permits roughly 104 bytes for a Unix-domain socket path; stay below
 // the narrower common limit so startup fails clearly instead of listen(EINVAL).
 const MAX_SOCKET_PATH_BYTES = 100;
+// A live owner may still be between lock creation and socket listen. Keep that short startup
+// window fail-closed, but do not mistake a recycled PID for a live broker after the window.
+const LOCK_STARTUP_GRACE_MS = 30_000;
+const LOCK_SOCKET_PROBE_MS = 250;
 
 function requireOwnerOnlyDirectory(path) {
   if (typeof path !== "string" || !isAbsolute(path)) throw new Error("Broker stateDir must be an absolute path");
@@ -235,7 +240,7 @@ export class SingleHostBrokerSupervisor {
     if (this.#state !== "new") throw new Error(`Broker supervisor cannot start from state ${this.#state}`);
     this.#state = "starting";
     try {
-      this.#acquireLock();
+      await this.#acquireLock();
       rejectUnsafeExistingFile(this.databasePath, "database");
       this.#broker = new SqliteLeaseBroker({
         path: this.databasePath,
@@ -316,7 +321,7 @@ export class SingleHostBrokerSupervisor {
 
   #lockPath() { return join(this.#stateDir, LOCK_NAME); }
 
-  #acquireLock() {
+  async #acquireLock() {
     const lockPath = this.#lockPath();
     rejectUnsafeExistingFile(lockPath, "lock");
     let descriptor;
@@ -324,9 +329,9 @@ export class SingleHostBrokerSupervisor {
       descriptor = openSync(lockPath, "wx", 0o600);
     } catch (error) {
       if (error && typeof error === "object" && error.code === "EEXIST") {
-        // A lock whose recorded owner pid no longer exists is debris from a killed host,
-        // not a running broker: refuse anything else, reclaim only that.
-        this.#reclaimProvablyStaleLock(lockPath);
+        // A lock whose owner pid is dead, or whose pid was recycled after its broker socket
+        // disappeared, is debris from a killed host. A live listener remains authoritative.
+        await this.#reclaimProvablyStaleLock(lockPath);
         try {
           descriptor = openSync(lockPath, "wx", 0o600);
         } catch (retryError) {
@@ -348,15 +353,38 @@ export class SingleHostBrokerSupervisor {
     hardenFile(lockPath);
   }
 
+  #brokerSocketReachable() {
+    return new Promise((resolve) => {
+      const socket = createConnection(this.socketPath);
+      let settled = false;
+      const finish = (reachable) => {
+        if (settled) return;
+        settled = true;
+        socket.setTimeout(0);
+        socket.destroy();
+        resolve(reachable);
+      };
+      socket.setTimeout(LOCK_SOCKET_PROBE_MS, () => finish(false));
+      socket.once("connect", () => finish(true));
+      socket.once("error", () => finish(false));
+    });
+  }
+
   /**
-   * Remove the lock only when it is parseable and its recorded pid is provably dead.
-   * A live or foreign-owned pid (EPERM) and unreadable contents stay fail-closed: pid
-   * reuse can produce a false "stale" never a false "alive", so this errs toward manual
-   * recovery whenever the lock cannot prove its owner is gone.
+   * Reclaim a lock only when the owner is provably absent. A live PID alone is not enough:
+   * macOS commonly reuses a PID for an unrelated system service after a Pi host exits. A
+   * parseable recent lock with no listener stays fail-closed for the startup grace window;
+   * an older live-PID lock is reclaimable only after its owner-only broker socket refuses a
+   * bounded connection. The lock contents are compared again before removal to avoid deleting
+   * a replacement owner's lock during the check.
    */
-  #reclaimProvablyStaleLock(lockPath) {
+  async #reclaimProvablyStaleLock(lockPath) {
+    let raw;
     let parsed;
-    try { parsed = JSON.parse(readFileSync(lockPath, "utf8")); } catch {
+    try {
+      raw = readFileSync(lockPath, "utf8");
+      parsed = JSON.parse(raw);
+    } catch {
       throw new Error("Broker stateDir is already locked or has a stale lock; manual recovery is required");
     }
     const pid = parsed?.pid;
@@ -365,10 +393,9 @@ export class SingleHostBrokerSupervisor {
     }
     try {
       process.kill(pid, 0);
-      throw new Error(`Broker stateDir is already locked by running broker pid ${pid}`);
     } catch (error) {
       if (error && typeof error === "object" && error.code === "ESRCH") {
-        rmSync(lockPath);
+        this.#removeUnchangedStaleLock(lockPath, raw);
         return;
       }
       if (error && typeof error === "object" && error.code === "EPERM") {
@@ -376,6 +403,26 @@ export class SingleHostBrokerSupervisor {
       }
       throw error;
     }
+
+    const startedAt = parsed?.startedAt;
+    if (!Number.isSafeInteger(startedAt) || startedAt <= 0 || Date.now() - startedAt < LOCK_STARTUP_GRACE_MS) {
+      throw new Error(`Broker stateDir is already locked by running broker pid ${pid}`);
+    }
+    if (await this.#brokerSocketReachable()) {
+      throw new Error(`Broker stateDir is already locked by running broker pid ${pid}`);
+    }
+    this.#removeUnchangedStaleLock(lockPath, raw);
+  }
+
+  #removeUnchangedStaleLock(lockPath, original) {
+    let current;
+    try { current = readFileSync(lockPath, "utf8"); } catch {
+      throw new Error("Broker stateDir lock disappeared during stale-lock recovery");
+    }
+    if (current !== original) {
+      throw new Error("Broker lock changed during stale-lock recovery; refusing to remove it");
+    }
+    rmSync(lockPath);
   }
 
   #releaseOwnLock() {
