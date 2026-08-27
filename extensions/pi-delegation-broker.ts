@@ -133,6 +133,11 @@ const FLEET_WIDGET_ROWS = 5;
 const FLEET_DURABLE_LIMIT = 256;
 const MODEL_CATALOG_REQUEST_EVENT = "pi:model-catalog:request:v1";
 const MODEL_CATALOG_SNAPSHOT_EVENT = "pi:model-catalog:snapshot:v1";
+// Cursor's subscription bridge publishes a fresh parent model catalog but has no safe generic
+// `/models` endpoint for the controller's currency probe. Its current catalog fact is therefore
+// seeded only for this provider, and the exact controller route preflight remains the hard gate
+// immediately before lease admission.
+const CATALOG_ONLY_NATIVE_PROVIDERS = Object.freeze(["cursor"]);
 
 const CAPABILITIES = ["text_generation", "code_reasoning", "large_context", "vision_input"] as const;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -439,6 +444,17 @@ function probeRoutes(registry: any, now = Date.now()) {
   return routes;
 }
 
+function catalogOnlyListings(registry: any, probedRoutes: Map<string, unknown>) {
+  const listings = new Map<string, Map<string, undefined>>();
+  for (const { provider, modelId } of registryModels(registry)) {
+    if (!CATALOG_ONLY_NATIVE_PROVIDERS.includes(provider) || probedRoutes.has(provider)) continue;
+    const listing = listings.get(provider) ?? new Map<string, undefined>();
+    listing.set(modelId, undefined);
+    listings.set(provider, listing);
+  }
+  return listings;
+}
+
 function controllerProviderPair(ctx: any) {
   const value = ctx?.controllerProvider;
   if (value === undefined) return undefined;
@@ -601,6 +617,15 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
   const refreshCurrency = async () => {
     const currentRegistry = supervisor.providerWatcher.currentRegistry();
     const routes = probeRoutes(currentRegistry);
+    // A Cursor model list is published by the parent bridge, not by a generic `/models` API.
+    // Replace the prior catalog-only fact on every refresh so removed models cannot remain current;
+    // routePreflight still checks the exact model/runtime/auth/API tuple before any lease.
+    const catalogOnly = catalogOnlyListings(currentRegistry, routes);
+    for (const provider of CATALOG_ONLY_NATIVE_PROVIDERS) {
+      const listing = catalogOnly.get(provider);
+      if (listing) liveListings.set(provider, listing);
+      else if (!routes.has(provider)) liveListings.delete(provider);
+    }
     const successfullyRefreshed = new Map<string, Map<string, number | undefined>>();
     await Promise.all([...routes].map(async ([provider, route]) => {
       const result = await probeProviderModels({ baseUrl: route.baseUrl, apiKey: route.apiKey });

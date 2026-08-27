@@ -198,6 +198,46 @@ test("currency cache is atomically persisted as credential-free listing facts", 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("a fresh catalog-only Cursor listing makes the native route current for exact preflight", () => {
+  const registry = registryFor([{ provider: "cursor", models: [model("composer-2.5", "cursor")] }]);
+  const staleCachedListing = buildCurrencyMap({
+    resources: resourcesFor(registry),
+    liveListings: new Map([["cursor", new Set()]]),
+  });
+  assert.equal(staleCachedListing["cursor/composer-2.5"].listed, false);
+  assert.equal(staleCachedListing["cursor/composer-2.5"].legacy, true);
+  const staleSelection = selectModelForTask({
+    taskDescription: "read a file and summarize it",
+    registry,
+    currency: staleCachedListing,
+    enforceQuality: true,
+    enforceProvenance: true,
+    constraints: { taskId: "cursor-currency-test", promptDigest: "a".repeat(64), allowedProviders: ["cursor"] },
+  });
+  assert.equal(staleSelection.action, "deny", "an empty cached Cursor listing must not masquerade as a current route");
+
+  // Cursor publishes its current model catalog through the parent bridge rather than a generic
+  // /models endpoint. The bridge supplies the listing fact; the controller's exact route
+  // preflight still has to verify runtime/auth/API readiness before leasing this model.
+  const currency = buildCurrencyMap({
+    resources: resourcesFor(registry),
+    liveListings: new Map([["cursor", new Map([["composer-2.5", undefined]])]]),
+    evaluatedAt: 1_780_000_000_000,
+  });
+  assert.equal(currency["cursor/composer-2.5"].listed, true);
+  assert.equal(currency["cursor/composer-2.5"].source, "provider_listing");
+  const selected = selectModelForTask({
+    taskDescription: "read a file and summarize it",
+    registry,
+    currency,
+    enforceQuality: true,
+    enforceProvenance: true,
+    constraints: { taskId: "cursor-currency-test", promptDigest: "a".repeat(64), allowedProviders: ["cursor"] },
+  });
+  assert.equal(selected.action, "allow");
+  assert.deepEqual(selected.expectedModel, { provider: "cursor", modelId: "composer-2.5" });
+});
+
 test("createSelectContract passes the live currency feed into automatic selection", () => {
   const registry = registryFor([{ provider: "zai", models: [model("glm-4.7", "zai"), model("glm-5.3", "zai")] }]);
   const currency = buildCurrencyMap({ resources: resourcesFor(registry) });
