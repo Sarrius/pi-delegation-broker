@@ -135,9 +135,9 @@ const MODEL_CATALOG_REQUEST_EVENT = "pi:model-catalog:request:v1";
 const MODEL_CATALOG_SNAPSHOT_EVENT = "pi:model-catalog:snapshot:v1";
 // Cursor's subscription bridge publishes a fresh parent model catalog but has no safe generic
 // `/models` endpoint for the controller's currency probe. Its current catalog fact is therefore
-// seeded only for this provider, and the exact controller route preflight remains the hard gate
+// seeded only for these providers, and the exact controller route preflight remains the hard gate
 // immediately before lease admission.
-const CATALOG_ONLY_NATIVE_PROVIDERS = Object.freeze(["cursor"]);
+const CATALOG_ONLY_NATIVE_PROVIDER = /^cursor(?:-account-\d+)?$/;
 
 const CAPABILITIES = ["text_generation", "code_reasoning", "large_context", "vision_input"] as const;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -424,6 +424,11 @@ function probeRoutes(registry: any, now = Date.now()) {
   const configured = readJson(join(PARENT_AGENT_DIR, "models.json")).providers ?? {};
   const routes = new Map<string, { baseUrl: string; apiKey: string }>();
   for (const { provider } of registryModels(registry)) {
+    // Cursor's parent-owned bridge has an OpenAI-shaped models.json URL, but that endpoint is
+    // not a generic provider `/models` resource. Probing it marks every Cursor model unknown
+    // when the bridge is intentionally not exposed at that URL; the catalog-only path below
+    // supplies the listing fact and exact routePreflight verifies the native runtime instead.
+    if (CATALOG_ONLY_NATIVE_PROVIDER.test(provider)) continue;
     if (routes.has(provider)) continue;
     const credential = auth[provider];
     // OAuth subscriptions were previously visible to selection but invisible to the controller
@@ -445,10 +450,10 @@ function probeRoutes(registry: any, now = Date.now()) {
 }
 
 function catalogOnlyListings(registry: any, probedRoutes: Map<string, unknown>) {
-  const listings = new Map<string, Map<string, undefined>>();
+  const listings = new Map<string, Map<string, number | undefined>>();
   for (const { provider, modelId } of registryModels(registry)) {
-    if (!CATALOG_ONLY_NATIVE_PROVIDERS.includes(provider) || probedRoutes.has(provider)) continue;
-    const listing = listings.get(provider) ?? new Map<string, undefined>();
+    if (!CATALOG_ONLY_NATIVE_PROVIDER.test(provider) || probedRoutes.has(provider)) continue;
+    const listing = listings.get(provider) ?? new Map<string, number | undefined>();
     listing.set(modelId, undefined);
     listings.set(provider, listing);
   }
@@ -621,50 +626,73 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     // Replace the prior catalog-only fact on every refresh so removed models cannot remain current;
     // routePreflight still checks the exact model/runtime/auth/API tuple before any lease.
     const catalogOnly = catalogOnlyListings(currentRegistry, routes);
-    for (const provider of CATALOG_ONLY_NATIVE_PROVIDERS) {
+    const catalogHealthUpdates: Promise<unknown>[] = [];
+    const auth = readJson(join(PARENT_AGENT_DIR, "auth.json"));
+    const catalogProviders = new Set(
+      registryModels(currentRegistry)
+        .map(({ provider }) => provider)
+        .filter((provider) => CATALOG_ONLY_NATIVE_PROVIDER.test(provider)),
+    );
+    for (const provider of catalogProviders) {
       const listing = catalogOnly.get(provider);
-      if (listing) liveListings.set(provider, listing);
-      else if (!routes.has(provider)) liveListings.delete(provider);
+      if (listing) {
+        liveListings.set(provider, listing);
+        // The parent catalog was read through the Cursor OAuth path, so it is a valid
+        // availability observation for resources previously quarantined by the invalid generic
+        // `/models` probe. Do not touch a capacity breaker: only an inference probe may close it.
+        const resourceId = Object.entries(currentRegistry.resources ?? {})
+          .find(([id, resource]: [string, any]) => (resource.model ?? parseResourceModel(id))?.provider === provider)?.[0];
+        if (resourceId && activeCredentialToken(auth[provider], Date.now())) {
+          catalogHealthUpdates.push(requestBrokerIpc({
+            socketPath: supervisor.socketPath, authorization: supervisor.controllerToken,
+            method: "markAvailabilityObserved",
+            params: { resourceId, scope: "capacity_group" },
+          }).catch(() => undefined));
+        }
+      } else if (!routes.has(provider)) liveListings.delete(provider);
     }
     const successfullyRefreshed = new Map<string, Map<string, number | undefined>>();
-    await Promise.all([...routes].map(async ([provider, route]) => {
-      const result = await probeProviderModels({ baseUrl: route.baseUrl, apiKey: route.apiKey });
-      const resources = Object.entries(currentRegistry.resources ?? {})
-        .filter(([resourceId, resource]: [string, any]) => (resource.model ?? parseResourceModel(resourceId))?.provider === provider)
-        .map(([resourceId]) => resourceId);
-      // catalogToBrokerRegistry gives every model of one provider one capacity group, so one
-      // health transition is enough and avoids racing identical updates for every model.
-      const resourceId = resources[0];
-      if (!resourceId) return;
-      const health = classifyProviderProbe(result);
-      if (health.status === "available") {
-        const listing = new Map(result.models.map((id: string) => [id, result.created?.[id]]));
-        liveListings.set(provider, listing);
-        successfullyRefreshed.set(provider, listing);
-        // A successful listing/credential probe clears stale unknown resource state. It does not
-        // close a quota breaker: only a leased inference probe can prove that subscription quota
-        // has recovered after a 429/402.
+    await Promise.all([
+      ...catalogHealthUpdates,
+      ...[...routes].map(async ([provider, route]) => {
+        const result = await probeProviderModels({ baseUrl: route.baseUrl, apiKey: route.apiKey });
+        const resources = Object.entries(currentRegistry.resources ?? {})
+          .filter(([resourceId, resource]: [string, any]) => (resource.model ?? parseResourceModel(resourceId))?.provider === provider)
+          .map(([resourceId]) => resourceId);
+        // catalogToBrokerRegistry gives every model of one provider one capacity group, so one
+        // health transition is enough and avoids racing identical updates for every model.
+        const resourceId = resources[0];
+        if (!resourceId) return;
+        const health = classifyProviderProbe(result);
+        if (health.status === "available") {
+          const listing = new Map(result.models.map((id: string) => [id, result.created?.[id]]));
+          liveListings.set(provider, listing);
+          successfullyRefreshed.set(provider, listing);
+          // A successful listing/credential probe clears stale unknown resource state. It does not
+          // close a quota breaker: only a leased inference probe can prove that subscription quota
+          // has recovered after a 429/402.
+          await requestBrokerIpc({
+            socketPath: supervisor.socketPath, authorization: supervisor.controllerToken,
+            method: "markAvailabilityObserved",
+            params: { resourceId, scope: "capacity_group" },
+          }).catch(() => undefined);
+          return;
+        }
+        // A provider that cannot answer its controller probe is not currently selectable. This is
+        // deliberately pessimistic: retaining a previously healthy state routed the next child
+        // into a known-dead credential/network path. Unknown state has a bounded half-open retry.
         await requestBrokerIpc({
           socketPath: supervisor.socketPath, authorization: supervisor.controllerToken,
-          method: "markAvailabilityObserved",
-          params: { resourceId, scope: "capacity_group" },
+          method: health.status === "rate_limited" ? "markRateLimited" : "markUnknown",
+          params: health.status === "rate_limited"
+            ? { resourceId, ...(health.retryAfterMs === undefined ? {} : { retryAfterMs: health.retryAfterMs }) }
+            : {
+              resourceId, reason: health.reason, scope: health.scope,
+              ...(health.retryAfterMs === undefined ? {} : { retryAfterMs: health.retryAfterMs }),
+            },
         }).catch(() => undefined);
-        return;
-      }
-      // A provider that cannot answer its controller probe is not currently selectable. This is
-      // deliberately pessimistic: retaining a previously healthy state routed the next child
-      // into a known-dead credential/network path. Unknown state has a bounded half-open retry.
-      await requestBrokerIpc({
-        socketPath: supervisor.socketPath, authorization: supervisor.controllerToken,
-        method: health.status === "rate_limited" ? "markRateLimited" : "markUnknown",
-        params: health.status === "rate_limited"
-          ? { resourceId, ...(health.retryAfterMs === undefined ? {} : { retryAfterMs: health.retryAfterMs }) }
-          : {
-            resourceId, reason: health.reason, scope: health.scope,
-            ...(health.retryAfterMs === undefined ? {} : { retryAfterMs: health.retryAfterMs }),
-          },
-      }).catch(() => undefined);
-    }));
+      }),
+    ]);
     // Persist only facts freshly observed in this pass. A provider that is currently unreachable
     // cannot refresh its old cache timestamp into a false declaration of liveness.
     if (successfullyRefreshed.size > 0) writeCurrencyCache(CURRENCY_CACHE_PATH, successfullyRefreshed);
