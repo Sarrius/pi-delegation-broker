@@ -7,6 +7,7 @@ import { createLauncherAttestation } from "./launcher-attestation.mjs";
 
 const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
 const PROVIDER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const ROUTE_PREFLIGHT_ROUNDS = 64;
 
 /** Total tokens a route consumed, or undefined when the transport reported no usage. */
 function tokensOf(usage) {
@@ -49,6 +50,8 @@ export class BrokeredLaunchResolver {
   #queuedTaskVerifier;
   #trackImmediateTasks;
   #resolveModelForResource;
+  #refreshProviderState;
+  #routePreflight;
   #provisionChildAuth;
   #controllerProxy;
   #admissions = new Map();
@@ -64,6 +67,8 @@ export class BrokeredLaunchResolver {
     queuedTaskVerifier,
     trackImmediateTasks = false,
     resolveModelForResource,
+    refreshProviderState,
+    routePreflight,
     provisionChildAuth,
     controllerProxy,
   }) {
@@ -76,6 +81,12 @@ export class BrokeredLaunchResolver {
     if (typeof selectContract !== "function") throw new Error("Broker launch resolver needs a controller selectContract function");
     if (resolveModelForResource !== undefined && typeof resolveModelForResource !== "function") {
       throw new Error("Broker launch resolver resolveModelForResource must be a controller-owned function");
+    }
+    if (refreshProviderState !== undefined && typeof refreshProviderState !== "function") {
+      throw new Error("Broker launch resolver refreshProviderState must be a controller-owned function");
+    }
+    if (routePreflight !== undefined && typeof routePreflight !== "function") {
+      throw new Error("Broker launch resolver routePreflight must be a controller-owned function");
     }
     if (provisionChildAuth !== undefined && typeof provisionChildAuth !== "function") {
       throw new Error("Broker launch resolver provisionChildAuth must be a controller-owned function");
@@ -114,6 +125,8 @@ export class BrokeredLaunchResolver {
     this.#queuedTaskVerifier = queuedTaskVerifier;
     this.#trackImmediateTasks = trackImmediateTasks;
     this.#resolveModelForResource = resolveModelForResource;
+    this.#refreshProviderState = refreshProviderState;
+    this.#routePreflight = routePreflight;
     this.#provisionChildAuth = provisionChildAuth;
     this.#controllerProxy = controllerProxy === undefined ? undefined : Object.freeze({ providerId: controllerProxy.providerId });
   }
@@ -142,6 +155,12 @@ export class BrokeredLaunchResolver {
     let queuedTaskId;
     let sawCapacityContention = false;
     for (let attempt = 1; ; attempt++) {
+      // The selector is fed by a long-lived registry/health projection. Refresh it immediately
+      // before every admission so a child never starts from a stale provider snapshot.
+      if (this.#refreshProviderState !== undefined) {
+        try { await this.#refreshProviderState(); }
+        catch { return { action: "deny", reason: "controller provider snapshot unavailable" }; }
+      }
       selection = await this.#selectContract(Object.freeze({
         ...request,
         capabilityRequest: Object.freeze({
@@ -170,6 +189,47 @@ export class BrokeredLaunchResolver {
       if (request.model !== undefined
         && (request.model.provider !== expected.provider || request.model.modelId !== expected.modelId)) {
         return { action: "deny", reason: "resolved model is not approved for this broker contract" };
+      }
+
+      // Provider catalogs and auth state are observations, not a guarantee that the exact
+      // controller-owned route can be resolved now. Preflight every allow-listed route before
+      // reserving capacity or creating a child. Unready routes are excluded for this launch and
+      // quarantined in the controller, so stale inventory cannot consume a provider attempt.
+      if (this.#routePreflight !== undefined) {
+        const candidates = Array.isArray(selection.contract.capability?.allowedResources)
+          && selection.contract.capability.allowedResources.length > 0
+          ? [...new Set(selection.contract.capability.allowedResources)]
+          : [`${expected.provider}/${expected.modelId}`];
+        if (attempt > ROUTE_PREFLIGHT_ROUNDS) {
+          return { action: "deny", reason: "controller route readiness could not be established" };
+        }
+        const unavailable = [];
+        try {
+          for (const resourceId of candidates) {
+            const result = await this.#routePreflight(Object.freeze({ resourceId }));
+            if (!result || typeof result !== "object" || !["ready", "unavailable"].includes(result.status)) {
+              throw new Error("invalid route preflight result");
+            }
+            if (result.status === "unavailable") unavailable.push({
+              resourceId,
+              reason: safeReason(result.reason ?? "controller route unavailable"),
+              scope: result.scope === "capacity_group" ? "capacity_group" : "resource",
+            });
+          }
+        } catch {
+          return { action: "deny", reason: "controller route preflight failed" };
+        }
+        if (unavailable.length > 0) {
+          for (const entry of unavailable) {
+            if (!excludeResources.includes(entry.resourceId)) excludeResources.push(entry.resourceId);
+            await this.#controller("markUnknown", {
+              resourceId: entry.resourceId,
+              reason: entry.reason,
+              scope: entry.scope,
+            }).catch(() => undefined);
+          }
+          continue;
+        }
       }
 
       queuedTaskId = undefined;

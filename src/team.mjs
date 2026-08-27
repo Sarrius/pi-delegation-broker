@@ -21,7 +21,9 @@ const DEFAULT_BUDGETS = Object.freeze({
   maxAppends: 100,
   maxParallel: 64,
   maxRedundant: 0,
-  maxAttempts: 1_000,
+  // A workflow-sized root budget must leave room for one bounded route handoff per node.
+  // Callers can still provide a smaller explicit budget when that is intentional.
+  maxAttempts: 100_000,
 });
 
 function fail(message) { throw new Error(`team admission: ${message}`); }
@@ -100,12 +102,13 @@ export function normalizeTaskAdmission(node, index = 0) {
 export function normalizeTeamBudgets(value = {}, { concurrency = 4 } = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("budgets must be an object");
   const maxParallel = integer(value.maxParallel ?? (value.maxOutputTokens !== undefined ? 1 : concurrency), "maxParallel", 1, 64);
+  const maxNodes = integer(value.maxNodes ?? DEFAULT_BUDGETS.maxNodes, "maxNodes", 1, 1000);
   const budgets = {
-    maxNodes: integer(value.maxNodes ?? DEFAULT_BUDGETS.maxNodes, "maxNodes", 1, 1000),
+    maxNodes,
     maxAppends: integer(value.maxAppends ?? DEFAULT_BUDGETS.maxAppends, "maxAppends", 0, 1000),
     maxParallel,
     maxRedundant: integer(value.maxRedundant ?? DEFAULT_BUDGETS.maxRedundant, "maxRedundant", 0, 1000),
-    maxAttempts: integer(value.maxAttempts ?? Math.min(DEFAULT_BUDGETS.maxAttempts, value.maxNodes ?? DEFAULT_BUDGETS.maxNodes), "maxAttempts", 1, 100_000),
+    maxAttempts: integer(value.maxAttempts ?? Math.min(DEFAULT_BUDGETS.maxAttempts, maxNodes * 2), "maxAttempts", 1, 100_000),
     ...(value.maxOutputTokens === undefined ? {} : { maxOutputTokens: integer(value.maxOutputTokens, "maxOutputTokens", 1, 2_000_000_000) }),
   };
   if (budgets.maxParallel > concurrency) fail("maxParallel cannot exceed workflow concurrency");
