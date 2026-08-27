@@ -87,7 +87,10 @@ export default function childShim(pi: any): void {
         patch: Type.String({ minLength: 1, maxLength: 4 * 1024 * 1024, description: "A conventional unified git diff with diff --git headers." }),
       }, { additionalProperties: false }),
       async execute(_id: string, params: { patch: string }, _signal: AbortSignal, _onUpdate: unknown, ctx: { cwd: string }) {
-        const result = applyProposedPatch({ cwd: ctx.cwd, patch: params.patch });
+        // Some native provider decoders omit the final newline from a string argument. The
+        // controller hashes the same canonical form before authorizing this tool.
+        const patch = params.patch.endsWith("\n") ? params.patch : `${params.patch}\n`;
+        const result = applyProposedPatch({ cwd: ctx.cwd, patch });
         return {
           content: [{ type: "text", text: `Patch applied in the isolated worktree for: ${result.changed.join(", ")}.` }],
           details: { changed: result.changed },
@@ -137,9 +140,14 @@ export default function childShim(pi: any): void {
   // enforcement extension and falsely publish an empty tool list. Session start
   // is the first lifecycle point at which the final active surface is available.
   pi.on("session_start", () => {
-    // The behavioral extension's session_start handler runs after this shim.
-    // Yield once so its final active-tool set is applied before reporting.
-    setImmediate(() => writeToolReport(spec.toolReportPath, { activeTools: pi.getActiveTools() }));
+    const report = () => writeToolReport(spec.toolReportPath, { activeTools: pi.getActiveTools() });
+    if (process.env.PI_BROKER_EXPECT_BEHAVIORAL_TOOLS === "1") {
+      // The final behavioral extension owns the async session_start gate. Reporting
+      // here would race its capability fetch and publish an incomplete tool set.
+      (globalThis as any).__PI_BROKER_REPORT_TOOLS_READY = report;
+    } else {
+      setImmediate(report);
+    }
     return undefined;
   });
 }

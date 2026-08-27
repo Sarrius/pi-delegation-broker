@@ -9,6 +9,7 @@ import { BehavioralRunMonitor } from "./behavior-monitor.mjs";
 import { ArtifactPipeline } from "./artifact-pipeline.mjs";
 import { AttemptSettlement, ProviderStreamAssembler, createAttemptRouteSnapshot, outcomeProperties } from "./provider-protocol.mjs";
 const MAX_REQUEST_BYTES = 1024 * 1024;
+const THINKING_LEVELS = new Set("off minimal low medium high xhigh max".split(" "));
 // Runner attempt ids are `<logical-id>` and `<logical-id>-rN`. The controller derives the
 // logical lineage from the lease id rather than trusting a child-supplied root field.
 function logicalTaskId(taskId) {
@@ -505,6 +506,16 @@ export class BrokerIpcServer {
     const context = params?.context;
     if (!context || typeof context !== "object") throw new Error("stream requires typed context");
     const captured = captureProviderContext(context, { maxBytes: 512 * 1024 });
+    if (captured.value.tools.length > 0) {
+      const bound = this.#broker.effectiveChildCapabilityForLease?.(lease.leaseId, lease.fencingToken, Date.now());
+      const allowed = bound?.status === "bound" && Array.isArray(bound.capability?.allowedTools)
+        ? new Set(["broker_declare_action", "broker_checkpoint", ...bound.capability.allowedTools])
+        : undefined;
+      if (!allowed || captured.value.tools.some((tool) => !allowed.has(tool.name))) {
+        this.#broker.release(lease.leaseId, lease.fencingToken, "provider tool capability is not bound", Date.now());
+        throw new Error("provider tool context is not authorized by the effective child capability");
+      }
+    }
     const inputDigest = createHash("sha256").update(captured.canonical).digest("hex");
     const inputUpperBound = Buffer.byteLength(captured.canonical, "utf8");
     const inputAdmission = this.#broker.reserveProviderInput(
@@ -528,9 +539,14 @@ export class BrokerIpcServer {
     // child context error, it cannot be corrected by the child, so release the
     // lease rather than leaving capacity stranded until TTL expiry.
     const releaseRouteFailure = () => this.#broker.release(lease.leaseId, lease.fencingToken, "controller route resolution failure", Date.now());
+    const requestedReasoning = params?.reasoningEffort;
+    if (requestedReasoning !== undefined && (typeof requestedReasoning !== "string" || !THINKING_LEVELS.has(requestedReasoning))) {
+      releaseRouteFailure();
+      throw new Error("controller reasoning effort is invalid");
+    }
     let route;
     try {
-      route = await this.#routeResolver(lease);
+      route = await this.#routeResolver(lease, { reasoningEffort: requestedReasoning });
     } catch (error) {
       releaseRouteFailure();
       throw error;
@@ -803,7 +819,7 @@ export function requestBrokerIpc({ socketPath, authorization, method, params = {
 /** Streaming client for framed provider responses. Reads NDJSON frames until
  * the controller ends the socket. Returns { frames, terminal } where terminal
  * is the frame whose type is "terminal". An error before streaming throws. */
-export function streamProviderIpc({ socketPath, authorization, context, signal }) {
+export function streamProviderIpc({ socketPath, authorization, context, reasoningEffort, signal }) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(new Error("aborted"));
     const socket = createConnection(socketPath);
@@ -816,7 +832,7 @@ export function streamProviderIpc({ socketPath, authorization, context, signal }
     const onAbort = () => { socket.destroy(); fail(new Error("aborted")); };
     signal?.addEventListener("abort", onAbort, { once: true });
     socket.once("connect", () => {
-      if (!settled) socket.write(`${JSON.stringify({ id: randomBytes(8).toString("hex"), authorization, method: "providerStream", params: { context } })}\n`);
+      if (!settled) socket.write(`${JSON.stringify({ id: randomBytes(8).toString("hex"), authorization, method: "providerStream", params: { context, reasoningEffort } })}\n`);
     });
     socket.on("data", (chunk) => { buffered += chunk; });
     socket.once("error", fail);

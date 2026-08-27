@@ -131,7 +131,7 @@ export function createAttemptRouteSnapshot(input) {
       ? input.registryFingerprint
       : fail("snapshot_invalid", "registryFingerprint must be a SHA-256 hex digest"),
     registryVersion: positiveSafeInteger(input.registryVersion, "registryVersion"),
-    resourceId: boundedId(input.resourceId, "resourceId"),
+    resourceId: boundedText(input.resourceId, "resourceId", 288),
     capacityGroup: boundedId(input.capacityGroup, "capacityGroup"),
     accountAlias: boundedId(input.accountAlias, "accountAlias"),
     provider: boundedText(input.provider, "provider"),
@@ -391,6 +391,11 @@ export class ProviderStreamAssembler {
     if (!block || !block.open) fail("block_not_open", "block_end addresses a block that is not open");
     if (typeof payload.value !== "string") fail("frame_payload_invalid", "block_end value must be the canonical completed string");
     if (payload.value !== block.accumulated) fail("block_value_mismatch", "block_end value diverges from accumulated deltas");
+    if (block.blockType === "tool_call") {
+      let args;
+      try { args = JSON.parse(payload.value); } catch { fail("frame_payload_invalid", "tool_call value must be valid JSON"); }
+      if (!args || typeof args !== "object" || Array.isArray(args)) fail("frame_payload_invalid", "tool_call value must be a JSON object");
+    }
     block.open = false;
     return Object.freeze({ status: "tentative", type: "block_end", index: payload.index, bytes: block.bytes });
   }

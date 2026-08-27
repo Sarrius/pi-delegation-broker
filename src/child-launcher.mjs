@@ -19,6 +19,9 @@ const DISPOSE_KILL_GRACE_MS = 2_000;
 const IMMEDIATE_COMPLETION_POLL_MS = 60;
 const IMMEDIATE_COMPLETION_MAX_POLLS = 40;
 const ACTIVE_RPCS = new Set();
+const BEHAVIORAL_TOOLS = ["broker_declare_action", "broker_checkpoint"];
+const EFFECT_TOOL = "propose_patch";
+const RECURSIVE_CHILD_TOOLS = ["broker_request_child", "broker_cancel_child"];
 
 async function terminateRpc(rpc) {
   rpc.kill("SIGTERM");
@@ -77,7 +80,17 @@ function buildChildArgs(config) {
     "--append-system-prompt", config.appendSystemPrompt,
     "--exclude-tools", excludeTools.join(","),
   ];
-  if (config.tools !== undefined) args.push("--tools", config.tools.join(","));
+  const requestedTools = config.tools === undefined ? undefined : [...config.tools];
+  if (requestedTools !== undefined) {
+    const requiredTools = [
+      ...(config.requiredActiveTools ?? []),
+      ...(config.behavioralTools ? BEHAVIORAL_TOOLS : []),
+      ...(config.effectCapable ? [EFFECT_TOOL] : []),
+      ...(config.recursiveTools ? RECURSIVE_CHILD_TOOLS : []),
+    ];
+    for (const name of requiredTools) if (!requestedTools.includes(name)) requestedTools.push(name);
+    args.push("--tools", requestedTools.join(","));
+  }
   if (config.forkSessionFile) args.push("--fork", config.forkSessionFile);
   if (config.shimPath) args.push("--extension", config.shimPath);
   for (const extensionPath of config.trustedExtensionPaths ?? []) args.push("--extension", extensionPath);
@@ -318,6 +331,10 @@ export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPi
     sessionDir: sessionsDir,
     forkSessionFile,
     appendSystemPrompt: spec.appendSystemPrompt ?? "",
+    requiredActiveTools: launchPolicy?.requiredActiveTools,
+    behavioralTools: launchPolicy?.environment?.PI_BROKER_EXPECT_BEHAVIORAL_TOOLS === "1",
+    effectCapable: launchPolicy?.authorizationPolicy?.effectCapable === true,
+    recursiveTools: launchPolicy?.recursion?.maxDepth === 2,
     shimPath,
     ...(reviewedSkills ? { reviewedSkills } : {}),
     ...(launchPolicy ? {
@@ -374,7 +391,7 @@ export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPi
 
     const requiredTools = launchPolicy?.requiredActiveTools ?? [];
     const missing = requiredTools.filter((name) => !report.activeTools.includes(name));
-    if (missing.length > 0) throw new Error(`Required active tools missing: ${missing.join(", ")}. Active: ${report.activeTools.join(", ") || "none"}`);
+    if (missing.length > 0) throw new Error(`Required active tools missing: ${missing.join(", ")}. Active: ${report.activeTools.join(", ") || "none"}. Stderr: ${rpc.stderrTail() || "(empty)"}`);
 
     const session = await RpcChildSession.start(rpc);
     return Object.freeze({
@@ -404,7 +421,7 @@ const ALLOWED_POLICY_ENVIRONMENT = new Set([
   // Leased hard output cap; the shim clamps the provider payload with it.
   "PI_BROKER_MAX_OUTPUT_TOKENS",
   // Non-secret model identity used only by the explicit controller IPC proxy provider.
-  "PI_BROKER_PROXY_MODEL_ID",
+  "PI_BROKER_PROXY_MODEL_ID", "PI_BROKER_EXPECT_BEHAVIORAL_TOOLS",
 ]);
 
 function isolatedEnv(policy, shimSpecPath) {

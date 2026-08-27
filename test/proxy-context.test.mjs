@@ -3,26 +3,66 @@ import test from "node:test";
 
 import { proxyCanonicalContext, proxyTerminalError } from "../src/proxy-context.mjs";
 
-test("proxy bridge preserves a text-only context without silently dropping content", () => {
+test("proxy bridge preserves text and controller-approved tool replay", () => {
   const context = proxyCanonicalContext({
     systemPrompt: "Be concise.",
     messages: [
-      { role: "user", content: [{ type: "text", text: "hello" }] },
-      { role: "assistant", content: [{ type: "text", text: "hi" }] },
+      { role: "user", content: [{ type: "text", text: "read greeting.txt" }] },
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "greeting.txt" } }] },
+      { role: "toolResult", toolCallId: "call_1", toolName: "read", content: [{ type: "text", text: "hello" }], isError: false },
+      { role: "assistant", content: [{ type: "text", text: "done" }] },
     ],
-    tools: [],
+    tools: [{
+      name: "read",
+      description: "Read one bounded path.",
+      parameters: { type: "object", additionalProperties: false, properties: { path: { type: "string" } }, required: ["path"] },
+      label: "Read",
+      execute: () => { throw new Error("must never cross the proxy"); },
+    }],
   });
   assert.deepEqual(context, {
     systemPrompt: "Be concise.",
-    messages: [{ role: "user", content: "hello" }, { role: "assistant", content: "hi" }],
-    tools: [],
+    messages: [
+      { role: "user", content: "read greeting.txt" },
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "greeting.txt" } }] },
+      { role: "toolResult", toolCallId: "call_1", toolName: "read", content: "hello", isError: false },
+      { role: "assistant", content: "done" },
+    ],
+    tools: [{
+      name: "read",
+      description: "Read one bounded path.",
+      inputSchema: { type: "object", additionalProperties: false, properties: { path: { type: "string" } }, required: ["path"] },
+    }],
   });
+  assert.equal(Object.hasOwn(context.tools[0], "execute"), false);
 });
 
-test("proxy fails closed on tool, image, or tool-result context it cannot faithfully replay", () => {
-  assert.throws(() => proxyCanonicalContext({ systemPrompt: "", messages: [], tools: [{ name: "read" }] }), /tool-free/);
+test("proxy fails closed on unsupported modalities, replay state, and unapproved tools", () => {
+  assert.throws(() => proxyCanonicalContext({ systemPrompt: "", messages: [], tools: [{ name: "read", description: "x" }] }), /parameters is required/);
   assert.throws(() => proxyCanonicalContext({ systemPrompt: "", messages: [{ role: "user", content: [{ type: "image", data: "x" }] }], tools: [] }), /non-text/);
-  assert.throws(() => proxyCanonicalContext({ systemPrompt: "", messages: [{ role: "toolResult", content: [] }], tools: [] }), /unsupported role/);
+  assert.throws(() => proxyCanonicalContext({
+    systemPrompt: "",
+    messages: [{ role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "write", arguments: {} }] }],
+    tools: [{ name: "read", description: "x", parameters: {} }],
+  }), /not an approved tool/);
+  assert.throws(() => proxyCanonicalContext({
+    systemPrompt: "",
+    messages: [{ role: "toolResult", toolCallId: "call_1", toolName: "read", content: [], isError: true }],
+    tools: [{ name: "read", description: "x", parameters: {} }],
+  }), /no matching assistant tool call/);
+  assert.throws(() => proxyCanonicalContext({
+    systemPrompt: "",
+    messages: [{ role: "assistant", content: [{ type: "thinking", thinking: "private" }] }],
+    tools: [],
+  }), /unknown field thinking/);
+  assert.throws(() => proxyCanonicalContext({
+    systemPrompt: "",
+    messages: [{ role: "user", content: "hello", hidden: "must reject" }],
+    tools: [],
+  }), /unknown field hidden/);
+  const decorated = ["x"];
+  decorated.extra = "must reject";
+  assert.throws(() => proxyCanonicalContext({ systemPrompt: "", messages: [], tools: [{ name: "read", description: "x", parameters: { enum: decorated } }] }), /dense and undecorated/);
 });
 
 test("proxy terminal mapping never converts an unknown/failed provider terminal into success", () => {

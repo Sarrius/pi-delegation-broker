@@ -97,6 +97,13 @@ test("route snapshot is immutable, fingerprinted, and commits to every route fac
   assert.notEqual(different.snapshotFingerprint, snapshot.snapshotFingerprint);
 });
 
+test("route snapshot accepts catalog resource identities containing provider/model separators", () => {
+  const snapshot = createAttemptRouteSnapshot(snapshotInput({
+    resourceId: "openai-codex-account-2/gpt-5.6-luna",
+  }));
+  assert.equal(snapshot.resourceId, "openai-codex-account-2/gpt-5.6-luna");
+});
+
 test("route snapshot refuses competing retry ownership and hidden SDK retries", () => {
   assert.throws(() => createAttemptRouteSnapshot(snapshotInput({ retryOwner: "sdk" })), /retryOwner must be broker/);
   assert.throws(() => createAttemptRouteSnapshot(snapshotInput({ sdkMaxRetries: 2 })), /sdkMaxRetries must be pinned to 0/);

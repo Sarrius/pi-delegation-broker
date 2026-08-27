@@ -41,3 +41,24 @@ test("provider context rejects duplicate tools, unsupported roles, and non-schem
   assert.throws(() => captureProviderContext(context({ messages: [{ role: "tool", content: "x" }] })), /role is unsupported/);
   assert.throws(() => captureProviderContext(context({ tools: [{ name: "read", description: "x", inputSchema: [] }] })), /JSON Schema object/);
 });
+
+test("provider context validates tool-call and tool-result replay as a closed conversation", () => {
+  const captured = captureProviderContext(context({
+    messages: [
+      { role: "user", content: "read greeting.txt" },
+      { role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "greeting.txt" } }] },
+      { role: "toolResult", toolCallId: "call_1", toolName: "read", content: "hello", isError: false },
+    ],
+  }));
+  assert.equal(captured.value.messages[1].content[0].arguments.path, "greeting.txt");
+  assert.equal(captured.value.messages[2].isError, false);
+  assert.throws(() => captureProviderContext(context({
+    messages: [{ role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "write", arguments: {} }] }],
+  })), /not an approved tool/);
+  assert.throws(() => captureProviderContext(context({
+    messages: [{ role: "toolResult", toolCallId: "call_1", toolName: "read", content: "missing", isError: true }],
+  })), /no matching assistant tool call/);
+  assert.throws(() => captureProviderContext(context({
+    messages: [{ role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "read", arguments: {} }] }],
+  })), /unresolved tool calls/);
+});
