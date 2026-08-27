@@ -398,10 +398,10 @@ export class SingleHostBrokerSupervisor {
         this.#removeUnchangedStaleLock(lockPath, raw);
         return;
       }
-      if (error && typeof error === "object" && error.code === "EPERM") {
-        throw new Error(`Broker stateDir is already locked by running broker pid ${pid}`);
-      }
-      throw error;
+      // EPERM proves that a process exists, but not that it is the broker: on macOS a stale
+      // Pi PID may already belong to a privileged system service. The owner-only broker socket
+      // and the startup grace window below are the authority in that case too.
+      if (!(error && typeof error === "object" && error.code === "EPERM")) throw error;
     }
 
     const startedAt = parsed?.startedAt;
