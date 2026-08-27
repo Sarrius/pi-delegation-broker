@@ -157,3 +157,11 @@ test("args declared as a JSON string match the object form at invocation", () =>
   });
   assert.equal(verdict.status, "allowed");
 });
+
+test("patch action hashing normalizes only a missing Git diff terminator", () => {
+  const monitor = new BehavioralRunMonitor({ doneWhen: ["patch proposed"] });
+  const patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two";
+  monitor.declareAction({ stepId: "patch", toolName: "propose_patch", args: { patch } });
+  const verdict = monitor.authorizeAction({ stepId: "patch", toolName: "propose_patch", args: { patch: `${patch}\n` } });
+  assert.equal(verdict.status, "allowed");
+});

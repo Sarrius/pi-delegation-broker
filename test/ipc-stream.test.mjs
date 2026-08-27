@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteLeaseBroker, fixtureContract, fixtureRegistry } from "../src/broker.mjs";
+import { createEffectiveChildCapability } from "../src/capability-compiler.mjs";
 import { BrokerIpcServer, requestBrokerIpc, streamProviderIpc } from "../src/ipc.mjs";
 import { ScriptedFakeProvider } from "../src/fake-provider.mjs";
 import { ANTHROPIC_MESSAGES_ADAPTER_ID, AnthropicMessagesTransport } from "../src/anthropic-messages-transport.mjs";
@@ -16,17 +17,16 @@ function createServer() {
 }
 
 async function reserveCapability(server, taskId, maxOutputTokens = 100, contractOverrides = {}) {
+  const contract = fixtureContract({
+    taskId,
+    budget: { maxInputTokens: 1_000, maxOutputTokens, enforcement: { input: "hard", output: "hard" } },
+    ...contractOverrides,
+  });
   const reservation = await requestBrokerIpc({
     socketPath: server.socketPath,
     authorization: server.controllerToken,
     method: "reserve",
-    params: {
-      contract: fixtureContract({
-        taskId,
-        budget: { maxInputTokens: 1_000, maxOutputTokens, enforcement: { input: "hard", output: "hard" } },
-        ...contractOverrides,
-      }),
-    },
+    params: { contract },
   });
   assert.equal(reservation.status, "leased");
   const issued = await requestBrokerIpc({
@@ -36,6 +36,28 @@ async function reserveCapability(server, taskId, maxOutputTokens = 100, contract
     params: { leaseId: reservation.lease.leaseId, fencingToken: reservation.lease.fencingToken },
   });
   assert.equal(issued.status, "issued");
+  const effective = createEffectiveChildCapability({
+    schemaVersion: 1,
+    taskId,
+    operationClass: contract.operationClass,
+    admissionClass: contract.admissionClass,
+    doneWhen: contract.doneWhen,
+    allowedTools: ["read"],
+    profileSupports: contract.capability.required,
+    budget: contract.budget,
+    latencyBudgetMs: contract.latencyBudgetMs,
+    leaseTtlMs: contract.leaseTtlMs,
+    promptDigest: contract.promptDigest,
+    behavioralEnforcement: reservation.lease.behavioralEnforcement,
+    downgradePolicy: contract.capability.downgradePolicy,
+  });
+  const bound = await requestBrokerIpc({
+    socketPath: server.socketPath,
+    authorization: server.controllerToken,
+    method: "bindEffectiveChildCapability",
+    params: { leaseId: reservation.lease.leaseId, fencingToken: reservation.lease.fencingToken, capability: effective },
+  });
+  assert.equal(bound.status, "bound");
   return issued.capability;
 }
 
@@ -242,7 +264,7 @@ test("streaming rejects malformed context without a real provider transport", as
       /systemPrompt/,
     );
     await assert.rejects(
-      () => streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: { systemPrompt: "x", messages: "not-array" } }),
+      () => streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: { systemPrompt: "x", messages: "not-array", tools: [] } }),
       /messages/,
     );
     await assert.rejects(
@@ -320,7 +342,12 @@ test("streaming cancellation aborts before any frame is written", async () => {
 test("real controller transport path streams one exact route through the same framed IPC boundary", async () => {
   let dispatches = 0;
   let observedRequest;
+  let observedReasoning;
   const { directory, server } = createRealServer({
+    routeResolver: async (_lease, request) => {
+      observedReasoning = request.reasoningEffort;
+      return realRoute();
+    },
     fetchImpl: async (url, options) => {
       dispatches += 1;
       observedRequest = { url, options, body: JSON.parse(options.body) };
@@ -337,7 +364,8 @@ test("real controller transport path streams one exact route through the same fr
   await server.start();
   try {
     const capability = await reserveCapability(server, "real-stream-happy");
-    const { frames, terminal } = await streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: realContext() });
+    const { frames, terminal } = await streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: realContext(), reasoningEffort: "high" });
+    assert.equal(observedReasoning, "high");
     assert.equal(dispatches, 1);
     assert.equal(observedRequest.url, "https://gateway.example/v1/messages");
     assert.equal(observedRequest.options.headers["x-api-key"], "exact-test-key");

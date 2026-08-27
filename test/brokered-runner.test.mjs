@@ -8,6 +8,10 @@ import { classifyChildFailure } from "../src/brokered-runner.mjs";
 
 test("route-specific provider policy rejection is failover-eligible", () => {
   assert.equal(classifyChildFailure("OpenAI API error (400): organization must be verified to generate reasoning summaries"), "unavailable");
+  assert.equal(classifyChildFailure("controller provider terminal: rate_limited (429)"), "rate_limited");
+  assert.equal(classifyChildFailure("controller provider terminal: auth_fatal (401)"), "auth_fatal");
+  assert.equal(classifyChildFailure("controller provider terminal: rejected_before_send (400, subscription_extra_usage_required)"), "account_exhausted");
+  assert.equal(classifyChildFailure("controller provider terminal: transport_before_headers"), "unavailable");
 });
 
 // We test the runner's deny path and semaphore release without spawning a real Pi process.

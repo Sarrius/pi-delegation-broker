@@ -339,6 +339,7 @@ export class BrokeredLaunchResolver {
             // and a low-balance account rejects the whole attempt.
             ...(lease.maxOutputTokens === undefined ? {} : { PI_BROKER_MAX_OUTPUT_TOKENS: String(lease.maxOutputTokens) }),
             ...(this.#controllerProxy && resolvedModel?.modelId ? { PI_BROKER_PROXY_MODEL_ID: resolvedModel.modelId } : {}),
+            ...(this.#launcherAttestationConfig === undefined ? {} : { PI_BROKER_EXPECT_BEHAVIORAL_TOOLS: "1" }),
           },
           onBeforeChildAbandoned: async () => this.releaseUnhanded(request.childId),
           onChildSessionOpened: async () => this.markChildHanded(request.childId),

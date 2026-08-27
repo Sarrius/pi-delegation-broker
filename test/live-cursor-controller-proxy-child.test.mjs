@@ -72,6 +72,14 @@ function filesUnder(root) {
   });
 }
 
+function cursorCompletionEndpoint(value) {
+  const endpoint = new URL(value);
+  if (!endpoint.pathname.endsWith("/chat/completions")) {
+    endpoint.pathname = `${endpoint.pathname.replace(/\/$/, "")}/chat/completions`;
+  }
+  return endpoint.toString();
+}
+
 test("owner-gated Cursor subscription canary keeps OAuth in the controller proxy", {
   skip: process.env.LIVE_PROVIDER_TEST !== "1"
     || process.env.LIVE_PROXY_CANARY_APPROVED !== "1"
@@ -99,7 +107,7 @@ test("owner-gated Cursor subscription canary keeps OAuth in the controller proxy
       resourceId: "R1", capacityGroup: "G-cheap", profile: "cursor-canary-text/v1",
       accountAlias: "cursor-canary", provider: "cursor", model: CANARY_MODEL,
       reasoningEffort: null, apiDialect: "openai-completions", endpointId: "cursor-canary",
-      endpoint: process.env.LIVE_CURSOR_ENDPOINT,
+      endpoint: cursorCompletionEndpoint(process.env.LIVE_CURSOR_ENDPOINT),
       adapterId: OPENAI_CHAT_COMPLETIONS_ADAPTER_ID, credentialRef: "cursor-canary-key", cacheRetention: "none",
     }],
   });

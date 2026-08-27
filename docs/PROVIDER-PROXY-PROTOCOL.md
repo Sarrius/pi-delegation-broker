@@ -1,6 +1,6 @@
-# Controller-owned provider proxy protocol (design gate)
+# Controller-owned provider proxy protocol
 
-Status: partially implemented. `src/provider-protocol.mjs` implements envelope validation, stream grammar, terminal CAS, phase machine, and outcome taxonomy as deterministic protocol primitives. `src/ipc.mjs` accepts either its deterministic fake transport or an explicitly injected real `providerTransport + routeResolver` pair (never both), then feeds both through the same framed stream assembler and settlement boundary. `src/anthropic-messages-transport.mjs` supplies the raw Anthropic Messages SSE transport and `src/openai-chat-completions-transport.mjs` supplies the text-only OpenAI-compatible transport used by the Cursor bridge. `src/controller-provider-config.mjs` adds controller-only exact-route construction: in-memory credential ref → credential-free owner-only route table → immutable snapshot → bounded expiring live approval. There is no environment/keychain fallback, account rotation, retry loop or automatic failover. Owner-authorized live evidence exists only for the bounded Cursor canary; Anthropic subscription requests were rejected by the account's extra-usage policy.
+Status: implemented for the Pi-native provider boundary, with the older hand-built transports retained as text-only compatibility seams. `src/provider-protocol.mjs` implements envelope validation, stream grammar, terminal CAS, phase machine, and outcome taxonomy as deterministic protocol primitives. `src/ipc.mjs` accepts either its deterministic fake transport or an explicitly injected real `providerTransport + routeResolver` pair (never both), then feeds both through the same framed stream assembler and settlement boundary. `src/anthropic-messages-transport.mjs` and `src/openai-chat-completions-transport.mjs` remain text-only raw transport adapters; the companion `pi-multi-account/controller-provider.ts` supplies the native parent-owned route for all approved Pi providers, including tool replay. There is no environment/keychain fallback, account rotation, retry loop or automatic failover inside one attempt. Owner-authorized fresh-process Cursor evidence covers a credentialless child read and isolated patch/test flow; Anthropic subscription requests were rejected by the account's extra-usage policy.
 
 ## Authority boundary
 
@@ -57,7 +57,7 @@ The attempt handle is one-shot. Once admitted into controller middleware it cann
 
 ## Request ingress
 
-The child sends canonical context, not only a digest. The currently implemented vocabulary is deliberately narrow: `systemPrompt` string, text-only `user | assistant` messages, and uniquely named tools with `name`, `description`, and JSON `inputSchema`. Provider options, provider response IDs, replay/cache handles, unknown fields, non-text modalities, tool-result blocks, malformed arguments and duplicate tool names fail before route/credential resolution; they are not silently transformed or dropped. The controller:
+The child sends canonical context, not only a digest. The native vocabulary is deliberately narrow: a `systemPrompt` string, text `user` messages, text/tool-call `assistant` messages, matching `toolResult` messages, and uniquely named tools with `name`, `description`, and JSON `inputSchema`. Provider options, provider response IDs, replay/cache handles, unknown fields, non-text modalities, malformed arguments and duplicate tool names fail before route/credential resolution; they are not silently transformed or dropped. The controller:
 
 1. parses a size-bounded request frame;
 2. validates the closed schema through `captureProviderContext` and semantic block vocabulary;
@@ -105,6 +105,7 @@ Rules:
 - no duplicate/retyped block index;
 - no delta before start or after end;
 - tool-call id/name cannot change after first non-empty value;
+- tool-call arguments must close as one valid JSON object and match the assembled deltas;
 - normal success cannot leave an open block;
 - usage cannot decrease and cannot contain negative/non-finite values;
 - no frame follows `terminal`;
@@ -113,7 +114,7 @@ Rules:
 - partial tool calls are never executable;
 - output is tentative until the terminal is validated and durably persisted.
 
-The child may render tentative text, but it must not append an accepted assistant message or dispatch tool calls before controller terminal settlement.
+The child may render tentative text, but it must not append an accepted assistant message or execute a local tool until the controller has validated the provider tool-call turn and emitted its terminal. The resulting tool result is replayed through a new controller provider turn; the controller never executes the tool or receives its function implementation.
 
 ## Attempt phases
 

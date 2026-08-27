@@ -8,6 +8,16 @@ function digestCanonical(canonical) {
   return createHash("sha256").update(canonical).digest("hex");
 }
 
+// Git patches are line-oriented and require a terminating newline, while some native provider
+// adapters omit that final transport newline when decoding a tool argument. Normalize only this
+// syntactic requirement for the one controller-owned patch tool; all other action arguments remain
+// byte-for-byte/structure-for-structure exact.
+function canonicalActionArgs(toolName, args) {
+  if (toolName !== "propose_patch" || !args || typeof args !== "object" || Array.isArray(args)
+    || typeof args.patch !== "string" || args.patch.endsWith("\n")) return args;
+  return { ...args, patch: `${args.patch}\n` };
+}
+
 function requireAction(input) {
   if (!input || !STEP_ID.test(input.stepId ?? "") || !TOOL_NAME.test(input.toolName ?? "") || !Object.hasOwn(input, "args")) {
     throw new Error("behavior action requires bounded stepId, toolName, and args");
@@ -19,11 +29,21 @@ function requireAction(input) {
     ? (() => { try { const parsed = JSON.parse(input.args); return parsed && typeof parsed === "object" ? parsed : input.args; } catch { return input.args; } })()
     : input.args;
   const captured = captureLosslessJson({ toolName: input.toolName, args });
+  const normalizedArgs = canonicalActionArgs(captured.value.toolName, captured.value.args);
+  if (normalizedArgs === captured.value.args) {
+    return Object.freeze({
+      stepId: input.stepId,
+      toolName: captured.value.toolName,
+      args: captured.value.args,
+      actionHash: digestCanonical(captured.canonical),
+    });
+  }
+  const normalized = captureLosslessJson({ toolName: captured.value.toolName, args: normalizedArgs });
   return Object.freeze({
     stepId: input.stepId,
-    toolName: captured.value.toolName,
-    args: captured.value.args,
-    actionHash: digestCanonical(captured.canonical),
+    toolName: normalized.value.toolName,
+    args: normalized.value.args,
+    actionHash: digestCanonical(normalized.canonical),
   });
 }
 

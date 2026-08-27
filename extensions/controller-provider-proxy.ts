@@ -11,9 +11,20 @@ import { streamProviderIpc } from "../src/ipc.mjs";
 import { proxyCanonicalContext, proxyTerminalError } from "../src/proxy-context.mjs";
 
 const PROVIDER_ID = "broker-proxy";
+const TOOL_CALL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 
 function nonNegative(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function partialToolArguments(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 function streamControllerProxy(model: any, context: any, options: any = {}) {
@@ -40,27 +51,59 @@ function streamControllerProxy(model: any, context: any, options: any = {}) {
       if (!socketPath || !authorization) throw new Error("controller proxy lease capability is unavailable");
       const canonical = proxyCanonicalContext(context);
       stream.push({ type: "start", partial: output });
-      const { frames, terminal } = await streamProviderIpc({ socketPath, authorization, context: canonical, signal: options.signal });
-      const blocks = new Map<number, number>();
+      const reasoningEffort = options.reasoning || "off";
+      const { frames, terminal } = await streamProviderIpc({ socketPath, authorization, context: canonical, reasoningEffort, signal: options.signal });
+      const blocks = new Map<number, { contentIndex: number; type: "text" | "toolCall"; partialArgs?: string }>();
       for (const frame of frames) {
         const payload = frame?.payload ?? {};
         if (frame.type === "block_start") {
-          if (payload.blockType !== "text" || !Number.isSafeInteger(payload.index)) throw new Error("controller proxy only supports text response blocks");
+          if (!Number.isSafeInteger(payload.index)) throw new Error("controller proxy received an invalid response block index");
           const contentIndex = output.content.length;
-          blocks.set(payload.index, contentIndex);
-          output.content.push({ type: "text", text: "" });
-          stream.push({ type: "text_start", contentIndex, partial: output });
+          if (payload.blockType === "text") {
+            blocks.set(payload.index, { contentIndex, type: "text" });
+            output.content.push({ type: "text", text: "" });
+            stream.push({ type: "text_start", contentIndex, partial: output });
+          } else if (payload.blockType === "tool_call" && typeof payload.id === "string" && TOOL_CALL_ID.test(payload.id)
+            && typeof payload.name === "string" && TOOL_NAME.test(payload.name)) {
+            blocks.set(payload.index, { contentIndex, type: "toolCall", partialArgs: "" });
+            output.content.push({ type: "toolCall", id: payload.id, name: payload.name, arguments: {} });
+            stream.push({ type: "toolcall_start", contentIndex, partial: output });
+          } else {
+            throw new Error("controller proxy received an unsupported response block");
+          }
         } else if (frame.type === "text_delta") {
-          const contentIndex = blocks.get(payload.index);
-          const block = output.content[contentIndex as number];
-          if (contentIndex === undefined || !block || typeof payload.delta !== "string") throw new Error("controller proxy received an invalid text delta");
+          const state = blocks.get(payload.index);
+          const block = output.content[state?.contentIndex as number];
+          if (!state || state.type !== "text" || !block || typeof payload.delta !== "string" || payload.delta.length === 0) {
+            throw new Error("controller proxy received an invalid text delta");
+          }
           block.text += payload.delta;
-          stream.push({ type: "text_delta", contentIndex, delta: payload.delta, partial: output });
+          stream.push({ type: "text_delta", contentIndex: state.contentIndex, delta: payload.delta, partial: output });
+        } else if (frame.type === "tool_call_delta") {
+          const state = blocks.get(payload.index);
+          const block = output.content[state?.contentIndex as number];
+          if (!state || state.type !== "toolCall" || !block || typeof payload.delta !== "string" || payload.delta.length === 0) {
+            throw new Error("controller proxy received an invalid tool call delta");
+          }
+          state.partialArgs = `${state.partialArgs ?? ""}${payload.delta}`;
+          block.arguments = partialToolArguments(state.partialArgs);
+          stream.push({ type: "toolcall_delta", contentIndex: state.contentIndex, delta: payload.delta, partial: output });
         } else if (frame.type === "block_end") {
-          const contentIndex = blocks.get(payload.index);
-          const block = output.content[contentIndex as number];
-          if (contentIndex === undefined || !block) throw new Error("controller proxy received an invalid block end");
-          stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
+          const state = blocks.get(payload.index);
+          const block = output.content[state?.contentIndex as number];
+          if (!state || !block || typeof payload.value !== "string") throw new Error("controller proxy received an invalid block end");
+          if (state.type === "text") {
+            if (payload.value !== block.text) throw new Error("controller proxy received a mismatched text block end");
+            stream.push({ type: "text_end", contentIndex: state.contentIndex, content: block.text, partial: output });
+          } else {
+            if (payload.value !== state.partialArgs) throw new Error("controller proxy received a mismatched tool call block end");
+            let args: unknown;
+            try { args = JSON.parse(payload.value); } catch { throw new Error("controller proxy received invalid tool call arguments"); }
+            if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("controller proxy received invalid tool call arguments");
+            block.arguments = args;
+            stream.push({ type: "toolcall_end", contentIndex: state.contentIndex, toolCall: block, partial: output });
+          }
+          blocks.delete(payload.index);
         } else if (frame.type === "usage") {
           output.usage.input = nonNegative(payload.input);
           output.usage.output = nonNegative(payload.output);
@@ -69,9 +112,11 @@ function streamControllerProxy(model: any, context: any, options: any = {}) {
           output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
         }
       }
+      if (blocks.size > 0) throw new Error("controller proxy received an unclosed response block");
       const terminalError = proxyTerminalError(terminal);
       if (terminalError) throw new Error(terminalError);
-      output.stopReason = "stop";
+      const hasToolCall = output.content.some((block: any) => block?.type === "toolCall");
+      output.stopReason = hasToolCall ? "toolUse" : "stop";
       stream.push({ type: "done", reason: output.stopReason, message: output });
       stream.end();
     } catch (error) {

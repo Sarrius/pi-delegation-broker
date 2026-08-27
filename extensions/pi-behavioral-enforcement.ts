@@ -176,6 +176,7 @@ export default function (pi: ExtensionAPI) {
     beat();
     runtime.heartbeat = setInterval(beat, heartbeatMs);
     runtime.heartbeat.unref?.();
+    (globalThis as any).__PI_BROKER_REPORT_TOOLS_READY?.();
   });
 
   pi.on("tool_call", async (event) => {
