@@ -183,4 +183,6 @@ test("mcp_pi_ prefix on an allowed tool canonicalizes to the unprefixed name", (
   assert.equal(canonicalDeclaredToolName("mcp_pi_read", new Set(allowed)), "read");
   assert.equal(canonicalDeclaredToolName("mcp_pi_bash", allowed), "mcp_pi_bash");
   assert.equal(canonicalDeclaredToolName("bash", allowed), "bash");
+  assert.equal(isImplicitlyDeclaredObserveTool("mcp_pi_read", allowed), true);
+  assert.equal(isImplicitlyDeclaredObserveTool("mcp_pi_bash", allowed), false);
 });

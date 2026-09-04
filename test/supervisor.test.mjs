@@ -75,6 +75,50 @@ test("single-host supervisor owns an owner-only state dir, socket, lock and peri
   }
 });
 
+test("independent Pi controllers share broker capacity without sharing sockets or controller tokens", async () => {
+  const stateDir = stateDirectory("bsmc-");
+  const first = new SingleHostBrokerSupervisor({
+    stateDir,
+    runtimeNamespace: "1111111111111111",
+    registry: fixtureRegistry(),
+    allowUnsignedFixture: true,
+    controllerToken: "a".repeat(48),
+  });
+  const second = new SingleHostBrokerSupervisor({
+    stateDir,
+    runtimeNamespace: "2222222222222222",
+    registry: fixtureRegistry(),
+    allowUnsignedFixture: true,
+    controllerToken: "b".repeat(48),
+  });
+  try {
+    await first.start();
+    await second.start();
+    assert.notEqual(first.socketPath, second.socketPath);
+    assert.equal(existsSync(first.socketPath), true);
+    assert.equal(existsSync(second.socketPath), true);
+    assert.deepEqual(await requestBrokerIpc({
+      socketPath: first.socketPath, authorization: first.controllerToken, method: "pendingTasks",
+    }), []);
+    assert.deepEqual(await requestBrokerIpc({
+      socketPath: second.socketPath, authorization: second.controllerToken, method: "pendingTasks",
+    }), []);
+    await assert.rejects(
+      () => requestBrokerIpc({ socketPath: second.socketPath, authorization: first.controllerToken, method: "pendingTasks" }),
+      /unauthorized/,
+    );
+    await first.stop();
+    assert.equal(existsSync(second.socketPath), true, "one Pi shutdown must not unlink another Pi controller socket");
+    assert.deepEqual(await requestBrokerIpc({
+      socketPath: second.socketPath, authorization: second.controllerToken, method: "pendingTasks",
+    }), []);
+  } finally {
+    await first.stop().catch(() => undefined);
+    await second.stop().catch(() => undefined);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("supervisor scheduler wakes queued controller work after capacity is released", async () => {
   const stateDir = stateDirectory("broker-supervisor-queue-");
   const supervisor = new SingleHostBrokerSupervisor({
@@ -198,6 +242,22 @@ test("supervisor rejects an insecure state directory before any broker artifact 
     );
     assert.equal(existsSync(join(stateDir, "broker.sqlite")), false);
     assert.equal(existsSync(join(stateDir, "broker.lock")), false);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("supervisor rejects an unsafe runtime namespace before creating controller artifacts", () => {
+  const stateDir = stateDirectory("broker-supervisor-namespace-");
+  try {
+    assert.throws(
+      () => new SingleHostBrokerSupervisor({
+        stateDir, runtimeNamespace: "../foreign", registry: fixtureRegistry(),
+        allowUnsignedFixture: true, controllerToken: CONTROLLER_TOKEN,
+      }),
+      /runtimeNamespace must be 16 lowercase hexadecimal characters/,
+    );
+    assert.equal(existsSync(join(stateDir, "broker.sqlite")), false);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

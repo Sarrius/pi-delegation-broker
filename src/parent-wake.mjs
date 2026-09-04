@@ -60,8 +60,10 @@ export function createParentWakeMessage(reports) {
 /**
  * Coalesces reports that settle in the same short burst and dispatches each id
  * once per live extension incarnation. The durable store claims a wake before
- * dispatch. A crash after claim is ambiguous and therefore never auto-replays;
- * it falls back to the next genuine owner turn instead of spending twice.
+ * dispatch, while the wake marker is written only after Pi emits the hidden
+ * custom message's lifecycle acknowledgement. A crash after claim or enqueue
+ * therefore remains visible to the next genuine owner turn instead of being
+ * silently treated as consumed or replayed.
  */
 export class ParentWakeCoordinator {
   #sendMessage;
@@ -69,20 +71,25 @@ export class ParentWakeCoordinator {
   #markWoken;
   #loadReport;
   #onFailure;
+  #canDispatch;
   #delayMs;
   #setTimer;
   #clearTimer;
   #pending = new Map();
   #dispatched = new Set();
+  #dispatchedReports = new Map();
+  #acknowledged = new Set();
   #timer;
+  #flushing = false;
   #closed = false;
 
-  constructor({ sendMessage, claimWake, markWoken, loadReport, onFailure, delayMs = 25, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  constructor({ sendMessage, claimWake, markWoken, loadReport, onFailure, canDispatch, delayMs = 25, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
     if (typeof sendMessage !== "function") throw new Error("parent wake requires sendMessage");
     if (typeof claimWake !== "function") throw new Error("parent wake requires claimWake");
     if (typeof markWoken !== "function") throw new Error("parent wake requires markWoken");
     if (loadReport !== undefined && typeof loadReport !== "function") throw new Error("parent wake loadReport must be a function");
     if (onFailure !== undefined && typeof onFailure !== "function") throw new Error("parent wake onFailure must be a function");
+    if (canDispatch !== undefined && typeof canDispatch !== "function") throw new Error("parent wake canDispatch must be a function");
     if (!Number.isSafeInteger(delayMs) || delayMs < 0 || delayMs > 5_000) throw new Error("parent wake delay must be 0..5000ms");
     if (typeof setTimer !== "function" || typeof clearTimer !== "function") throw new Error("parent wake requires timer functions");
     this.#sendMessage = sendMessage;
@@ -90,6 +97,7 @@ export class ParentWakeCoordinator {
     this.#markWoken = markWoken;
     this.#loadReport = loadReport;
     this.#onFailure = onFailure;
+    this.#canDispatch = canDispatch;
     this.#delayMs = delayMs;
     this.#setTimer = setTimer;
     this.#clearTimer = clearTimer;
@@ -107,67 +115,110 @@ export class ParentWakeCoordinator {
   }
 
   async flush() {
-    if (this.#closed || this.#pending.size === 0) return false;
-    if (this.#timer !== undefined) this.#clearTimer(this.#timer);
-    this.#timer = undefined;
-    const selected = [...this.#pending.values()].slice(0, MAX_REPORTS_PER_WAKE);
-    for (const report of selected) this.#pending.delete(report.taskId);
-    const candidates = selected.map((report) => this.#loadReport ? this.#loadReport(report.taskId) : report)
-      .filter((report) => validReport(report) && report.readAt === null
-        && report.wakeClaimedAt === null && report.wakeAt === null);
-    const reports = [];
-    for (const candidate of candidates) {
-      try {
-        const claimed = await Promise.resolve(this.#claimWake(candidate.taskId));
-        if (validReport(claimed) && claimed.readAt === null && Number.isSafeInteger(claimed.wakeClaimedAt)
-          && claimed.wakeAt === null) reports.push(claimed);
-      } catch (error) {
-        this.#onFailure?.([candidate], error, "claim");
+    if (this.#closed || this.#pending.size === 0 || this.#flushing) return false;
+    this.#flushing = true;
+    try {
+      if (this.#timer !== undefined) this.#clearTimer(this.#timer);
+      this.#timer = undefined;
+      const selected = [...this.#pending.values()].slice(0, MAX_REPORTS_PER_WAKE);
+      // Do not claim a wake while the host is in a transition where a queued owner message may
+      // be promoted. The claim is durable and therefore cannot be safely undone if the host then
+      // aborts the turn. The extension calls notifyReady() from the next agent_start/settled
+      // boundary, so the report remains a live pending item rather than becoming ambiguous.
+      if (this.#canDispatch) {
+        let canDispatch = false;
+        try { canDispatch = this.#canDispatch() === true; }
+        catch { canDispatch = false; }
+        if (!canDispatch) return false;
       }
-    }
-    if (reports.length === 0) {
-      if (this.#pending.size > 0 && this.#timer === undefined) {
-        this.#timer = this.#setTimer(() => { void this.flush(); }, this.#delayMs);
+      for (const report of selected) this.#pending.delete(report.taskId);
+      const candidates = selected.map((report) => this.#loadReport ? this.#loadReport(report.taskId) : report)
+        .filter((report) => validReport(report) && report.readAt === null
+          && report.wakeClaimedAt === null && report.wakeAt === null);
+      const reports = [];
+      for (const candidate of candidates) {
+        try {
+          const claimed = await Promise.resolve(this.#claimWake(candidate.taskId));
+          if (validReport(claimed) && claimed.readAt === null && Number.isSafeInteger(claimed.wakeClaimedAt)
+            && claimed.wakeAt === null) reports.push(claimed);
+        } catch (error) {
+          this.#onFailure?.([candidate], error, "claim");
+        }
       }
-      return false;
-    }
-    const wake = createParentWakeMessage(reports);
-    let sendResult;
-    try { sendResult = this.#sendMessage(wake.message, wake.options); }
-    catch (error) {
-      // Even a synchronous host rejection retains the create-once claim. The
-      // safe recovery is the genuine-owner fallback, never automatic replay.
-      for (const report of reports) this.#dispatched.add(report.taskId);
-      this.#onFailure?.(reports, error, "send_sync");
-      if (this.#pending.size > 0 && this.#timer === undefined) {
-        this.#timer = this.#setTimer(() => { void this.flush(); }, this.#delayMs);
+      if (reports.length === 0) {
+        if (this.#pending.size > 0 && this.#timer === undefined) {
+          this.#timer = this.#setTimer(() => { void this.flush(); }, this.#delayMs);
+        }
+        return false;
       }
-      return false;
-    }
-    try { await Promise.resolve(sendResult); }
-    catch (error) {
-      // Promise rejection is ambiguous: the host may already have queued the
-      // custom turn. Retain claims and live dedup; use owner-turn fallback.
-      for (const report of reports) this.#dispatched.add(report.taskId);
-      this.#onFailure?.(reports, error, "send_async");
-      if (this.#pending.size > 0 && this.#timer === undefined) {
-        this.#timer = this.#setTimer(() => { void this.flush(); }, this.#delayMs);
+      const wake = createParentWakeMessage(reports);
+      // Register the ids before crossing into the host. A sufficiently eager host/test double may
+      // emit message_start synchronously from sendMessage; acknowledgement must not miss that
+      // event. A synchronous throw remains ambiguous and keeps the same create-once dedup.
+      for (const report of reports) {
+        this.#dispatched.add(report.taskId);
+        this.#dispatchedReports.set(report.taskId, report);
       }
-      return false;
-    }
-    for (const report of reports) {
-      this.#dispatched.add(report.taskId);
-      try { await Promise.resolve(this.#markWoken(report.taskId)); }
+      let sendResult;
+      try { sendResult = this.#sendMessage(wake.message, wake.options); }
       catch (error) {
-        // The custom wake is already accepted. Keep the durable claim and live
-        // dedup; restart will use the genuine-owner-turn fallback, never replay.
-        this.#onFailure?.([report], error, "mark");
+        // Even a synchronous host rejection retains the create-once claim. The
+        // safe recovery is the genuine-owner fallback, never automatic replay.
+        this.#onFailure?.(reports, error, "send_sync");
+        if (this.#pending.size > 0 && this.#timer === undefined) {
+          this.#timer = this.#setTimer(() => { void this.flush(); }, this.#delayMs);
+        }
+        return false;
+      }
+      try { await Promise.resolve(sendResult); }
+      catch (error) {
+        // Promise rejection is ambiguous: the host may already have queued the
+        // custom turn. Retain claims and live dedup; use owner-turn fallback.
+        this.#onFailure?.(reports, error, "send_async");
+        if (this.#pending.size > 0 && this.#timer === undefined) {
+          this.#timer = this.#setTimer(() => { void this.flush(); }, this.#delayMs);
+        }
+        return false;
+      }
+      // Do not mark the report as woken merely because `sendMessage` accepted the enqueue. Pi can
+      // still abort the active run before this custom message reaches `message_start`; keeping
+      // wakeAt null leaves the report visible to the owner-turn system-prompt fallback. The
+      // extension acknowledges these ids from the actual custom-message lifecycle event.
+      if (this.#pending.size > 0 && this.#timer === undefined) {
+        this.#timer = this.#setTimer(() => { void this.flush(); }, this.#delayMs);
+      }
+      return true;
+    } finally {
+      this.#flushing = false;
+    }
+  }
+
+  /** Retry a wake after the host reports that its run/queue transition is over. */
+  notifyReady() {
+    if (this.#closed || this.#pending.size === 0 || this.#flushing) return Promise.resolve(false);
+    return this.flush();
+  }
+
+  /**
+   * Acknowledge reports after Pi has actually started the hidden custom wake message.
+   * A claimed/accepted enqueue without this acknowledgement remains visible to the owner fallback.
+   */
+  async acknowledge(taskIds) {
+    if (this.#closed) return false;
+    const ids = Array.isArray(taskIds) ? taskIds : [taskIds];
+    let acknowledged = false;
+    for (const taskId of ids) {
+      if (typeof taskId !== "string" || !this.#dispatched.has(taskId) || this.#acknowledged.has(taskId)) continue;
+      const report = this.#dispatchedReports.get(taskId);
+      try {
+        await Promise.resolve(this.#markWoken(taskId));
+        this.#acknowledged.add(taskId);
+        acknowledged = true;
+      } catch (error) {
+        this.#onFailure?.(report ? [report] : [{ taskId }], error, "ack");
       }
     }
-    if (this.#pending.size > 0 && this.#timer === undefined) {
-      this.#timer = this.#setTimer(() => { void this.flush(); }, this.#delayMs);
-    }
-    return true;
+    return acknowledged;
   }
 
   close() {

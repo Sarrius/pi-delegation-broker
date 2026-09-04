@@ -20,7 +20,7 @@
  * ~/.pi/agent/delegation-broker/ and is owner-only.
  */
 
-import { createHash, generateKeyPairSync, sign } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -106,6 +106,7 @@ import { planUnreadNotice, seedNotifiedUnread } from "../src/unread-notice.mjs";
 import { buildFleetProjection, fleetSummary, formatFleetDetails, formatFleetWidget } from "../src/fleet-view.mjs";
 import { normalizeContract, renderRoleFraming, resolveContract } from "../src/child-contract.mjs";
 import { RecursiveAdmissionStore, normalizeRecursivePolicy } from "../src/recursive-admission.mjs";
+import { isCatalogOnlyNativeProvider } from "../src/native-provider-routing.mjs";
 
 const EXTENSIONS_DIR = dirname(fileURLToPath(import.meta.url));
 const CHILD_SHIM_PATH = join(EXTENSIONS_DIR, "child-shim.ts");
@@ -113,11 +114,19 @@ const CONTROLLER_PROXY_PATH = join(EXTENSIONS_DIR, "controller-provider-proxy.ts
 const BEHAVIORAL_ENFORCEMENT_PATH = join(EXTENSIONS_DIR, "pi-behavioral-enforcement.ts");
 const PARENT_AGENT_DIR = join(homedir(), ".pi", "agent");
 const STATE_DIR = join(PARENT_AGENT_DIR, "delegation-broker");
+// Every live Pi controller owns its IPC socket/token lifecycle. Capacity and health remain shared
+// through STATE_DIR/broker.sqlite, whose BEGIN IMMEDIATE transactions serialize local processes.
+// A per-incarnation namespace prevents one Pi reload/shutdown from replacing another Pi's socket
+// and turning its still-live controller token into an `unauthorized` failure.
+const CONTROLLER_RUNTIME_NAMESPACE = createHash("sha256")
+  .update(`${process.pid}:${randomUUID()}`)
+  .digest("hex")
+  .slice(0, 16);
+const CONTROLLER_PRIVATE_DIR = join(STATE_DIR, "controllers", CONTROLLER_RUNTIME_NAMESPACE);
 const KEYS_PATH = join(STATE_DIR, "registry-keys.json");
 const PREFERENCES_PATH = join(STATE_DIR, "preferences.json");
 const ENABLED_PATH = join(STATE_DIR, "enabled.json");
 const CURRENCY_CACHE_PATH = join(STATE_DIR, "currency-cache.json");
-const ROUTING_AUDIT_PATH = join(STATE_DIR, "routing-audit.json");
 const REPORTS_DIR = join(STATE_DIR, "reports");
 const JOBS_DIR = join(STATE_DIR, "jobs");
 const CHECKPOINTS_DIR = join(STATE_DIR, "checkpoints");
@@ -133,11 +142,12 @@ const FLEET_WIDGET_ROWS = 5;
 const FLEET_DURABLE_LIMIT = 256;
 const MODEL_CATALOG_REQUEST_EVENT = "pi:model-catalog:request:v1";
 const MODEL_CATALOG_SNAPSHOT_EVENT = "pi:model-catalog:snapshot:v1";
-// Cursor's subscription bridge publishes a fresh parent model catalog but has no safe generic
-// `/models` endpoint for the controller's currency probe. Its current catalog fact is therefore
-// seeded only for these providers, and the exact controller route preflight remains the hard gate
-// immediately before lease admission.
-const CATALOG_ONLY_NATIVE_PROVIDER = /^cursor(?:-account-\d+)?$/;
+// Cursor's subscription bridge and the parent-owned Anthropic/Codex OAuth slot proxy do not
+// expose a safe generic `/models` endpoint for the controller's currency probe. In particular,
+// the controller already holds the real access token while the loopback child proxy deliberately
+// accepts only its placeholder key; probing a published slot with the real token creates a false
+// 401/refusal loop. Seed these native providers from the parent catalog instead, and keep the
+// exact controller route preflight as the hard gate immediately before lease admission.
 
 const CAPABILITIES = ["text_generation", "code_reasoning", "large_context", "vision_input"] as const;
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -428,7 +438,7 @@ function probeRoutes(registry: any, now = Date.now()) {
     // not a generic provider `/models` resource. Probing it marks every Cursor model unknown
     // when the bridge is intentionally not exposed at that URL; the catalog-only path below
     // supplies the listing fact and exact routePreflight verifies the native runtime instead.
-    if (CATALOG_ONLY_NATIVE_PROVIDER.test(provider)) continue;
+    if (isCatalogOnlyNativeProvider(provider)) continue;
     if (routes.has(provider)) continue;
     const credential = auth[provider];
     // OAuth subscriptions were previously visible to selection but invisible to the controller
@@ -452,7 +462,7 @@ function probeRoutes(registry: any, now = Date.now()) {
 function catalogOnlyListings(registry: any, probedRoutes: Map<string, unknown>) {
   const listings = new Map<string, Map<string, number | undefined>>();
   for (const { provider, modelId } of registryModels(registry)) {
-    if (!CATALOG_ONLY_NATIVE_PROVIDER.test(provider) || probedRoutes.has(provider)) continue;
+    if (!isCatalogOnlyNativeProvider(provider) || probedRoutes.has(provider)) continue;
     const listing = listings.get(provider) ?? new Map<string, number | undefined>();
     listing.set(modelId, undefined);
     listings.set(provider, listing);
@@ -532,7 +542,10 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
 
   // Built before the supervisor: the broker refuses to make any task terminal unless a receipt
   // authenticates against this authority, so it has to exist at supervisor construction.
-  const evidenceStore = new ControllerEvidenceStore({ root: join(STATE_DIR, "verification-evidence") });
+  // Evidence and learned JSON journals document one controller's observations and require one
+  // writer. Keep them private to this incarnation; only the transactional capacity DB is shared.
+  mkdirSync(CONTROLLER_PRIVATE_DIR, { recursive: true, mode: 0o700 });
+  const evidenceStore = new ControllerEvidenceStore({ root: join(CONTROLLER_PRIVATE_DIR, "verification-evidence") });
   const checkpointStore = new CheckpointStore({ root: CHECKPOINTS_DIR });
   const defectStore = new DefectStore({ root: DEFECTS_DIR });
   const recursiveStore = new RecursiveAdmissionStore({
@@ -554,6 +567,7 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
   });
   const supervisor = new SingleHostBrokerSupervisor({
     stateDir: STATE_DIR,
+    runtimeNamespace: CONTROLLER_RUNTIME_NAMESPACE,
     // Without this the controller token alone would be trusted, and every verified completion
     // would be denied instead — the acceptance path would exist but never finish a task.
     verificationReceiptVerifier: (receipt: any, binding: any) => verificationAuthority.verify(receipt, binding),
@@ -572,8 +586,8 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
   });
   await supervisor.start();
   const acceptancePlans = new Map<string, any>();
-  const affinityJournal = new ModelAffinityJournal({ path: join(STATE_DIR, "model-affinity.json") });
-  const routingAudit = new RoutingAuditJournal({ path: ROUTING_AUDIT_PATH });
+  const affinityJournal = new ModelAffinityJournal({ path: join(CONTROLLER_PRIVATE_DIR, "model-affinity.json") });
+  const routingAudit = new RoutingAuditJournal({ path: join(CONTROLLER_PRIVATE_DIR, "routing-audit.json") });
   const verifiedRouting = new ControllerVerifiedRoutingBoard({
     routingBoard: new RoutingBoard(), verificationAuthority, affinityJournal,
   });
@@ -622,7 +636,8 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
   const refreshCurrency = async () => {
     const currentRegistry = supervisor.providerWatcher.currentRegistry();
     const routes = probeRoutes(currentRegistry);
-    // A Cursor model list is published by the parent bridge, not by a generic `/models` API.
+    // Parent-owned native subscription model lists are published by the parent bridge, not by a
+    // generic `/models` API on the child proxy.
     // Replace the prior catalog-only fact on every refresh so removed models cannot remain current;
     // routePreflight still checks the exact model/runtime/auth/API tuple before any lease.
     const catalogOnly = catalogOnlyListings(currentRegistry, routes);
@@ -631,13 +646,13 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     const catalogProviders = new Set(
       registryModels(currentRegistry)
         .map(({ provider }) => provider)
-        .filter((provider) => CATALOG_ONLY_NATIVE_PROVIDER.test(provider)),
+        .filter((provider) => isCatalogOnlyNativeProvider(provider)),
     );
     for (const provider of catalogProviders) {
       const listing = catalogOnly.get(provider);
       if (listing) {
         liveListings.set(provider, listing);
-        // The parent catalog was read through the Cursor OAuth path, so it is a valid
+        // The parent catalog was read through the native parent path, so it is a valid
         // availability observation for resources previously quarantined by the invalid generic
         // `/models` probe. Do not touch a capacity breaker: only an inference probe may close it.
         const resourceId = Object.entries(currentRegistry.resources ?? {})
@@ -819,6 +834,11 @@ export default function piDelegationBroker(pi: any) {
     deadlineTimer?: ReturnType<typeof setTimeout>;
   }>();
   let parentWake: ParentWakeCoordinator | undefined;
+  // Pi exposes a short transition where `ctx.isIdle()` is already true while the
+  // current `_runAgentPrompt` is still settling. Starting an automatic wake there
+  // can race a queued owner message and surface a generic AbortError. Hold wakes
+  // until the next agent_start/settled boundary instead.
+  let parentWakeSettling = false;
   let fleetTimer: ReturnType<typeof setInterval> | undefined;
   const fleetJobs = new Map<string, any>();
   const fleetReports = new Map<string, any>();
@@ -944,6 +964,16 @@ export default function piDelegationBroker(pi: any) {
   const openParentWake = () => {
     parentWake?.close();
     parentWake = new ParentWakeCoordinator({
+      // The check and send are synchronous at the extension boundary. If a user
+      // message is already queued while the session reports idle, leave the
+      // durable report pending; agent_start will call notifyReady() and the wake
+      // will then be a normal follow-up instead of a competing fresh turn.
+      canDispatch: () => {
+        if (parentWakeSettling) return false;
+        const ctx = lastCtx;
+        if (typeof ctx?.isIdle !== "function" || typeof ctx?.hasPendingMessages !== "function") return true;
+        return !(ctx.isIdle() === true && ctx.hasPendingMessages() === true);
+      },
       sendMessage: (message: any, options: any) => pi.sendMessage(message, options),
       claimWake: (taskId: string) => claimReportWake(REPORTS_DIR, taskId),
       markWoken: (taskId: string) => markReportWoken(REPORTS_DIR, taskId),
@@ -1617,6 +1647,7 @@ export default function piDelegationBroker(pi: any) {
 
   pi.on("session_start", (_event: any, ctx: any) => {
     lastCtx = ctx;
+    parentWakeSettling = false;
     openParentWake();
     pi.events?.emit?.(MODEL_CATALOG_REQUEST_EVENT, { schemaVersion: 1 });
     try { pruneReports(REPORTS_DIR); } catch { /* pruning is best effort */ }
@@ -1711,13 +1742,44 @@ export default function piDelegationBroker(pi: any) {
     return { systemPrompt: additions.join("\n\n") };
   });
 
+  pi.on("message_start", async (event: any) => {
+    const message = event?.message;
+    if (message?.role !== "custom" || message.customType !== "delegation-broker-wake") return;
+    const reports = Array.isArray(message.details?.reports) ? message.details.reports : [];
+    const taskIds = reports.map((report: any) => report?.taskId).filter((taskId: any) => typeof taskId === "string");
+    await parentWake?.acknowledge(taskIds);
+  });
+
+  pi.on("agent_end", () => {
+    // `AgentSession` marks itself idle before it emits agent_settled. Treat the
+    // whole end→settled window as a transition so an automatic wake cannot
+    // start a competing prompt in that gap.
+    parentWakeSettling = true;
+  });
+
+  pi.on("agent_start", () => {
+    parentWakeSettling = false;
+    void parentWake?.notifyReady();
+  });
+
   pi.on("agent_settled", async () => {
     if (activeTasks.size === 0 && activeWorkflows.size === 0) {
       await disposeBrokeredChildProcesses();
     }
+    // The event dispatcher may still have other settled listeners after this
+    // handler. Release on the next turn of the host event loop, then retry any
+    // wake that was held without claiming it.
+    const wake = parentWake;
+    const release = setTimeout(() => {
+      if (parentWake !== wake) return;
+      parentWakeSettling = false;
+      void wake?.notifyReady();
+    }, 0);
+    release.unref?.();
   });
 
   pi.on("session_shutdown", async (_event: any, ctx: any) => {
+    parentWakeSettling = false;
     stopFleet();
     parentWake?.close();
     parentWake = undefined;

@@ -560,6 +560,32 @@ test("controller accounts cumulative input reservations and output usage before 
   broker.release(lease.leaseId, lease.fencingToken, "test", 1_006);
 }));
 
+test("real input reservations reconcile to observed usage instead of consuming the conservative upper bound", () => withBroker((broker) => {
+  const lease = leased(broker, fixtureContract({
+    budget: { maxInputTokens: 100, maxOutputTokens: 100, enforcement: { input: "hard", output: "hard" } },
+  }));
+  assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 60, 1_001).status, "reserved");
+  const first = broker.recordProviderUsage(
+    lease.leaseId,
+    lease.fencingToken,
+    { input: 10, output: 1 },
+    1_002,
+    { inputReserved: true, reservedInputUpperBound: 60 },
+  );
+  assert.deepEqual(first, { status: "recorded", inputTokensUsed: 10, outputTokensUsed: 1 });
+  assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 80, 1_003).status, "reserved");
+  const second = broker.recordProviderUsage(
+    lease.leaseId,
+    lease.fencingToken,
+    { input: 20, output: 2 },
+    1_004,
+    { inputReserved: true, reservedInputUpperBound: 80 },
+  );
+  assert.deepEqual(second, { status: "recorded", inputTokensUsed: 30, outputTokensUsed: 3 });
+  assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 71, 1_005).status, "budget_exceeded");
+  broker.release(lease.leaseId, lease.fencingToken, "test", 1_006);
+}));
+
 test("typed effect receipts are approval-bound and idempotent", () => {
   const registry = fixtureRegistry();
   withBroker((broker) => {

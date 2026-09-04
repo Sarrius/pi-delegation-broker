@@ -4,7 +4,9 @@ import { captureLosslessJson } from "./lossless-json.mjs";
  * project this value only after the controller has validated its replay state. */
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const TOOL_CALL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+// OpenAI Responses composes tool ids as `${call_id}|${item.id}`. The optional
+// delimiter is valid only here; controller/snapshot identifiers remain stricter.
+const TOOL_CALL_ID = /^(?=.{1,128}$)[A-Za-z0-9][A-Za-z0-9._:-]*(?:\|[A-Za-z0-9][A-Za-z0-9._:-]*)?$/;
 const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const MESSAGE_ROLES = new Set(["user", "assistant", "toolResult"]);
 
@@ -14,7 +16,7 @@ function isPlainObject(value) {
 }
 
 function boundedText(value, name, max) {
-  if (typeof value !== "string" || value.length > max || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(value)) {
+  if (typeof value !== "string" || value.length > max || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value)) {
     throw new Error(`${name} must be bounded printable text`);
   }
   return value;
@@ -44,7 +46,7 @@ function validateToolCall(block, label, toolNames) {
   if (block.type !== "toolCall") throw new Error(`${label}.type is unsupported`);
   boundedId(block.id, `${label}.id`, TOOL_CALL_ID);
   boundedId(block.name, `${label}.name`, TOOL_NAME);
-  if (block.namespace !== undefined) boundedId(block.namespace, `${label}.namespace`, TOOL_CALL_ID);
+  if (block.namespace !== undefined) boundedId(block.namespace, `${label}.namespace`, ID);
   if (!toolNames.has(block.name)) throw new Error(`${label}.name is not an approved tool`);
   validateToolArguments(block.arguments, `${label}.arguments`);
 }

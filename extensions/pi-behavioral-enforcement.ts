@@ -183,22 +183,23 @@ export default function (pi: ExtensionAPI) {
     if (event.toolName === DECLARATION_TOOL || event.toolName === CHECKPOINT_TOOL || RECURSIVE_TOOLS.has(event.toolName)) return undefined;
     if (!runtime || runtime.failed) return failClosed(runtime?.failed ?? "broker behavioral monitor was not initialized");
     const pending = runtime.pending;
-    if (!pending && isImplicitlyDeclaredObserveTool(event.toolName)) {
+    const canonicalToolName = canonicalDeclaredToolName(event.toolName, runtime.capability.allowedTools);
+    if (!pending && isImplicitlyDeclaredObserveTool(event.toolName, runtime.capability.allowedTools)) {
       let actual;
       try { actual = captureLosslessJson(event.input, { maxBytes: 256 * 1024, maxDepth: 32, maxNodes: 10_000 }).value; }
       catch { return failClosed("observe tool arguments cannot be represented by the broker behavioral protocol"); }
       const stepId = `step-${++runtime.step}`;
       try {
         const declared = await controller<{ status?: string }>("declareBehavioralAction", {
-          stepId, toolName: event.toolName, args: actual,
+          stepId, toolName: canonicalToolName, args: actual,
         });
         if (declared.status !== "declared") return failClosed("controller rejected automatic observe declaration");
         const decision = await controller<{ status?: string; block?: boolean; terminate?: boolean; cause?: string }>("authorizeBehavioralAction", {
-          stepId, toolName: event.toolName, args: actual,
+          stepId, toolName: canonicalToolName, args: actual,
         });
         if (decision.status === "allowed" && decision.block !== true) {
           runtime.undeclaredBlocks = 0;
-          runtime.executing.set(event.toolCallId, { stepId, toolName: event.toolName, args: actual });
+          runtime.executing.set(event.toolCallId, { stepId, toolName: canonicalToolName, args: actual });
           return undefined;
         }
         return {

@@ -11,6 +11,7 @@ import { captureLosslessJson } from "./lossless-json.mjs";
 export const PROVIDER_PROTOCOL_VERSION = 1;
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const TOOL_CALL_ID = /^(?=.{1,128}$)[A-Za-z0-9][A-Za-z0-9._:-]*(?:\|[A-Za-z0-9][A-Za-z0-9._:-]*)?$/;
 const HEX64 = /^[a-f0-9]{64}$/;
 const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 
@@ -342,7 +343,7 @@ export class ProviderStreamAssembler {
     let id = null;
     let name = null;
     if (blockType === "tool_call") {
-      if (typeof payload.id !== "string" || !ID.test(payload.id)) fail("frame_payload_invalid", "tool_call block requires a bounded id");
+      if (typeof payload.id !== "string" || !TOOL_CALL_ID.test(payload.id)) fail("frame_payload_invalid", "tool_call block requires a bounded id");
       if (typeof payload.name !== "string" || !TOOL_NAME.test(payload.name)) fail("frame_payload_invalid", "tool_call block requires a bounded name");
       id = payload.id;
       name = payload.name;

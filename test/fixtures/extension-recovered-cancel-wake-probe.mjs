@@ -43,6 +43,9 @@ const wake = await Promise.race([
 ]);
 assert.match(wake.message.content, /delegate-recovered-cancel-1: failed/);
 assert.equal(wake.options.triggerTurn, true);
+await hooks.get("message_start")?.({ message: {
+  role: "custom", customType: wake.message.customType, details: wake.message.details,
+} }, ctx);
 await new Promise((resolve) => setTimeout(resolve, 25));
 assert.equal(readJob(jobs, "delegate-recovered-cancel-1").status, "cancelled");
 const report = JSON.parse(await (await import("node:fs/promises")).readFile(

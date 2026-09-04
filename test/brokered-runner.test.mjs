@@ -13,6 +13,9 @@ test("route-specific provider policy rejection is failover-eligible", () => {
   assert.equal(classifyChildFailure("controller provider terminal: rejected_before_send (400, subscription_extra_usage_required)"), "account_exhausted");
   assert.equal(classifyChildFailure("controller provider terminal: transport_before_headers"), "unavailable");
   assert.equal(classifyChildFailure("controller provider terminal: controller_failure"), "unavailable");
+  assert.equal(classifyChildFailure("controller input budget exhausted: input_budget_exceeded (used=10, requested=20, cap=25)"), "budget_exhausted");
+  assert.equal(classifyChildFailure("controller output budget exhausted: output_budget_exceeded (used=10, cap=10)"), "budget_exhausted");
+  assert.equal(classifyChildFailure("provider returned input_budget_exceeded"), "fatal");
 });
 
 // We test the runner's deny path and semaphore release without spawning a real Pi process.
@@ -139,6 +142,42 @@ test("brokered runner releases semaphore when child spawn fails after resolver a
     rmSync(root, { recursive: true, force: true });
   }
 });
+test("brokered runner does not fail over a controller budget exhaustion to another provider", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-budget-terminal-"));
+  try {
+    const { BrokeredChildRunner } = await import("../src/brokered-runner.mjs");
+    let resolves = 0;
+    const base = fakeResolver(true);
+    const resolver = {
+      async resolve(request) {
+        resolves += 1;
+        return base.resolve(request);
+      },
+    };
+    const session = {
+      latestAssistantMessage: { role: "assistant", content: [], stopReason: "error", errorMessage: "controller input budget exhausted: input_budget_exceeded (used=10, requested=20, cap=25)" },
+      usage: { input: 0, output: 0 },
+      subscribe: () => () => {},
+      prompt: async () => {},
+      dispose: async () => {},
+    };
+    const runner = new BrokeredChildRunner({
+      resolver,
+      semaphore: new Semaphore(1),
+      sessionsRoot: join(root, "sessions"),
+      spawnChild: async () => ({ session, resolved: { provider: "broker-fake", modelId: "lease-fake" } }),
+    });
+    const result = await runner.run({
+      childId: "budget-terminal-child", model: MODEL, cwd: root, prompt: "read-only", maxAttempts: 3,
+    });
+    assert.equal(result.status, "failed");
+    assert.equal(result.route[0].outcome, "budget_exhausted");
+    assert.equal(resolves, 1, "a task budget terminal must not spend another route");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a spent plan allowance is an account fact, not the end of the task", () => {
   // Observed live from the Codex CLI: no HTTP status, so an unclassified string would read as
   // fatal and stop failover while other accounts were still healthy.

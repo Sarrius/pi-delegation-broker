@@ -5,13 +5,18 @@ import { captureProviderContext } from "./provider-context.mjs";
  * The provider may request a controller-approved local tool, but the provider
  * never receives an executable function or permission to run that tool. */
 
-const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
-const TOOL_CALL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+export const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
+// Codex/OpenAI Responses composes tool-call ids as `${call_id}|${item.id}`, so the child-side
+// proxy must accept exactly the same identity shape the controller accepts. Keeping one canon
+// here prevents a stale duplicate from silently rejecting a live provider frame.
+export const TOOL_CALL_ID = /^(?=.{1,128}$)[A-Za-z0-9][A-Za-z0-9._:-]*(?:\|[A-Za-z0-9][A-Za-z0-9._:-]*)?$/;
 const NAMESPACE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const LOCAL_SCHEMA_METADATA = new Set(["~kind", "~optional", "~readonly"]);
 const USER_METADATA = ["role", "content", "timestamp"];
 const ASSISTANT_METADATA = ["role", "content", "api", "provider", "model", "responseModel", "responseId", "diagnostics", "usage", "stopReason", "deferred", "errorMessage", "rawStopReason", "endTurn", "timestamp"];
 const TOOL_RESULT_METADATA = ["role", "toolCallId", "toolName", "content", "details", "usage", "addedToolNames", "isError", "timestamp"];
+const NON_PRINTABLE_TEXT = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+const MAX_PROVIDER_TEXT = 256 * 1024;
 
 function exactKeys(value, allowed, label) {
   for (const key of Object.keys(value)) if (!allowed.includes(key)) throw new Error(`${label} has unknown field ${key}`);
@@ -30,6 +35,22 @@ function textContent(content, label) {
     text += block.text;
   }
   return text;
+}
+
+function providerToolResultContent(content, label) {
+  const raw = textContent(content, label);
+  let escapedCount = 0;
+  const escaped = raw.replace(NON_PRINTABLE_TEXT, (character) => {
+    escapedCount += 1;
+    return `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`;
+  });
+  const notice = escapedCount === 0
+    ? ""
+    : `[Broker escaped ${escapedCount} non-printable control characters in this tool result.]\n`;
+  const projected = `${notice}${escaped}`;
+  if (projected.length <= MAX_PROVIDER_TEXT) return projected;
+  const marker = `\n[Broker truncated tool result from ${projected.length} to ${MAX_PROVIDER_TEXT} characters.]`;
+  return `${projected.slice(0, MAX_PROVIDER_TEXT - marker.length)}${marker}`;
 }
 
 function schemaProjection(value, label, ancestors = new Set()) {
@@ -121,7 +142,10 @@ function canonicalMessage(message, index) {
       role: "toolResult",
       toolCallId: message.toolCallId,
       toolName: message.toolName,
-      content: textContent(message.content, `${label}.content`),
+      // Pi's read tool can return binary files as strings (for example `.git/index`). The raw
+      // result remains in the child transcript and behavioral digest, while the provider-facing
+      // replay gets a deterministic printable projection instead of terminating the whole task.
+      content: providerToolResultContent(message.content, `${label}.content`),
       isError: message.isError,
     };
   }

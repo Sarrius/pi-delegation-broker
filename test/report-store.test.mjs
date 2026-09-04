@@ -43,7 +43,7 @@ test("a written report round-trips and starts unread", () => {
   } finally { s.done(); }
 });
 
-test("create-once claim and dispatch mark form a durable non-replayable wake outbox", () => {
+test("create-once claim and lifecycle acknowledgement form a durable non-replayable wake outbox", () => {
   const s = store();
   try {
     writeReport(s.root, report("delegate-wake-1"));

@@ -380,6 +380,41 @@ test("real controller transport path streams one exact route through the same fr
   }
 });
 
+test("real controller proxy reconciles conservative input reservations to observed usage", async () => {
+  let dispatches = 0;
+  const { directory, server } = createRealServer({
+    fetchImpl: async () => {
+      dispatches += 1;
+      return anthropicSse([
+        { event: "message_start", data: { message: { usage: { input_tokens: 2 } } } },
+        { event: "content_block_start", data: { index: 0, content_block: { type: "text", text: "" } } },
+        { event: "content_block_delta", data: { index: 0, delta: { type: "text_delta", text: "done" } } },
+        { event: "content_block_stop", data: { index: 0 } },
+        { event: "message_delta", data: { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
+        { event: "message_stop", data: {} },
+      ]);
+    },
+  });
+  await server.start();
+  try {
+    const capability = await reserveCapability(
+      server,
+      "real-stream-reconciled-input",
+      100,
+      { budget: { maxInputTokens: 25_000, maxOutputTokens: 100, enforcement: { input: "hard", output: "hard" } } },
+    );
+    const context = realContext({ systemPrompt: "x".repeat(10_000) });
+    for (let index = 0; index < 3; index += 1) {
+      const result = await streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context });
+      assert.equal(result.terminal.payload.outcome, "succeeded_terminal");
+    }
+    assert.equal(dispatches, 3);
+  } finally {
+    await server.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("real controller proxy enforces cumulative output on repeated streams under one lease", async () => {
   let dispatches = 0;
   const { directory, broker, server } = createRealServer({
@@ -420,7 +455,7 @@ test("real controller proxy rejects an input payload over the hard controller ca
     const capability = await reserveCapability(server, "real-stream-input-budget", 100, { budget: { maxInputTokens: 100, maxOutputTokens: 100, enforcement: { input: "hard", output: "hard" } } });
     await assert.rejects(
       () => streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: realContext({ systemPrompt: "x".repeat(2_000) }) }),
-      /input_budget_exceeded/,
+      /controller input budget exhausted: input_budget_exceeded/,
     );
     assert.equal(dispatches, 0);
     assert.equal(broker.leases().length, 0);
