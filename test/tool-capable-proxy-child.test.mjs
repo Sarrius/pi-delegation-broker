@@ -36,7 +36,7 @@ function testRegistry() {
   return registry;
 }
 
-test("credentialless proxy completes and replays a Codex compound-id read tool turn", async () => {
+test("credentialless proxy completes and replays a Cursor LF compound-id read tool turn", async () => {
   const root = mkdtempSync(join(tmpdir(), "tool-proxy-child-"));
   writeFileSync(join(root, "probe.txt"), "TOOL_PROXY_INPUT\n", { mode: 0o600 });
   const registry = testRegistry();
@@ -48,7 +48,7 @@ test("credentialless proxy completes and replays a Codex compound-id read tool t
       yield { type: "headers", payload: { httpStatus: 200, providerRequestId: `tool-proxy-${requests.length}` } };
       const result = context.messages.find((message) => message.role === "toolResult");
       if (!result) {
-        yield { type: "block_start", payload: { index: 0, blockType: "tool_call", id: "call_1|fc_1", name: "read" } };
+        yield { type: "block_start", payload: { index: 0, blockType: "tool_call", id: "call_1\nfc_1", name: "read" } };
         yield { type: "tool_call_delta", payload: { index: 0, delta: '{"path":"probe.txt"}' } };
         yield { type: "block_end", payload: { index: 0, value: '{"path":"probe.txt"}' } };
         yield { type: "terminal", outcome: "succeeded_terminal", payload: { finishReason: "tool_use" } };

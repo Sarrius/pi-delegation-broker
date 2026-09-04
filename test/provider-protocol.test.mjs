@@ -201,7 +201,7 @@ test("duplicate and retyped blocks are fatal; deltas after close are fatal", () 
   assert.throws(() => assembler.accept(frame("text_delta", { index: 0, delta: "late" })), /block_not_open/);
 });
 
-test("Codex compound tool_call identity is fixed at block_start and cannot mutate via deltas", () => {
+test("native compound tool_call identity is fixed at block_start and cannot mutate via deltas", () => {
   const assembler = newAssembler();
   assembler.accept(frame("attempt_accepted"));
   assembler.accept(frame("provider_send_started"));
@@ -221,6 +221,21 @@ test("Codex compound tool_call identity is fixed at block_start and cannot mutat
   assembler.accept(frame("tool_call_delta", { index: 1, delta: "{\"command\":\"ls\"}" }));
   const closed = assembler.accept(frame("block_end", { index: 1, value: "{\"command\":\"ls\"}" }));
   assert.equal(closed.status, "tentative");
+
+  const cursor = newAssembler();
+  cursor.accept(frame("attempt_accepted"));
+  cursor.accept(frame("provider_send_started"));
+  const cursorId = "call-1\nfc-1";
+  assert.equal(cursor.accept(frame("block_start", { index: 0, blockType: "tool_call", id: cursorId, name: "read" })).status, "tentative");
+  cursor.accept(frame("tool_call_delta", { index: 0, delta: "{}" }));
+  assert.equal(cursor.accept(frame("block_end", { index: 0, value: "{}" })).status, "tentative");
+  const invalid = newAssembler();
+  invalid.accept(frame("attempt_accepted"));
+  invalid.accept(frame("provider_send_started"));
+  assert.throws(
+    () => invalid.accept(frame("block_start", { index: 0, blockType: "tool_call", id: "call-1\rfc-1", name: "read" })),
+    /bounded id/,
+  );
 });
 
 test("block_end must carry the canonical value assembled from deltas", () => {

@@ -1,13 +1,10 @@
 import { captureLosslessJson } from "./lossless-json.mjs";
+import { TOOL_CALL_ID, TOOL_NAME } from "./tool-identity.mjs";
 
 /** Closed, lossless child→controller context vocabulary. Provider adapters may
  * project this value only after the controller has validated its replay state. */
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-// OpenAI Responses composes tool ids as `${call_id}|${item.id}`. The optional
-// delimiter is valid only here; controller/snapshot identifiers remain stricter.
-const TOOL_CALL_ID = /^(?=.{1,128}$)[A-Za-z0-9][A-Za-z0-9._:-]*(?:\|[A-Za-z0-9][A-Za-z0-9._:-]*)?$/;
-const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const MESSAGE_ROLES = new Set(["user", "assistant", "toolResult"]);
 
 function isPlainObject(value) {

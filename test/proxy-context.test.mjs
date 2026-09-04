@@ -37,6 +37,21 @@ test("proxy bridge preserves text and controller-approved Codex compound tool re
   assert.equal(Object.hasOwn(context.tools[0], "execute"), false);
 });
 
+test("proxy preserves Cursor Grok's LF-joined tool-call identity across replay", () => {
+  const toolCallId = "call_2\nfc_2";
+  const context = proxyCanonicalContext({
+    systemPrompt: "Be concise.",
+    messages: [
+      { role: "user", content: "read README.md" },
+      { role: "assistant", content: [{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "README.md" } }] },
+      { role: "toolResult", toolCallId, toolName: "read", content: "ok", isError: false },
+    ],
+    tools: [{ name: "read", description: "Read one bounded path.", parameters: { type: "object" } }],
+  });
+  assert.equal(context.messages[1].content[0].id, toolCallId);
+  assert.equal(context.messages[2].toolCallId, toolCallId);
+});
+
 test("proxy makes non-printable tool output safe for the next provider turn", () => {
   const context = proxyCanonicalContext({
     systemPrompt: "Be concise.",

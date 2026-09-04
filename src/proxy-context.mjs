@@ -1,15 +1,12 @@
 import { captureLosslessJson } from "./lossless-json.mjs";
 import { captureProviderContext } from "./provider-context.mjs";
+export { TOOL_CALL_ID, TOOL_NAME } from "./tool-identity.mjs";
+import { TOOL_CALL_ID, TOOL_NAME } from "./tool-identity.mjs";
 
 /** Child Pi Context → controller providerStream vocabulary bridge.
  * The provider may request a controller-approved local tool, but the provider
  * never receives an executable function or permission to run that tool. */
 
-export const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
-// Codex/OpenAI Responses composes tool-call ids as `${call_id}|${item.id}`, so the child-side
-// proxy must accept exactly the same identity shape the controller accepts. Keeping one canon
-// here prevents a stale duplicate from silently rejecting a live provider frame.
-export const TOOL_CALL_ID = /^(?=.{1,128}$)[A-Za-z0-9][A-Za-z0-9._:-]*(?:\|[A-Za-z0-9][A-Za-z0-9._:-]*)?$/;
 const NAMESPACE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const LOCAL_SCHEMA_METADATA = new Set(["~kind", "~optional", "~readonly"]);
 const USER_METADATA = ["role", "content", "timestamp"];
