@@ -522,14 +522,18 @@ export class BrokerIpcServer {
       lease.leaseId, lease.fencingToken, inputUpperBound, Date.now(),
     );
     if (inputAdmission.status !== "reserved") {
-      this.#broker.release(lease.leaseId, lease.fencingToken, "provider input budget admission failed", Date.now());
-      throw new Error(inputAdmission.status === "budget_exceeded" ? "input_budget_exceeded" : "provider input budget admission failed");
+      const reason = inputAdmission.status === "budget_exceeded"
+        ? `controller input budget exhausted: input_budget_exceeded (used=${inputAdmission.used}, requested=${inputAdmission.requested}, cap=${inputAdmission.cap})`
+        : "provider input budget admission failed";
+      this.#broker.release(lease.leaseId, lease.fencingToken, reason, Date.now());
+      throw new Error(reason);
     }
     const outputUsed = lease.usage?.output ?? 0;
     const outputCap = lease.maxOutputTokens;
     if (lease.enforcement.output === "hard" && outputCap !== undefined && outputUsed >= outputCap) {
-      this.#broker.release(lease.leaseId, lease.fencingToken, "provider output budget exhausted", Date.now());
-      throw new Error("output_budget_exceeded");
+      const reason = `controller output budget exhausted: output_budget_exceeded (used=${outputUsed}, cap=${outputCap})`;
+      this.#broker.release(lease.leaseId, lease.fencingToken, reason, Date.now());
+      throw new Error(reason);
     }
     const remainingOutputTokens = outputCap === undefined ? 8_000 : Math.max(1, outputCap - outputUsed);
 
@@ -644,7 +648,11 @@ export class BrokerIpcServer {
       const usage = payload.usage ?? latestUsage;
       if (usage) {
         const usageResult = this.#broker.recordProviderUsage(
-          lease.leaseId, lease.fencingToken, usage, Date.now(), { inputReserved: true },
+          lease.leaseId,
+          lease.fencingToken,
+          usage,
+          Date.now(),
+          { inputReserved: true, reservedInputUpperBound: inputUpperBound },
         );
         if (usageResult.status === "denied_lease") throw new Error("lease no longer active");
         if (!["recorded", "budget_exceeded"].includes(usageResult.status)) throw new Error("provider usage could not be recorded");

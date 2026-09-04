@@ -57,6 +57,8 @@ test("coordinator coalesces a terminal burst and dispatches each report once", a
   assert.equal(typeof scheduled, "function");
   assert.equal(await coordinator.flush(), true);
   assert.equal(sent.length, 1);
+  assert.deepEqual(marked, [], "enqueue acceptance must not imply that Pi consumed the wake");
+  assert.equal(await coordinator.acknowledge(["delegate-a-1", "delegate-b-2"]), true);
   assert.deepEqual(marked, ["delegate-a-1", "delegate-b-2"]);
   assert.equal(sent[0].options.triggerTurn, true);
   assert.match(sent[0].message.content, /delegate-a-1/);
@@ -77,6 +79,31 @@ test("a report collected before the coalescing timer fires does not wake the par
   assert.equal(coordinator.enqueue(report("delegate-collected-1")), true);
   assert.equal(await coordinator.flush(), false);
   assert.equal(sent, 0);
+});
+
+test("a queued owner message defers the durable wake until the host starts a safe turn", async () => {
+  let canDispatch = false;
+  let claimed = 0;
+  let sent = 0;
+  let marked = 0;
+  const coordinator = new ParentWakeCoordinator({
+    canDispatch: () => canDispatch,
+    sendMessage() { sent += 1; },
+    claimWake(taskId) { claimed += 1; return report(taskId, { wakeClaimedAt: 200 }); },
+    markWoken() { marked += 1; },
+    setTimer() { return 1; },
+    clearTimer() {},
+  });
+
+  assert.equal(coordinator.enqueue(report("delegate-queued-owner-1")), true);
+  assert.equal(await coordinator.flush(), false);
+  assert.deepEqual({ claimed, sent, marked }, { claimed: 0, sent: 0, marked: 0 });
+
+  canDispatch = true;
+  assert.equal(await coordinator.notifyReady(), true);
+  assert.deepEqual({ claimed, sent, marked }, { claimed: 1, sent: 1, marked: 0 });
+  assert.equal(await coordinator.acknowledge(["delegate-queued-owner-1"]), true);
+  assert.deepEqual({ claimed, sent, marked }, { claimed: 1, sent: 1, marked: 1 });
 });
 
 test("synchronous dispatch failure retains the create-once claim and uses fallback", async () => {
@@ -127,7 +154,9 @@ test("post-send mark failure keeps live dedup and never releases the ambiguous d
   });
   assert.equal(coordinator.enqueue(report("delegate-ambiguous-1")), true);
   assert.equal(await coordinator.flush(), true, "the custom wake was already accepted");
-  assert.deepEqual(phases, ["mark"]);
+  assert.deepEqual(phases, [], "the report is not marked until Pi starts the custom message");
+  assert.equal(await coordinator.acknowledge(["delegate-ambiguous-1"]), false, "the failing acknowledgement must not be reported as durable");
+  assert.deepEqual(phases, ["ack"]);
   assert.equal(coordinator.enqueue(report("delegate-ambiguous-1")), false);
 });
 

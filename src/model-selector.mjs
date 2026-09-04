@@ -38,7 +38,11 @@ const SAFE_REASON = /^[A-Za-z0-9 _.-]{1,120}$/;
 
 const DEFAULT_LATENCY_BUDGET_MS = 120_000;
 // No money dimension: the broker cannot observe spend, so it budgets what it can enforce.
-const DEFAULT_BUDGET = Object.freeze({ maxInputTokens: 200_000, maxOutputTokens: 16_000, maxAttempts: 8 });
+// Input is cumulative across agent turns and must be reserved before each send using canonical
+// UTF-8 bytes — a safe upper bound that is commonly ~4x observed tokens. A 200k default therefore
+// rejected healthy multi-step work around 125k observed tokens. One million preserves a finite
+// hard ceiling while accommodating one near-context-window request plus preceding tool turns.
+const DEFAULT_BUDGET = Object.freeze({ maxInputTokens: 1_000_000, maxOutputTokens: 16_000, maxAttempts: 8 });
 
 /**
  * Keyword evidence for each capability beyond plain text generation. Matching is intentionally

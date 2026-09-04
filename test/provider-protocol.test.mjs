@@ -201,7 +201,7 @@ test("duplicate and retyped blocks are fatal; deltas after close are fatal", () 
   assert.throws(() => assembler.accept(frame("text_delta", { index: 0, delta: "late" })), /block_not_open/);
 });
 
-test("tool_call identity is fixed at block_start and cannot mutate via deltas", () => {
+test("Codex compound tool_call identity is fixed at block_start and cannot mutate via deltas", () => {
   const assembler = newAssembler();
   assembler.accept(frame("attempt_accepted"));
   assembler.accept(frame("provider_send_started"));
@@ -209,7 +209,7 @@ test("tool_call identity is fixed at block_start and cannot mutate via deltas", 
     () => assembler.accept(frame("block_start", { index: 0, blockType: "tool_call", name: "bash" }, { seq: 2 })),
     /bounded id/,
   );
-  assembler.accept(frame("block_start", { index: 1, blockType: "tool_call", id: "call-1", name: "bash" }));
+  assembler.accept(frame("block_start", { index: 1, blockType: "tool_call", id: "call-1|fc-1", name: "bash" }));
   assert.throws(
     () => assembler.accept(frame("tool_call_delta", { index: 1, delta: "{}", id: "call-2" }, { seq: 3 })),
     (error) => error.reasonCode === "tool_call_identity_mutation",

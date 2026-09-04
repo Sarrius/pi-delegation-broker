@@ -51,6 +51,11 @@ assert.equal(wake.options.deliverAs, "followUp");
 assert.equal(wake.options.triggerTurn, true);
 assert.match(wake.message.content, new RegExp(result.details.taskId));
 assert.match(wake.message.content, /NOT a user request/);
+// The durable wake marker is acknowledged by the actual custom-message lifecycle, not by the
+// enqueue call. This models Pi consuming the hidden follow-up after the host accepts it.
+await hooks.get("message_start")?.({ message: {
+  role: "custom", customType: wake.message.customType, details: wake.message.details,
+} }, ctx);
 await new Promise((resolve) => setTimeout(resolve, 25));
 const report = JSON.parse(await (await import("node:fs/promises")).readFile(
   join(agent, "delegation-broker", "reports", `${result.details.taskId}.json`), "utf8",

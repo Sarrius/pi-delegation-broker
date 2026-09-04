@@ -27,6 +27,7 @@ const LOCK_NAME = "broker.lock";
 // macOS permits roughly 104 bytes for a Unix-domain socket path; stay below
 // the narrower common limit so startup fails clearly instead of listen(EINVAL).
 const MAX_SOCKET_PATH_BYTES = 100;
+const RUNTIME_NAMESPACE = /^[a-f0-9]{16}$/;
 // A live owner may still be between lock creation and socket listen. Keep that short startup
 // window fail-closed, but do not mistake a recycled PID for a live broker after the window.
 const LOCK_STARTUP_GRACE_MS = 30_000;
@@ -80,6 +81,7 @@ function deepFreeze(value) {
  */
 export class SingleHostBrokerSupervisor {
   #stateDir;
+  #runtimeNamespace;
   #registry;
   #registryStatus;
   #controllerToken;
@@ -108,6 +110,7 @@ export class SingleHostBrokerSupervisor {
 
   constructor({
     stateDir,
+    runtimeNamespace,
     registry,
     signedRegistry,
     trustedRegistryKeys,
@@ -149,7 +152,11 @@ export class SingleHostBrokerSupervisor {
       this.#registryStatus = Object.freeze({ source: "unsigned_fixture" });
     }
     this.#stateDir = requireOwnerOnlyDirectory(stateDir);
-    if (Buffer.byteLength(join(this.#stateDir, SOCKET_NAME)) > MAX_SOCKET_PATH_BYTES) {
+    if (runtimeNamespace !== undefined && (typeof runtimeNamespace !== "string" || !RUNTIME_NAMESPACE.test(runtimeNamespace))) {
+      throw new Error("Broker runtimeNamespace must be 16 lowercase hexadecimal characters");
+    }
+    this.#runtimeNamespace = runtimeNamespace;
+    if (Buffer.byteLength(this.socketPath) > MAX_SOCKET_PATH_BYTES) {
       throw new Error(`Broker stateDir makes Unix socket path exceed ${MAX_SOCKET_PATH_BYTES} bytes`);
     }
     if (!Number.isInteger(sweepIntervalMs) || sweepIntervalMs < 100 || sweepIntervalMs > 60_000) {
@@ -195,7 +202,9 @@ export class SingleHostBrokerSupervisor {
   }
 
   get stateDir() { return this.#stateDir; }
-  get socketPath() { return join(this.#stateDir, SOCKET_NAME); }
+  // Embedded Pi controllers share the durable SQLite capacity ledger, but each owns a distinct
+  // socket/token pair. The legacy unnamed mode remains available for standalone supervision.
+  get socketPath() { return join(this.#stateDir, this.#runtimeNamespace ? `broker-${this.#runtimeNamespace}.sock` : SOCKET_NAME); }
   get databasePath() { return join(this.#stateDir, DATABASE_NAME); }
   /** Controller-only bootstrap capability; never put this in a child policy. */
   get controllerToken() { return this.#controllerToken; }
@@ -319,7 +328,7 @@ export class SingleHostBrokerSupervisor {
     return this.status();
   }
 
-  #lockPath() { return join(this.#stateDir, LOCK_NAME); }
+  #lockPath() { return join(this.#stateDir, this.#runtimeNamespace ? `broker-${this.#runtimeNamespace}.lock` : LOCK_NAME); }
 
   async #acquireLock() {
     const lockPath = this.#lockPath();

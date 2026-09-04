@@ -39,8 +39,9 @@ const CAPABILITY_FIELDS = [
 const OBSERVE_TOOLS = Object.freeze(["read", "grep", "ls", "find", "test"]);
 const OBSERVE_TOOL_SET = Object.freeze(new Set(OBSERVE_TOOLS));
 
-export function isImplicitlyDeclaredObserveTool(toolName) {
-  return typeof toolName === "string" && OBSERVE_TOOL_SET.has(toolName);
+export function isImplicitlyDeclaredObserveTool(toolName, allowedTools) {
+  const canonical = canonicalDeclaredToolName(toolName, allowedTools);
+  return typeof canonical === "string" && OBSERVE_TOOL_SET.has(canonical);
 }
 
 /**

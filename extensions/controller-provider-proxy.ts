@@ -8,11 +8,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { streamProviderIpc } from "../src/ipc.mjs";
-import { proxyCanonicalContext, proxyTerminalError } from "../src/proxy-context.mjs";
+import { proxyCanonicalContext, proxyTerminalError, TOOL_CALL_ID, TOOL_NAME } from "../src/proxy-context.mjs";
 
 const PROVIDER_ID = "broker-proxy";
-const TOOL_CALL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 
 function nonNegative(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;

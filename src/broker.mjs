@@ -650,8 +650,9 @@ export class SqliteLeaseBroker {
 
   /**
    * Reserve a conservative controller-side input upper bound before a real provider send.
-   * The real proxy supplies canonical UTF-8 bytes, which are an upper bound on token count and
-   * therefore intentionally reject some large-but-valid prompts rather than overspend a hard cap.
+   * The real proxy supplies canonical UTF-8 bytes, which are an upper bound on token count.
+   * The reservation is reconciled to observed provider usage when the stream settles; keeping
+   * the upper bound until then is fail-closed for a provider that dies without reporting usage.
    */
   reserveProviderInput(leaseId, fencingToken, inputUpperBound, now) {
     return this.#transaction(() => {
@@ -674,8 +675,15 @@ export class SqliteLeaseBroker {
     });
   }
 
-  /** Record observed provider usage and enforce cumulative per-lease output/input limits. */
-  recordProviderUsage(leaseId, fencingToken, usage, now, { inputReserved = false } = {}) {
+  /**
+   * Record observed provider usage and enforce cumulative per-lease output/input limits.
+   *
+   * A real stream reserves a conservative UTF-8-byte upper bound before dispatch. When the
+   * provider reports usage, pass that reservation back so the ledger is reconciled to the
+   * observed amount instead of charging the upper bound forever. Boolean `inputReserved: true`
+   * remains supported for older callers that intentionally already accounted the input.
+   */
+  recordProviderUsage(leaseId, fencingToken, usage, now, { inputReserved = false, reservedInputUpperBound } = {}) {
     return this.#transaction(() => {
       this.#assertNondecreasingTime(now);
       const lease = this.#db.prepare("SELECT * FROM leases WHERE lease_id = ? AND fencing_token = ? AND expires_at > ?")
@@ -684,10 +692,17 @@ export class SqliteLeaseBroker {
       if (!usage || typeof usage !== "object" || ["input", "output", "cacheRead", "cacheWrite"].some((key) => !Number.isSafeInteger(usage[key] ?? 0) || (usage[key] ?? 0) < 0)) {
         return { status: "denied_budget", reason: "invalid provider usage" };
       }
+      if (reservedInputUpperBound !== undefined
+        && (!Number.isSafeInteger(reservedInputUpperBound) || reservedInputUpperBound < 0
+          || reservedInputUpperBound > (lease.input_tokens_used ?? 0))) {
+        return { status: "denied_budget", reason: "invalid input reservation" };
+      }
       const enforcement = parseJson(lease.enforcement);
       const inputObserved = (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-      const inputDelta = inputReserved && enforcement.input === "hard" ? 0 : inputObserved;
-      const inputUsed = (lease.input_tokens_used ?? 0) + inputDelta;
+      const inputDelta = reservedInputUpperBound !== undefined
+        ? inputObserved - reservedInputUpperBound
+        : inputReserved && enforcement.input === "hard" ? 0 : inputObserved;
+      const inputUsed = Math.max(0, (lease.input_tokens_used ?? 0) + inputDelta);
       const outputUsed = (lease.output_tokens_used ?? 0) + (usage.output ?? 0);
       if (enforcement.input === "hard" && lease.max_input_tokens !== null && inputUsed > lease.max_input_tokens) {
         this.#record(now, "BudgetExceeded", { leaseId, dimension: "input", used: inputUsed, cap: lease.max_input_tokens });
@@ -699,7 +714,14 @@ export class SqliteLeaseBroker {
       }
       this.#db.prepare("UPDATE leases SET input_tokens_used = ?, output_tokens_used = ? WHERE lease_id = ? AND fencing_token = ?")
         .run(inputUsed, outputUsed, leaseId, fencingToken);
-      this.#record(now, "ProviderUsageObserved", { leaseId, input: usage.input ?? 0, output: usage.output ?? 0, inputTokensUsed: inputUsed, outputTokensUsed: outputUsed });
+      this.#record(now, "ProviderUsageObserved", {
+        leaseId,
+        input: usage.input ?? 0,
+        output: usage.output ?? 0,
+        ...(reservedInputUpperBound === undefined ? {} : { reservedInputUpperBound, inputDelta }),
+        inputTokensUsed: inputUsed,
+        outputTokensUsed: outputUsed,
+      });
       return { status: "recorded", inputTokensUsed: inputUsed, outputTokensUsed: outputUsed };
     });
   }

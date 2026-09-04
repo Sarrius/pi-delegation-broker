@@ -49,7 +49,7 @@ function readWakeSentMarker(root, taskId, completedAt) {
     if (!Number.isSafeInteger(marker.wakeAt) || marker.wakeAt < completedAt) throw new Error("malformed wake marker");
     return marker.wakeAt;
   } catch {
-    // A malformed sent marker follows an accepted host dispatch. Fail closed
+    // A malformed consumption marker follows an accepted host lifecycle event. Fail closed
     // against a duplicate wake by treating its timestamp as durable.
     try { return Math.max(completedAt, Math.floor(statSync(path).mtimeMs)); }
     catch { return completedAt; }
@@ -250,7 +250,7 @@ export function claimReportWake(root, taskId, now = Date.now()) {
   }
 }
 
-/** Mark a terminal report's automatic parent wake as dispatched. */
+/** Mark a terminal report's automatic parent wake as consumed by Pi. */
 export function markReportWoken(root, taskId, now = Date.now()) {
   const report = readReport(root, taskId);
   if (!report) return undefined;

@@ -70,6 +70,7 @@ test("an effect-capable task never lands on the weakest class and is budgeted in
   // Consumption is hard because the controller can actually enforce it. There is no money
   // dimension at all: the broker never observes spend, so it does not pretend to bound it.
   assert.deepEqual(selected.contract.budget.enforcement, { input: "hard", output: "hard" });
+  assert.equal(selected.contract.budget.maxInputTokens, 1_000_000, "default cumulative input accommodates byte-safe reservation across agent turns");
   assert.equal(selected.contract.budget.maxCostMicros, undefined);
 });
 

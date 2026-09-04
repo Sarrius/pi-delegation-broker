@@ -28,6 +28,10 @@ const FAILURE_SIGNATURES = Object.freeze([
   // Capability/organization policy rejection is route-specific: the same task can run on
   // another account/model, so quarantine this resource and let controller failover continue.
   Object.freeze({ kind: "unavailable", pattern: /\b(unsupported_value|reasoning summaries|organization must be verified|model is not supported)\b/i }),
+  // A hard controller input/output cap is a task-budget terminal, not provider health evidence.
+  // Retrying the same transcript on another route would spend another lease without repairing
+  // the exhausted task budget; the caller needs an explicit bounded failure instead.
+  Object.freeze({ kind: "budget_exhausted", pattern: /\bcontroller (?:input|output) budget exhausted:\s*(?:input|output)_budget_exceeded\b/i }),
   // A controller route can disappear after catalog admission (for example, a model slot was
   // replaced in Pi's live registry). This is route unavailability, not task failure: exclude the
   // exact resource and let the controller try the remaining eligible pool.
@@ -485,10 +489,10 @@ export class BrokeredChildRunner {
           await this.#reportUnavailable(resourceId, "provider unavailable", failures >= 2 ? "capacity_group" : "resource");
         }
         // A context overflow leaves the provider healthy — only this route is wrong.
-        if (kind !== "context_exhausted") excludeResources.push(resourceId);
+        if (kind !== "context_exhausted" && kind !== "budget_exhausted") excludeResources.push(resourceId);
       }
       if (resourceId !== undefined && kind === "incomplete") excludeResources.push(resourceId);
-      if (kind === "fatal" || attempt === routeAttemptLimit) break;
+      if (kind === "fatal" || kind === "budget_exhausted" || attempt === routeAttemptLimit) break;
 
       this.#clearAttempt(attemptId);
       visibleAttemptId = undefined;
