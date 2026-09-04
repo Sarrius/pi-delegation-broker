@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { captureLosslessJson } from "./lossless-json.mjs";
+import { TOOL_CALL_ID, TOOL_NAME } from "./tool-identity.mjs";
 
 /**
  * Deterministic protocol machinery for the controller-owned provider proxy
@@ -11,9 +12,7 @@ import { captureLosslessJson } from "./lossless-json.mjs";
 export const PROVIDER_PROTOCOL_VERSION = 1;
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const TOOL_CALL_ID = /^(?=.{1,128}$)[A-Za-z0-9][A-Za-z0-9._:-]*(?:\|[A-Za-z0-9][A-Za-z0-9._:-]*)?$/;
 const HEX64 = /^[a-f0-9]{64}$/;
-const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 
 export class ProviderProtocolError extends Error {
   constructor(reasonCode, detail) {

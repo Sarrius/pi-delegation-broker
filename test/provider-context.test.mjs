@@ -53,6 +53,15 @@ test("provider context validates Codex compound tool-call replay as a closed con
   }));
   assert.equal(captured.value.messages[1].content[0].arguments.path, "greeting.txt");
   assert.equal(captured.value.messages[2].isError, false);
+  const cursorId = "call_2\nfc_2";
+  const cursor = captureProviderContext(context({
+    messages: [
+      { role: "user", content: "read README.md" },
+      { role: "assistant", content: [{ type: "toolCall", id: cursorId, name: "read", arguments: { path: "README.md" } }] },
+      { role: "toolResult", toolCallId: cursorId, toolName: "read", content: "ok", isError: false },
+    ],
+  }));
+  assert.equal(cursor.value.messages[2].toolCallId, cursorId);
   assert.throws(() => captureProviderContext(context({
     messages: [{ role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "write", arguments: {} }] }],
   })), /not an approved tool/);
