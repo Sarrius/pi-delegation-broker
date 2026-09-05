@@ -449,6 +449,11 @@ export class AnthropicMessagesTransport {
   async *stream(snapshot, context, { signal, onSendStarted } = {}) {
     validateSnapshot(snapshot);
     const capturedContext = captureRequestContext(snapshot, context);
+    // Adapter compatibility is public route/context metadata. Reject an image/tool-result replay
+    // before even resolving the exact credential; this text-only adapter must never become a
+    // late secret-bearing detour for a vision-capable route.
+    normalizeMessages(capturedContext.value);
+    normalizeTools(capturedContext.value);
     if (signal?.aborted) {
       yield { type: "terminal", outcome: "cancelled_before_send", payload: {} };
       return;

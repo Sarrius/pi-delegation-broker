@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildFleetProjection, formatFleetDetails, formatFleetWidget, terminalWidth } from "../src/fleet-view.mjs";
+import { buildFleetProjection, formatDelegationStatus, formatFleetDetails, formatFleetWidget, terminalWidth } from "../src/fleet-view.mjs";
 
 const NOW = 1_000_000;
 
@@ -50,6 +50,34 @@ test("fleet projection overlays volatile attempts on durable task and workflow n
   assert.equal(fleet.counts.running, 1);
   assert.equal(fleet.counts.retrying, 1);
   assert.equal(fleet.counts.stalled, 1);
+});
+
+test("delegation status reports volatile route waits instead of durable running promises", () => {
+  const job = {
+    jobId: "workflow-live", kind: "workflow", status: "running", submittedAt: NOW - 10_000, updatedAt: NOW,
+    nodes: [
+      { id: "working", state: "running", dependsOn: [] },
+      { id: "waiting", state: "running", dependsOn: [] },
+    ],
+  };
+  const fleet = buildFleetProjection({
+    now: NOW,
+    jobs: [job],
+    attempts: [{
+      attemptId: "workflow-live-working", logicalId: "workflow-live/working", rootId: "workflow-live",
+      workflowId: "workflow-live", nodeId: "working", kind: "workflow_node", attempt: 1, state: "running",
+      resourceId: "cursor/composer-2.5", provider: "cursor", modelId: "composer-2.5",
+      startedAt: NOW - 5_000, lastProgressAt: NOW - 1_000, usage: {},
+    }, {
+      attemptId: "workflow-live-waiting-r2", logicalId: "workflow-live/waiting", rootId: "workflow-live",
+      workflowId: "workflow-live", nodeId: "waiting", kind: "workflow_node", attempt: 2, state: "waiting_capacity",
+      startedAt: NOW - 4_000, usage: {},
+    }],
+  });
+  const status = formatDelegationStatus(job, fleet);
+  assert.match(status, /working: running \(cursor\/composer-2\.5/);
+  assert.match(status, /waiting: waiting_capacity \(route:pending; durable=running/);
+  assert.doesNotMatch(status, /waiting: running(?:\n|$)/);
 });
 
 test("fleet widget is bounded, identifies real routes, and never includes task prose", () => {

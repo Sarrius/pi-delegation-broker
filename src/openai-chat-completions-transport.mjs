@@ -222,13 +222,15 @@ export class OpenAIChatCompletionsTransport {
   async *stream(snapshot, context, { signal, onSendStarted } = {}) {
     validateSnapshot(snapshot);
     const captured = captureRequestContext(snapshot, context);
+    // Compatibility is decidable without credentials. Preserve the adapter's strict
+    // text-only boundary and reject image/tool replay before exact secret resolution.
+    const { request } = requestFromCapturedContext(snapshot, captured);
     if (signal?.aborted) {
       yield { type: "terminal", outcome: "cancelled_before_send", payload: {} };
       return;
     }
     const credential = await this.#credentialResolver(snapshot);
     const auth = authHeadersForCredential(credential);
-    const { request } = requestFromCapturedContext(snapshot, captured);
     const endpoint = parseEndpoint(await this.#endpointResolver(snapshot));
     if (signal?.aborted) {
       yield { type: "terminal", outcome: "cancelled_before_send", payload: {} };

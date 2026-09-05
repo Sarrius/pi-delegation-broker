@@ -71,6 +71,11 @@ test("explicit tool selection retains controller behavioral tools", async () => 
       },
     });
     assert.ok(spawned.session);
+    // Broker routing is explicit and never inherits settings.json. This is the independence seam
+    // with pi-multi-account: the parent may rotate its live session or Pi may keep selections
+    // session-scoped, while every leased child still launches on exactly this provider/model.
+    assert.equal(argv[argv.indexOf("--provider") + 1], "zai");
+    assert.equal(argv[argv.indexOf("--model") + 1], "glm-5.3");
     const toolsIndex = argv.indexOf("--tools");
     assert.notEqual(toolsIndex, -1);
     assert.equal(argv[toolsIndex + 1], "read,broker_declare_action,broker_checkpoint,propose_patch");

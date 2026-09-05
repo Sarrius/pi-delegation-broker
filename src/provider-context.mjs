@@ -6,6 +6,10 @@ import { TOOL_CALL_ID, TOOL_NAME } from "./tool-identity.mjs";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const MESSAGE_ROLES = new Set(["user", "assistant", "toolResult"]);
+const IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+export const MAX_PROVIDER_IMAGE_DATA_CHARS = 6 * 1024 * 1024;
+export const MAX_PROVIDER_CONTEXT_BYTES = 8 * 1024 * 1024;
 
 function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value)
@@ -48,6 +52,39 @@ function validateToolCall(block, label, toolNames) {
   validateToolArguments(block.arguments, `${label}.arguments`);
 }
 
+function validateImageBlock(block, label) {
+  if (!isPlainObject(block)) throw new Error(`${label} must be a plain object`);
+  exactKeys(block, ["type", "data", "mimeType"], label);
+  if (block.type !== "image") throw new Error(`${label}.type is unsupported`);
+  if (typeof block.mimeType !== "string" || !IMAGE_MIME_TYPES.has(block.mimeType)) {
+    throw new Error(`${label}.mimeType is unsupported`);
+  }
+  if (typeof block.data !== "string" || block.data.length === 0
+    || block.data.length > MAX_PROVIDER_IMAGE_DATA_CHARS || !BASE64.test(block.data)) {
+    throw new Error(`${label}.data must be bounded canonical base64`);
+  }
+}
+
+function validateInputContent(content, label) {
+  if (typeof content === "string") {
+    boundedText(content, label, 256 * 1024);
+    return;
+  }
+  if (!Array.isArray(content) || content.length > 128) {
+    throw new Error(`${label} must be text or a bounded text/image block array`);
+  }
+  for (const [index, block] of content.entries()) {
+    const blockLabel = `${label}[${index}]`;
+    if (!isPlainObject(block)) throw new Error(`${blockLabel} must be a plain object`);
+    if (block.type === "text") {
+      exactKeys(block, ["type", "text"], blockLabel);
+      boundedText(block.text, `${blockLabel}.text`, 256 * 1024);
+    } else {
+      validateImageBlock(block, blockLabel);
+    }
+  }
+}
+
 function validateAssistantContent(content, label, toolNames, pending) {
   if (typeof content === "string") {
     boundedText(content, label, 256 * 1024);
@@ -77,7 +114,7 @@ function validateMessages(messages, toolNames) {
     if (!MESSAGE_ROLES.has(message.role)) throw new Error(`${label}.role is unsupported`);
     if (message.role === "user") {
       exactKeys(message, ["role", "content"], label);
-      boundedText(message.content, `${label}.content`, 256 * 1024);
+      validateInputContent(message.content, `${label}.content`);
       continue;
     }
     if (message.role === "assistant") {
@@ -88,7 +125,7 @@ function validateMessages(messages, toolNames) {
     exactKeys(message, ["role", "toolCallId", "toolName", "content", "isError"], label);
     boundedId(message.toolCallId, `${label}.toolCallId`, TOOL_CALL_ID);
     boundedId(message.toolName, `${label}.toolName`, TOOL_NAME);
-    boundedText(message.content, `${label}.content`, 256 * 1024);
+    validateInputContent(message.content, `${label}.content`);
     if (typeof message.isError !== "boolean") throw new Error(`${label}.isError must be boolean`);
     if (!pending.has(message.toolCallId)) throw new Error(`${label}.toolCallId has no matching assistant tool call`);
     if (pending.get(message.toolCallId) !== message.toolName) throw new Error(`${label}.toolName does not match its assistant tool call`);
@@ -117,7 +154,7 @@ function validateTools(tools) {
  * credential resolution or any provider send. Tool calls/results are replay
  * metadata, not permission: the controller separately binds tool names to the
  * effective child capability before admitting a tool-bearing stream. */
-export function captureProviderContext(context, { maxBytes = 512 * 1024 } = {}) {
+export function captureProviderContext(context, { maxBytes = MAX_PROVIDER_CONTEXT_BYTES } = {}) {
   const captured = captureLosslessJson(context, { maxBytes, maxNodes: 100_000, maxDepth: 32 });
   const value = captured.value;
   if (!isPlainObject(value)) throw new Error("context must be a plain object");

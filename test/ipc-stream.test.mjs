@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import test from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { SqliteLeaseBroker, fixtureContract, fixtureRegistry } from "../src/broker.mjs";
 import { createEffectiveChildCapability } from "../src/capability-compiler.mjs";
 import { BrokerIpcServer, requestBrokerIpc, streamProviderIpc } from "../src/ipc.mjs";
@@ -228,6 +230,38 @@ test("streaming failed_before_effect maps to transport_before_headers", async ()
   }
 });
 
+test("an illegal provider terminal preserves a bounded controller failure code", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "delegation-broker-controller-failure-"));
+  const broker = new SqliteLeaseBroker({ path: join(directory, "broker.sqlite"), registry: fixtureRegistry() });
+  const providerTransport = {
+    async *stream(_snapshot, _context, options) {
+      options.onSendStarted();
+      // auth_fatal is provider-owned and illegal before a headers frame.
+      yield { type: "terminal", outcome: "auth_fatal", payload: {} };
+    },
+  };
+  const server = new BrokerIpcServer({
+    broker,
+    socketPath: join(directory, "broker.sock"),
+    providerTransport,
+    routeResolver: async () => realRoute(),
+  });
+  await server.start();
+  try {
+    const capability = await reserveCapability(server, "stream-controller-failure");
+    const { terminal } = await streamProviderIpc({
+      socketPath: server.socketPath,
+      authorization: capability,
+      context: realContext(),
+    });
+    assert.equal(terminal.payload.outcome, "controller_failure");
+    assert.equal(terminal.payload.finishReason, "phase_invalid");
+  } finally {
+    await server.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("streaming budget exceeded when output exceeds hard cap", async () => {
   const { directory, server } = createServer();
   await server.start();
@@ -286,7 +320,14 @@ test("streaming rejects oversized context that exceeds the capture byte limit", 
       () => streamProviderIpc({
         socketPath: server.socketPath,
         authorization: capability,
-        context: { systemPrompt: "x".repeat(600_000), messages: [], tools: [] },
+        context: {
+          systemPrompt: "x",
+          messages: [{ role: "user", content: [
+            { type: "image", data: "a".repeat(4_220_000), mimeType: "image/png" },
+            { type: "image", data: "b".repeat(4_220_000), mimeType: "image/png" },
+          ] }],
+          tools: [],
+        },
       }),
       /byte limit/,
     );
@@ -443,6 +484,125 @@ test("real controller proxy enforces cumulative output on repeated streams under
     await server.stop();
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("real controller proxy meters read-only input without confusing UTF-8 bytes for provider tokens", async () => {
+  let dispatches = 0;
+  const { directory, broker, server } = createRealServer({
+    fetchImpl: async () => {
+      dispatches += 1;
+      return anthropicSse([
+        { event: "message_start", data: { message: { usage: { input_tokens: 1_000 } } } },
+        { event: "content_block_start", data: { index: 0, content_block: { type: "text", text: "" } } },
+        { event: "content_block_delta", data: { index: 0, delta: { type: "text_delta", text: "done" } } },
+        { event: "content_block_stop", data: { index: 0 } },
+        { event: "message_delta", data: { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } } },
+        { event: "message_stop", data: {} },
+      ]);
+    },
+  });
+  await server.start();
+  try {
+    const capability = await reserveCapability(server, "real-stream-metered-input", 100, {
+      budget: { maxInputTokens: 3_000, maxOutputTokens: 100, enforcement: { input: "metered_best_effort", output: "hard" } },
+    });
+    const context = realContext({ systemPrompt: "x".repeat(10_000) });
+    for (let index = 0; index < 3; index += 1) {
+      const result = await streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context });
+      assert.equal(result.terminal.payload.outcome, "succeeded_terminal");
+    }
+    await assert.rejects(
+      () => streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context }),
+      /controller input budget exhausted: input_budget_exceeded/,
+    );
+    assert.equal(dispatches, 3, "the request after observed usage reaches the cap is denied before dispatch");
+    assert.equal(broker.leases().length, 0);
+  } finally {
+    await server.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("incident used=804330 requested=236663 cap=1000000: hard proxy denies before dispatch, metered proxy sends", async () => {
+  // workflow-mtmzxk2i-4-evidence-audit: 27 turns reconciled to 804330 observed input tokens.
+  // The next canonical payload was 236663 UTF-8 bytes. Hard input added the byte bound onto the
+  // token ledger and denied (804330+236663>1000000) even though that turn's prompt tokens were 43630.
+  const incidentContext = realContext({ systemPrompt: "x".repeat(236_663) });
+  const seedObservedUsage = (broker) => {
+    const [lease] = broker.leases();
+    const now = Date.now();
+    assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 804330, now).status, "reserved");
+    assert.deepEqual(
+      broker.recordProviderUsage(lease.leaseId, lease.fencingToken, { input: 804330, output: 7301 }, now, {
+        inputReserved: true, reservedInputUpperBound: 804330,
+      }),
+      { status: "recorded", inputTokensUsed: 804330, outputTokensUsed: 7301 },
+    );
+  };
+  const withProxy = async (enforcement, verify) => {
+    let dispatches = 0;
+    const { directory, broker, server } = createRealServer({
+      fetchImpl: async () => {
+        dispatches += 1;
+        return anthropicSse([
+          { event: "message_start", data: { message: { usage: { input_tokens: 43_630 } } } },
+          { event: "content_block_start", data: { index: 0, content_block: { type: "text", text: "" } } },
+          { event: "content_block_delta", data: { index: 0, delta: { type: "text_delta", text: "ok" } } },
+          { event: "content_block_stop", data: { index: 0 } },
+          { event: "message_delta", data: { delta: { stop_reason: "end_turn" }, usage: { output_tokens: 453 } } },
+          { event: "message_stop", data: {} },
+        ]);
+      },
+    });
+    await server.start();
+    try {
+      const capability = await reserveCapability(server, `incident-proxy-${enforcement.input}`, 16_000, {
+        budget: { maxInputTokens: 1_000_000, maxOutputTokens: 16_000, enforcement },
+      });
+      seedObservedUsage(broker);
+      await verify({ broker, server, capability, dispatches: () => dispatches });
+    } finally {
+      await server.stop();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  };
+  await withProxy({ input: "hard", output: "hard" }, async ({ server, capability, dispatches }) => {
+    await assert.rejects(
+      () => streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: incidentContext }),
+      (error) => {
+        assert.match(error.message, /used=804330/);
+        assert.match(error.message, /cap=1000000/);
+        const requested = Number(/requested=(\d+)/.exec(error.message)?.[1]);
+        assert.ok(requested > 1_000_000 - 804330, `requested=${requested}`);
+        return true;
+      },
+    );
+    assert.equal(dispatches(), 0);
+  });
+  await withProxy({ input: "metered_best_effort", output: "hard" }, async ({ server, capability, dispatches }) => {
+    const result = await streamProviderIpc({
+      socketPath: server.socketPath, authorization: capability, context: incidentContext,
+    });
+    assert.equal(result.terminal.payload.outcome, "succeeded_terminal");
+    assert.equal(dispatches(), 1);
+  });
+});
+
+test("incident class UTF-8/token gap still holds in a freshly loaded process", async () => {
+  const worker = fileURLToPath(new URL("./fixtures/incident-input-cap-worker.mjs", import.meta.url));
+  const child = spawn(process.execPath, [worker], { stdio: ["ignore", "pipe", "pipe"] });
+  const stdout = [];
+  const stderr = [];
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => stdout.push(chunk));
+  child.stderr.on("data", (chunk) => stderr.push(chunk));
+  const code = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  assert.equal(code, 0, stderr.join("") || stdout.join(""));
+  assert.match(stdout.join(""), /PASS: incident 804330\/236663\/1000000/);
 });
 
 test("real controller proxy rejects an input payload over the hard controller cap before provider dispatch", async () => {

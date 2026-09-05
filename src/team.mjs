@@ -16,13 +16,16 @@ const JOIN_POLICIES = new Map([
   ["ensemble", new Set(["majority", "all_accepted", "adjudicated"])],
   ["reviewer", new Set(["reviewer_accepts"])],
 ]);
+const ROUTE_ATTEMPTS_PER_NODE = 8;
 const DEFAULT_BUDGETS = Object.freeze({
   maxNodes: 1_000,
   maxAppends: 100,
   maxParallel: 64,
   maxRedundant: 0,
-  // A workflow-sized root budget must leave room for one bounded route handoff per node.
-  // Callers can still provide a smaller explicit budget when that is intentional.
+  // A workflow-sized root budget must not make one node's normal bounded failover starve its
+  // siblings. The per-node controller contract defaults to eight physical route attempts, so
+  // the root default reserves that same allowance for every admitted member. Callers can still
+  // declare a smaller explicit cap when early termination is intentional.
   maxAttempts: 100_000,
 });
 
@@ -108,7 +111,7 @@ export function normalizeTeamBudgets(value = {}, { concurrency = 4 } = {}) {
     maxAppends: integer(value.maxAppends ?? DEFAULT_BUDGETS.maxAppends, "maxAppends", 0, 1000),
     maxParallel,
     maxRedundant: integer(value.maxRedundant ?? DEFAULT_BUDGETS.maxRedundant, "maxRedundant", 0, 1000),
-    maxAttempts: integer(value.maxAttempts ?? Math.min(DEFAULT_BUDGETS.maxAttempts, maxNodes * 2), "maxAttempts", 1, 100_000),
+    maxAttempts: integer(value.maxAttempts ?? Math.min(DEFAULT_BUDGETS.maxAttempts, maxNodes * ROUTE_ATTEMPTS_PER_NODE), "maxAttempts", 1, 100_000),
     ...(value.maxOutputTokens === undefined ? {} : { maxOutputTokens: integer(value.maxOutputTokens, "maxOutputTokens", 1, 2_000_000_000) }),
   };
   if (budgets.maxParallel > concurrency) fail("maxParallel cannot exceed workflow concurrency");

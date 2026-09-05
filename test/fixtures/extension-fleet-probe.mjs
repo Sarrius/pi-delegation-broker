@@ -18,11 +18,11 @@ writeFileSync(join(state, "enabled.json"), `${JSON.stringify({ enabled: false })
 
 const now = Date.now();
 writeFileSync(join(jobs, "queued-task.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "queued-task", kind: "task", status: "queued",
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "queued-task", kind: "task", status: "queued",
   task: "SENSITIVE_CHILD_PROMPT_MUST_NOT_RENDER", cwd: process.cwd(), submittedAt: now - 1000, updatedAt: now - 1000,
 })}\n`, { mode: 0o600 });
 writeFileSync(join(jobs, "done-task.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "done-task", kind: "task", status: "completed",
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "done-task", kind: "task", status: "completed",
   task: "SENSITIVE_TERMINAL_PROMPT_MUST_NOT_RENDER", cwd: process.cwd(), submittedAt: now - 5000,
   startedAt: now - 4000, completedAt: now - 2000, updatedAt: now - 2000,
 })}\n`, { mode: 0o600 });
@@ -35,7 +35,7 @@ writeFileSync(join(reports, "done-task.json"), `${JSON.stringify({
 })}\n`, { mode: 0o600 });
 // Crash windows: reports reached durability, but their task/node projection did not.
 writeFileSync(join(jobs, "orphan-task.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "orphan-task", kind: "task", status: "running", task: "orphan",
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "orphan-task", kind: "task", status: "running", task: "orphan",
   cwd: process.cwd(), submittedAt: now - 5000, startedAt: now - 4500, updatedAt: now - 4500,
 })}\n`, { mode: 0o600 });
 writeFileSync(join(reports, "orphan-task.json"), `${JSON.stringify({
@@ -43,7 +43,7 @@ writeFileSync(join(reports, "orphan-task.json"), `${JSON.stringify({
   startedAt: now - 4500, completedAt: now - 2500, readAt: null, wakeClaimedAt: null, wakeAt: now - 2500,
 })}\n`, { mode: 0o600 });
 writeFileSync(join(jobs, "cancelled-orphan.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "cancelled-orphan", kind: "task", status: "cancellation_requested", task: "cancelled",
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "cancelled-orphan", kind: "task", status: "cancellation_requested", task: "cancelled",
   cwd: process.cwd(), submittedAt: now - 5000, startedAt: now - 4500, cancelRequestedAt: now - 3000, updatedAt: now - 3000,
 })}\n`, { mode: 0o600 });
 writeFileSync(join(reports, "cancelled-orphan.json"), `${JSON.stringify({
@@ -51,7 +51,7 @@ writeFileSync(join(reports, "cancelled-orphan.json"), `${JSON.stringify({
   startedAt: now - 4500, completedAt: now - 2500, readAt: null, wakeClaimedAt: null, wakeAt: now - 2500,
 })}\n`, { mode: 0o600 });
 writeFileSync(join(jobs, "orphan-workflow.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "orphan-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "orphan-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
   concurrency: 1, submittedAt: now - 5000, startedAt: now - 4500, updatedAt: now - 4500,
   nodes: [{ id: "research", task: "research", dependsOn: [], inputs: [], state: "running" }],
 })}\n`, { mode: 0o600 });
@@ -63,7 +63,7 @@ writeFileSync(join(reports, "orphan-workflow-research.json"), `${JSON.stringify(
 
 // Pre-upgrade node reports had no logicalId and were keyed by the launch child id.
 writeFileSync(join(jobs, "legacy-workflow.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "legacy-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "legacy-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
   concurrency: 1, submittedAt: now - 5000, startedAt: now - 4500, updatedAt: now - 4500,
   nodes: [{ id: "research", task: "research", dependsOn: [], inputs: [], state: "running" }],
 })}\n`, { mode: 0o600 });
@@ -74,7 +74,7 @@ writeFileSync(join(reports, "legacy-workflow-research.json"), `${JSON.stringify(
 })}\n`, { mode: 0o600 });
 // A pre-upgrade node WITH dependency inputs stored the composed prompt, not the bare task.
 writeFileSync(join(jobs, "legacy-composed-workflow.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "legacy-composed-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "legacy-composed-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
   concurrency: 1, submittedAt: now - 5000, startedAt: now - 4500, updatedAt: now - 4500,
   nodes: [
     { id: "first", task: "first stage", dependsOn: [], inputs: [], state: "completed", result: { status: "completed", reportTaskId: "legacy-composed-workflow-first" } },
@@ -90,7 +90,7 @@ writeFileSync(join(reports, "legacy-composed-workflow-second.json"), `${JSON.str
 // A long node task truncates the stored report mid-header; that must still reconcile.
 const longTask = "L".repeat(1990);
 writeFileSync(join(jobs, "legacy-truncated-workflow.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "legacy-truncated-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "legacy-truncated-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
   concurrency: 1, submittedAt: now - 5000, startedAt: now - 4500, updatedAt: now - 4500,
   nodes: [{ id: "long", task: longTask, dependsOn: [], inputs: [], state: "running" }],
 })}\n`, { mode: 0o600 });
@@ -102,7 +102,7 @@ writeFileSync(join(reports, "legacy-truncated-workflow-long.json"), `${JSON.stri
 })}\n`, { mode: 0o600 });
 // A foreign report whose task merely EXTENDS the node's wording must not attach.
 writeFileSync(join(jobs, "prefix-workflow.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "prefix-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "prefix-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
   concurrency: 1, submittedAt: now - 5000, startedAt: now - 4500, updatedAt: now - 4500,
   nodes: [{ id: "research", task: "research", dependsOn: [], inputs: [], state: "running" }],
 })}\n`, { mode: 0o600 });
@@ -113,7 +113,7 @@ writeFileSync(join(reports, "prefix-workflow-research.json"), `${JSON.stringify(
 })}\n`, { mode: 0o600 });
 // A report whose own job file is missing must not be adopted as a node result either.
 writeFileSync(join(jobs, "orphaned-report-workflow.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "orphaned-report-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "orphaned-report-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
   concurrency: 1, submittedAt: now - 5000, startedAt: now - 4500, updatedAt: now - 4500,
   nodes: [{ id: "research", task: "research", dependsOn: [], inputs: [], state: "running" }],
 })}\n`, { mode: 0o600 });
@@ -126,12 +126,12 @@ writeFileSync(join(reports, "orphaned-report-workflow-research.json"), `${JSON.s
 // A real task whose id collides with a workflow's legacy node key must never be consumed
 // as that node's result.
 writeFileSync(join(jobs, "collide-workflow.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "collide-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "collide-workflow", kind: "workflow", status: "running", cwd: process.cwd(),
   concurrency: 1, submittedAt: now - 5000, startedAt: now - 4500, updatedAt: now - 4500,
   nodes: [{ id: "research", task: "research", dependsOn: [], inputs: [], state: "running" }],
 })}\n`, { mode: 0o600 });
 writeFileSync(join(jobs, "collide-workflow-research.json"), `${JSON.stringify({
-  schemaVersion: 1, jobId: "collide-workflow-research", kind: "task", status: "completed", task: "unrelated",
+  schemaVersion: 1, ownerSessionId: `ephemeral:${process.cwd()}`, jobId: "collide-workflow-research", kind: "task", status: "completed", task: "unrelated",
   cwd: process.cwd(), submittedAt: now - 5000, startedAt: now - 4500, completedAt: now - 2500, updatedAt: now - 2500,
 })}\n`, { mode: 0o600 });
 writeFileSync(join(reports, "collide-workflow-research.json"), `${JSON.stringify({

@@ -200,10 +200,17 @@ export class RepairController {
       }
       const reconciled = await this.#reconcile({ proposal, verified });
       if (!reconciled || reconciled.status !== "reconciled") { this.#store.transition(repairId, "failed", { reason: "repair reconciliation failed" }); return { status: "failed", repairId }; }
-      this.#store.transition(repairId, "verified", { reason: "controller verification and reconciliation passed" });
-      this.#defects.transition(proposal.defectId, "resolved", { reason: "verified repair" });
       await this.#resume({ rootId: proposal.rootId, taskId: proposal.taskId, repairId });
+      this.#store.transition(repairId, "verified", { reason: "controller verification, reconciliation and resume completed" });
+      this.#defects.transition(proposal.defectId, "resolved", { reason: "verified repair" });
       return { status: "verified", repairId };
+    } catch {
+      // An adapter exception is a failed attempt, not a permanently verifying proposal or a
+      // resolved defect whose original task never resumed. Do not persist raw adapter errors.
+      if (this.#store.read(repairId)?.status === "verifying") {
+        this.#store.transition(repairId, "failed", { reason: "controller repair gate threw" });
+      }
+      return { status: "failed", repairId };
     } finally { this.#active = undefined; }
   }
 }

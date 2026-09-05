@@ -36,6 +36,28 @@ test("orchestrator supplies a controller-owned physical-attempt gate and root ou
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("default root attempts cannot let one node's bounded failover starve its sibling", async () => {
+  const root = mkdtempSync(join(tmpdir(), "orchestrator-default-attempts-"));
+  try {
+    const o = new TaskOrchestrator({
+      path: join(root, "tasks.json"),
+      concurrency: 2,
+      run: async (node) => {
+        const grants = Array.from({ length: 8 }, () => node.attemptBudget.acquire().granted);
+        return grants.every(Boolean) ? { status: "completed" } : { status: "failed" };
+      },
+    });
+    o.initialize([
+      { id: "evidence-audit", task: "audit evidence" },
+      { id: "decision-review", task: "review decision" },
+    ], { budgets: { maxNodes: 2, maxParallel: 2 } });
+    const state = await o.execute();
+    assert.equal(state.team.budgets.maxAttempts, 16);
+    assert.equal(state.team.usage.startedAttempts, 16);
+    assert.equal(state.nodes.every((node) => node.state === "completed"), true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("orchestrator runs independent work in parallel and blocks dependents after failure", async () => {
   const root = mkdtempSync(join(tmpdir(), "orchestrator-"));
   const seen = [];

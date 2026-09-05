@@ -32,10 +32,11 @@ const FAILURE_SIGNATURES = Object.freeze([
   // Retrying the same transcript on another route would spend another lease without repairing
   // the exhausted task budget; the caller needs an explicit bounded failure instead.
   Object.freeze({ kind: "budget_exhausted", pattern: /\bcontroller (?:input|output) budget exhausted:\s*(?:input|output)_budget_exceeded\b/i }),
-  // A controller route can disappear after catalog admission (for example, a model slot was
-  // replaced in Pi's live registry). This is route unavailability, not task failure: exclude the
-  // exact resource and let the controller try the remaining eligible pool.
-  Object.freeze({ kind: "unavailable", pattern: /\bcontroller provider terminal:\s*controller_failure\b/i }),
+  // This closed terminal is emitted by the controller boundary itself, not by the provider.
+  // Keep it out of provider health accounting and do not churn through unrelated accounts as if
+  // changing models could repair the harness. Route-specific preflight failures have their own
+  // bounded unavailable reasons before a child starts.
+  Object.freeze({ kind: "controller_failure", pattern: /\bcontroller provider terminal:\s*controller_failure\b/i }),
   // Provider catalogs are observations, not authority. A model can disappear between discovery
   // and launch; its 404 is a stale route and must fail over, not kill otherwise valid work.
   Object.freeze({ kind: "unavailable", pattern: /\bmodel\b[^\n]{0,200}\bnot found\b|\b404\b[^\n]{0,300}\bnot_found_error\b/i }),
@@ -49,6 +50,10 @@ const FAILURE_SIGNATURES = Object.freeze([
   Object.freeze({ kind: "unavailable", pattern: /\b(50[0234]|transport_before_headers|service unavailable|bad gateway|upstream|connection (error|refused|reset)|econnrefused|etimedout|network)\b/i }),
   // A child that settles with no answer (expired lease IPC, empty final text) is a dead route.
   Object.freeze({ kind: "unavailable", pattern: /child completed without a result|controller lease heartbeat failed|broker behavioral monitor is unavailable/i }),
+  // A provider abort (Cursor/Pi "This operation was aborted", stopReason aborted) is a dead
+  // route, not a dead task. Operator abort() still sets status "aborted" / abortedEarly and
+  // that path stays fatal so a cancelled run cannot hop onto another account.
+  Object.freeze({ kind: "unavailable", pattern: /\bthis operation was aborted\b|\boperation was aborted\b|child was aborted(?: before completion)?|\baborterror\b/i }),
 ]);
 
 export function classifyChildFailure(text) {
@@ -466,7 +471,9 @@ export class BrokeredChildRunner {
         return finish(Object.freeze({ ...lastResult, id: childId, ...(verification ? { verification } : {}), route: Object.freeze(route) }));
       }
 
-      const kind = lastResult.status === "aborted" ? "fatal" : classifyChildFailure(lastResult.error ?? lastResult.text);
+      const kind = lastResult.status === "aborted" || abortedEarly()
+        ? "fatal"
+        : classifyChildFailure(lastResult.error ?? lastResult.text);
       this.#updateAttempt(attemptId, { state: "failed", failureKind: kind, lastEventAt: this.#now(), lastEventType: "attempt_failed" });
       route.push({ attempt, childId: attemptId, resourceId, outcome: kind, error: lastResult.error });
 
@@ -474,7 +481,7 @@ export class BrokeredChildRunner {
       // account is an observed fact about the fleet no matter which attempt saw it; reporting
       // it only when a retry follows means the route that fails last is never cooled, and the
       // next task selects that same exhausted account first and burns an attempt re-proving it.
-      if (resourceId !== undefined && kind !== "fatal" && kind !== "incomplete") {
+      if (resourceId !== undefined && kind !== "fatal" && kind !== "incomplete" && kind !== "controller_failure") {
         if (kind === "rate_limited" || kind === "account_exhausted") await this.#reportRateLimited(resourceId, lastResult.retryAfterMs);
         // A revoked/expired credential belongs to the account, not the model: condemning only
         // this resource makes the next hop retry a sibling model on the same dead credential.
@@ -492,7 +499,7 @@ export class BrokeredChildRunner {
         if (kind !== "context_exhausted" && kind !== "budget_exhausted") excludeResources.push(resourceId);
       }
       if (resourceId !== undefined && kind === "incomplete") excludeResources.push(resourceId);
-      if (kind === "fatal" || kind === "budget_exhausted" || attempt === routeAttemptLimit) break;
+      if (kind === "fatal" || kind === "budget_exhausted" || kind === "controller_failure" || attempt === routeAttemptLimit) break;
 
       this.#clearAttempt(attemptId);
       visibleAttemptId = undefined;
@@ -883,7 +890,10 @@ export class BrokeredChildRunner {
       const attempt = this.#attempts.get(handle.id);
       return attempt?.baseChildId === childId || attempt?.logicalId === childId;
     });
-    await Promise.allSettled(handles.map((handle) => handle.session?.abort?.()));
+    await Promise.allSettled(handles.map((handle) => {
+      handle.wasExternallyCancelled = true;
+      return handle.session?.abort?.();
+    }));
   }
 
   async dispose() {

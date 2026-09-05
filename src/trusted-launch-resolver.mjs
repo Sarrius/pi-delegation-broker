@@ -398,7 +398,12 @@ export class BrokeredLaunchResolver {
             // child's provider request itself; without it a child asks for the model maximum
             // and a low-balance account rejects the whole attempt.
             ...(lease.maxOutputTokens === undefined ? {} : { PI_BROKER_MAX_OUTPUT_TOKENS: String(lease.maxOutputTokens) }),
-            ...(this.#controllerProxy && resolvedModel?.modelId ? { PI_BROKER_PROXY_MODEL_ID: resolvedModel.modelId } : {}),
+            ...(this.#controllerProxy && resolvedModel?.modelId ? {
+              PI_BROKER_PROXY_MODEL_ID: resolvedModel.modelId,
+              PI_BROKER_PROXY_INPUT_MODALITIES: selection.contract.capability.required.includes("vision_input")
+                ? "text,image"
+                : "text",
+            } : {}),
             ...(this.#launcherAttestationConfig === undefined ? {} : { PI_BROKER_EXPECT_BEHAVIORAL_TOOLS: "1" }),
           },
           onBeforeChildAbandoned: async () => this.releaseUnhanded(request.childId),

@@ -2,13 +2,15 @@ import { randomBytes, createHash, randomUUID, timingSafeEqual } from "node:crypt
 import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { dirname } from "node:path";
-import { captureProviderContext } from "./provider-context.mjs";
+import { captureProviderContext, MAX_PROVIDER_CONTEXT_BYTES } from "./provider-context.mjs";
 import { captureLosslessJson } from "./lossless-json.mjs";
 import { compileEffectiveChildCapability } from "./capability-compiler.mjs";
 import { BehavioralRunMonitor } from "./behavior-monitor.mjs";
 import { ArtifactPipeline } from "./artifact-pipeline.mjs";
 import { AttemptSettlement, ProviderStreamAssembler, createAttemptRouteSnapshot, outcomeProperties } from "./provider-protocol.mjs";
-const MAX_REQUEST_BYTES = 1024 * 1024;
+// A single request may carry one bounded canonical multimodal context plus the small
+// lease/method envelope. Keep the wire bound explicit and only slightly above that context cap.
+const MAX_REQUEST_BYTES = MAX_PROVIDER_CONTEXT_BYTES + 512 * 1024;
 const THINKING_LEVELS = new Set("off minimal low medium high xhigh max".split(" "));
 // Runner attempt ids are `<logical-id>` and `<logical-id>-rN`. The controller derives the
 // logical lineage from the lease id rather than trusting a child-supplied root field.
@@ -49,6 +51,15 @@ function validateTtl(value) {
   if (value === undefined) return 30_000;
   if (!Number.isInteger(value) || value < 1_000 || value > 60_000) throw new Error("heartbeat ttlMs must be an integer between 1000 and 60000");
   return value;
+}
+
+function controllerFailureCode(error) {
+  const candidate = error && typeof error === "object"
+    ? (error.reasonCode ?? error.code)
+    : undefined;
+  return typeof candidate === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(candidate)
+    ? candidate
+    : "controller_stream_exception";
 }
 
 /**
@@ -367,7 +378,7 @@ export class BrokerIpcServer {
     if (!context || typeof context !== "object") throw new Error("stream requires typed context");
 
     // Phase 1: bounded lossless, closed-schema context ingress (before writes)
-    const captured = captureProviderContext(context, { maxBytes: 512 * 1024 });
+    const captured = captureProviderContext(context, { maxBytes: MAX_PROVIDER_CONTEXT_BYTES });
     const inputDigest = createHash("sha256").update(captured.canonical).digest("hex");
 
     // Phase 2: immutable route snapshot
@@ -505,7 +516,7 @@ export class BrokerIpcServer {
   async #realProviderStream(lease, params, signal, socket, requestId) {
     const context = params?.context;
     if (!context || typeof context !== "object") throw new Error("stream requires typed context");
-    const captured = captureProviderContext(context, { maxBytes: 512 * 1024 });
+    const captured = captureProviderContext(context, { maxBytes: MAX_PROVIDER_CONTEXT_BYTES });
     if (captured.value.tools.length > 0) {
       const bound = this.#broker.effectiveChildCapabilityForLease?.(lease.leaseId, lease.fencingToken, Date.now());
       const allowed = bound?.status === "bound" && Array.isArray(bound.capability?.allowedTools)
@@ -592,7 +603,7 @@ export class BrokerIpcServer {
       retryOwner: "broker",
       sdkMaxRetries: 0,
       deadlineAt: lease.expiresAt,
-      maxInputBytes: 512 * 1024,
+      maxInputBytes: MAX_PROVIDER_CONTEXT_BYTES,
       maxOutputBytes: 1_000_000,
       maxOutputTokens: remainingOutputTokens,
       });
@@ -729,7 +740,14 @@ export class BrokerIpcServer {
         throw new Error("provider transport emitted unknown normalized event");
       }
     } catch (error) {
-      if (!terminalSeen) settleAndApply({ type: "terminal", outcome: "controller_failure", payload: {} });
+      // Keep a closed, non-secret controller reason so an impossible phase/frame is diagnosable
+      // without exposing raw SDK/provider bodies. controller_failure remains controller-owned;
+      // the runner must never convert it into provider health evidence.
+      if (!terminalSeen) settleAndApply({
+        type: "terminal",
+        outcome: "controller_failure",
+        payload: { finishReason: controllerFailureCode(error) },
+      });
     }
     if (!terminalSeen) {
       settleAndApply({ type: "terminal", outcome: sendStarted ? "stream_truncated" : "controller_failure", payload: {} });

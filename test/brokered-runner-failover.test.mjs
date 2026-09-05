@@ -96,6 +96,36 @@ test("a provider rate limit is classified as a routing fact, not a child failure
   assert.equal(classifyChildFailure("controller lease heartbeat failed"), "unavailable");
   assert.equal(classifyChildFailure("broker behavioral monitor is unavailable"), "unavailable");
   assert.equal(classifyChildFailure("child stopped with an unresolved tool request"), "incomplete");
+  assert.equal(classifyChildFailure("This operation was aborted"), "unavailable");
+  assert.equal(classifyChildFailure("child was aborted before completion"), "unavailable");
+});
+
+test("a controller-local provider terminal fails visibly without poisoning or hopping routes", async () => {
+  const resolver = fakeResolver({ resources: [{ id: "acct-a/model" }, { id: "acct-b/model" }] });
+  let launches = 0;
+  const spawnChild = scriptedSpawn([
+    { error: "controller provider terminal: controller_failure" },
+    { text: "must not run" },
+  ]);
+  const { runner, root } = runnerWith(resolver, async (options) => {
+    launches += 1;
+    return spawnChild(options);
+  });
+
+  try {
+    const result = await runner.run({
+      childId: "job-controller-failure",
+      promptDigest: "c".repeat(64),
+      cwd: root,
+      prompt: "research",
+    });
+    assert.equal(result.status, "failed");
+    assert.equal(launches, 1, "a controller defect must not churn through provider routes");
+    assert.deepEqual(result.route.map((attempt) => attempt.outcome), ["controller_failure"]);
+    assert.deepEqual(resolver.reports, [], "controller-origin failure is not provider health evidence");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a child stopped at a tool request is retried without blaming provider health", async () => {
@@ -320,6 +350,100 @@ test("a child that settles with no answer fails over instead of reporting comple
     assert.equal(result.route[0].error, "child completed without a result");
     assert.equal(result.route[1].outcome, "completed");
     assert.equal(resolver.reports[0].kind, "unavailable");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a provider abort mid-run reroutes and the work still completes", async () => {
+  const resolver = fakeResolver({ resources: [{ id: "cursor/composer-2.5" }, { id: "kimi-coding/k3" }] });
+  const { runner, root } = runnerWith(resolver, scriptedSpawn([
+    { error: "This operation was aborted" },
+    { text: "finished on the fallback route" },
+  ]));
+
+  try {
+    const result = await runner.run({
+      childId: "job-provider-abort",
+      promptDigest: "c".repeat(64),
+      cwd: root,
+      prompt: "continue the review",
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.text, "finished on the fallback route");
+    assert.deepEqual(result.route.map((attempt) => [attempt.resourceId, attempt.outcome]), [
+      ["cursor/composer-2.5", "unavailable"],
+      ["kimi-coding/k3", "completed"],
+    ]);
+    assert.equal(resolver.reports[0].resourceId, "cursor/composer-2.5");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a child stopReason aborted is a dead route, not a completed answer", async () => {
+  const resolver = fakeResolver({ resources: [{ id: "acct-a/weak" }, { id: "acct-b/weak" }] });
+  const { runner, root } = runnerWith(resolver, scriptedSpawn([
+    { stopReason: "aborted", text: "I'll start by reading the project instructions." },
+    { text: "done elsewhere" },
+  ]));
+
+  try {
+    const result = await runner.run({
+      childId: "job-stop-aborted",
+      promptDigest: "c".repeat(64),
+      cwd: root,
+      prompt: "x",
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.route[0].outcome, "unavailable");
+    assert.match(result.route[0].error, /child was aborted/);
+    assert.equal(result.route[1].outcome, "completed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an operator abort does not fail over onto another provider", async () => {
+  const resolver = fakeResolver({ resources: [{ id: "acct-a/weak" }, { id: "acct-b/weak" }] });
+  let releasePrompt;
+  let spawned = 0;
+  const { runner, root } = runnerWith(resolver, async ({ spec }) => {
+    spawned += 1;
+    return {
+      resolved: { model: spec.model },
+      session: {
+        usage: { input: 1, output: 1 },
+        latestAssistantMessage: {
+          stopReason: "error",
+          errorMessage: "This operation was aborted",
+          content: [],
+        },
+        async prompt() {
+          await new Promise((resolve) => { releasePrompt = resolve; });
+        },
+        async abort() { releasePrompt?.(); },
+        async dispose() {},
+      },
+    };
+  });
+
+  try {
+    const completion = runner.run({
+      childId: "job-operator-abort",
+      promptDigest: "c".repeat(64),
+      cwd: root,
+      prompt: "x",
+    });
+    for (let i = 0; i < 100 && runner.activeAttempts()[0]?.state !== "running"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    assert.equal(runner.activeAttempts()[0]?.state, "running");
+    await runner.abort("job-operator-abort");
+    const result = await completion;
+    assert.equal(result.status, "aborted");
+    assert.equal(spawned, 1, "cancelled work must not hop onto the next account");
+    assert.equal(result.route.length, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

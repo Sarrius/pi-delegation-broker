@@ -1,5 +1,9 @@
 import { captureLosslessJson } from "./lossless-json.mjs";
-import { captureProviderContext } from "./provider-context.mjs";
+import {
+  captureProviderContext,
+  MAX_PROVIDER_CONTEXT_BYTES,
+  MAX_PROVIDER_IMAGE_DATA_CHARS,
+} from "./provider-context.mjs";
 export { TOOL_CALL_ID, TOOL_NAME } from "./tool-identity.mjs";
 import { TOOL_CALL_ID, TOOL_NAME } from "./tool-identity.mjs";
 
@@ -14,28 +18,27 @@ const ASSISTANT_METADATA = ["role", "content", "api", "provider", "model", "resp
 const TOOL_RESULT_METADATA = ["role", "toolCallId", "toolName", "content", "details", "usage", "addedToolNames", "isError", "timestamp"];
 const NON_PRINTABLE_TEXT = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 const MAX_PROVIDER_TEXT = 256 * 1024;
+const IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 function exactKeys(value, allowed, label) {
   for (const key of Object.keys(value)) if (!allowed.includes(key)) throw new Error(`${label} has unknown field ${key}`);
 }
 
-function textContent(content, label) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) throw new Error(`${label} must be text`);
-  let text = "";
-  for (const [index, block] of content.entries()) {
-    const blockLabel = `${label}[${index}]`;
-    if (!block || typeof block !== "object" || Array.isArray(block) || block.type !== "text" || typeof block.text !== "string") {
-      throw new Error(`${label} contains a non-text block`);
-    }
-    exactKeys(block, ["type", "text"], blockLabel);
-    text += block.text;
+function canonicalImageBlock(block, label) {
+  if (!block || typeof block !== "object" || Array.isArray(block)) throw new Error(`${label} must be an image block`);
+  exactKeys(block, ["type", "data", "mimeType"], label);
+  if (block.type !== "image" || typeof block.mimeType !== "string" || !IMAGE_MIME_TYPES.has(block.mimeType)) {
+    throw new Error(`${label} has unsupported image metadata`);
   }
-  return text;
+  if (typeof block.data !== "string" || block.data.length === 0
+    || block.data.length > MAX_PROVIDER_IMAGE_DATA_CHARS || !BASE64.test(block.data)) {
+    throw new Error(`${label}.data must be bounded canonical base64`);
+  }
+  return { type: "image", data: block.data, mimeType: block.mimeType };
 }
 
-function providerToolResultContent(content, label) {
-  const raw = textContent(content, label);
+function printableToolText(raw) {
   let escapedCount = 0;
   const escaped = raw.replace(NON_PRINTABLE_TEXT, (character) => {
     escapedCount += 1;
@@ -48,6 +51,26 @@ function providerToolResultContent(content, label) {
   if (projected.length <= MAX_PROVIDER_TEXT) return projected;
   const marker = `\n[Broker truncated tool result from ${projected.length} to ${MAX_PROVIDER_TEXT} characters.]`;
   return `${projected.slice(0, MAX_PROVIDER_TEXT - marker.length)}${marker}`;
+}
+
+function canonicalInputContent(content, label, { toolResult = false } = {}) {
+  if (typeof content === "string") return toolResult ? printableToolText(content) : content;
+  if (!Array.isArray(content) || content.length > 128) {
+    throw new Error(`${label} must be text or a bounded text/image block array`);
+  }
+  const blocks = content.map((block, index) => {
+    const blockLabel = `${label}[${index}]`;
+    if (!block || typeof block !== "object" || Array.isArray(block)) throw new Error(`${blockLabel} must be a block`);
+    if (block.type === "text") {
+      exactKeys(block, ["type", "text"], blockLabel);
+      if (typeof block.text !== "string") throw new Error(`${blockLabel}.text must be text`);
+      return { type: "text", text: toolResult ? printableToolText(block.text) : block.text };
+    }
+    return canonicalImageBlock(block, blockLabel);
+  });
+  return blocks.every((block) => block.type === "text")
+    ? blocks.map((block) => block.text).join("")
+    : blocks;
 }
 
 function schemaProjection(value, label, ancestors = new Set()) {
@@ -124,7 +147,7 @@ function canonicalMessage(message, index) {
   if (!message || typeof message !== "object" || Array.isArray(message)) throw new Error(`${label} must be an object`);
   if (message.role === "user") {
     exactKeys(message, USER_METADATA, label);
-    return { role: "user", content: textContent(message.content, `${label}.content`) };
+    return { role: "user", content: canonicalInputContent(message.content, `${label}.content`) };
   }
   if (message.role === "assistant") {
     exactKeys(message, ASSISTANT_METADATA, label);
@@ -142,7 +165,7 @@ function canonicalMessage(message, index) {
       // Pi's read tool can return binary files as strings (for example `.git/index`). The raw
       // result remains in the child transcript and behavioral digest, while the provider-facing
       // replay gets a deterministic printable projection instead of terminating the whole task.
-      content: providerToolResultContent(message.content, `${label}.content`),
+      content: canonicalInputContent(message.content, `${label}.content`, { toolResult: true }),
       isError: message.isError,
     };
   }
@@ -176,7 +199,7 @@ export function proxyCanonicalContext(context) {
     systemPrompt: context.systemPrompt ?? "",
     messages,
     tools,
-  }).value;
+  }, { maxBytes: MAX_PROVIDER_CONTEXT_BYTES }).value;
 }
 
 /** Map closed provider terminal outcomes to Pi stop/error semantics without leaking raw bodies. */
@@ -187,9 +210,15 @@ export function proxyTerminalError(terminal) {
   const status = terminal?.payload?.httpStatus;
   const reason = terminal?.payload?.providerReason;
   const safeReason = typeof reason === "string" && /^[a-z_]{1,64}$/.test(reason) ? reason : undefined;
+  const finishReason = terminal?.payload?.finishReason;
+  const safeControllerReason = outcome === "controller_failure"
+    && typeof finishReason === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(finishReason)
+    ? finishReason
+    : undefined;
   const detail = [
     Number.isSafeInteger(status) && status >= 100 && status <= 599 ? String(status) : undefined,
     safeReason,
+    safeControllerReason,
   ].filter(Boolean).join(", ");
   return detail ? `controller provider terminal: ${outcome} (${detail})` : `controller provider terminal: ${outcome}`;
 }

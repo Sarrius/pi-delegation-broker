@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fixtureContract, fixtureRegistry } from "../src/broker.mjs";
 import { ControllerEvidenceStore } from "../src/evidence.mjs";
+import { createSelectContract } from "../src/model-selector.mjs";
+import { catalogToBrokerRegistry } from "../src/provider-catalog.mjs";
 import { ControllerQueuedTaskVerifier, ControllerVerificationAuthority } from "../src/verification-authority.mjs";
 import { requestBrokerIpc } from "../src/ipc.mjs";
 import { signedRegistryMessage } from "../src/signed-registry.mjs";
@@ -622,6 +624,47 @@ test("a failing provisionChildAuth denies the launch, frees the lease, and remov
     await assert.rejects(() => resolver.resolve(request("child_fail")), /no credential for leased provider/);
     assert.equal(supervisor.auditSnapshot().leases.length, 0, "lease released after provisioning failure");
     assert.equal(existsSync(capturedDir), false, "agent dir removed after provisioning failure");
+  } finally {
+    await supervisor.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("observe launch lease keeps metered input against a hard catalog resource", async () => {
+  const registry = catalogToBrokerRegistry([{
+    provider: "solo",
+    baseUrl: "https://solo.example",
+    api: "openai-completions",
+    models: [
+      { id: "weak", name: "Weak", contextWindow: 32_000, maxTokens: 4_000, reasoning: false, input: ["text"] },
+      { id: "strong", name: "Strong", contextWindow: 400_000, maxTokens: 32_000, reasoning: true, input: ["text"] },
+    ],
+  }], { confidence: "measured" });
+  const root = mkdtempSync(join(tmpdir(), "br-observe-metered-"));
+  const supervisor = signedSupervisor(root, registry);
+  try {
+    await supervisor.start();
+    const resolver = resolverFor(supervisor, root, createSelectContract({
+      registry,
+      availability: () => supervisor.inventory(),
+    }));
+    const { model: _omit, ...withoutModel } = request("child_observe_metered");
+    const decision = await resolver.resolve({
+      ...withoutModel,
+      capabilityRequest: {
+        taskId: "observe-metered-launch",
+        taskDescription: "audit the repository and return evidence",
+        operationClass: "observe",
+        admissionClass: "work",
+      },
+    });
+    assert.equal(decision.action, "allow", decision.reason ?? "");
+    const [lease] = supervisor.auditSnapshot().leases;
+    const resource = supervisor.inventory().find((row) => row.resourceId === lease.resourceId);
+    assert.deepEqual(resource.enforcement, { input: "hard", output: "hard" });
+    assert.deepEqual(lease.enforcement, { input: "metered_best_effort", output: "hard" });
+    assert.deepEqual(decision.policy.authorizationPolicy.budget.enforcement, lease.enforcement);
+    await decision.policy.onBeforeChildAbandoned("test_cleanup");
   } finally {
     await supervisor.stop();
     rmSync(root, { recursive: true, force: true });

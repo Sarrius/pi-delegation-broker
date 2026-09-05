@@ -1,3 +1,5 @@
+> Product-policy update 2026-09-05: the historical "self-contained means delegate" rule below is retired. The current [integration product contract](INTEGRATION.md#delegation-product-contract-2026-09-05) defines delegation benefit, ownership, availability and learning. Historical sections explain previous decisions; they are not current agent instructions.
+
 # L1 routing policy: when the parent delegates, and to whom
 
 > **Superseded operationally on 2026-08-23.** The historical decision below explains why

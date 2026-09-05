@@ -49,7 +49,7 @@ export class ControllerVerifiedRoutingBoard {
   }
 
   /** Record the terminal outcome only after broker finalization has succeeded. */
-  recordFinalized({ taskId, leaseId, fencingToken, verification, outcome, resourceId, capabilities, latencyMs, tokens, attempts } = {}) {
+  recordFinalized({ taskId, leaseId, fencingToken, verification, outcome, resourceId, capabilities, latencyMs, tokens, attempts, context, observationId, learningResourceId } = {}) {
     if (typeof taskId !== "string" || !ID.test(taskId) || typeof leaseId !== "string" || !ID.test(leaseId)
       || !Number.isSafeInteger(fencingToken) || fencingToken < 1
       || typeof resourceId !== "string" || !ID.test(resourceId)
@@ -79,8 +79,10 @@ export class ControllerVerifiedRoutingBoard {
     // This is intentionally after receipt authentication and terminal-outcome matching. A child
     // cannot improve its own future routing score by reporting a convincing-looking success.
     this.#affinityJournal?.recordVerified({
-      resourceId,
+      resourceId: learningResourceId ?? resourceId,
       capabilities: requiredCapabilities,
+      ...(context ? {context} : {}),
+      ...(observationId ? {observationId} : {}),
       outcome: record.outcome,
       latencyMs,
       ...(tokens === undefined ? {} : { tokens }),

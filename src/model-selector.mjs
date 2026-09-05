@@ -23,6 +23,7 @@
 
 import { preferenceMatches, taskModelTier } from "./model-preferences.mjs";
 import { meetsQualityFloor, qualityForModel, QUALITY_TIERS } from "./model-quality-catalog.mjs";
+import { apexAdmissionAllows, apexAdmissionKind } from "./apex-admission.mjs";
 import { evaluateRouteEligibility, modelPolicyGeneration } from "./model-provenance-policy.mjs";
 
 const CONFIDENCE_RANK = Object.freeze({ measured: 0, observed: 1, assumed: 2 });
@@ -37,11 +38,12 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const SAFE_REASON = /^[A-Za-z0-9 _.-]{1,120}$/;
 
 const DEFAULT_LATENCY_BUDGET_MS = 120_000;
-// No money dimension: the broker cannot observe spend, so it budgets what it can enforce.
-// Input is cumulative across agent turns and must be reserved before each send using canonical
-// UTF-8 bytes — a safe upper bound that is commonly ~4x observed tokens. A 200k default therefore
-// rejected healthy multi-step work around 125k observed tokens. One million preserves a finite
-// hard ceiling while accommodating one near-context-window request plus preceding tool turns.
+// No money dimension: the broker cannot observe spend, so it budgets what it can measure.
+// Input is cumulative across agent turns. Exact provider token usage is only known after a send;
+// canonical UTF-8 bytes are the only safe pre-send upper bound, but routinely overstate English
+// JSON by 4-6x. Read-only work therefore defaults to metered_best_effort input: it may overshoot
+// by at most one controller-bounded request, then terminates. Effect-capable work keeps the strict
+// byte-safe hard reservation because false denial is preferable to unbounded effects.
 const DEFAULT_BUDGET = Object.freeze({ maxInputTokens: 1_000_000, maxOutputTokens: 16_000, maxAttempts: 8 });
 
 /**
@@ -177,7 +179,7 @@ function currencyIndex(currency) {
   return index;
 }
 
-function rankResources(entries, learnedRanker, capabilities, modelTier) {
+function rankResources(entries, learnedRanker, capabilities, modelTier, rankingOptions) {
   const baseline = [...entries].sort((left, right) => {
     const confidence = (CONFIDENCE_RANK[left.resource.confidence] ?? 3) - (CONFIDENCE_RANK[right.resource.confidence] ?? 3);
     if (confidence !== 0) return confidence;
@@ -191,7 +193,7 @@ function rankResources(entries, learnedRanker, capabilities, modelTier) {
   });
   if (typeof learnedRanker !== "function") return baseline;
   let ordered;
-  try { ordered = learnedRanker({ resourceIds: baseline.map((entry) => entry.id), capabilities }); } catch { return baseline; }
+  try { ordered = learnedRanker({ resourceIds: baseline.map((entry) => entry.id), capabilities, ...rankingOptions }); } catch { return baseline; }
   if (!Array.isArray(ordered) || ordered.length !== baseline.length || new Set(ordered).size !== baseline.length
     || ordered.some((id) => !baseline.some((entry) => entry.id === id))) return baseline;
   const positions = new Map(ordered.map((id, index) => [id, index]));
@@ -215,7 +217,7 @@ function candidateProfiles(registry, required) {
   return candidates.sort((left, right) => (left.extra - right.extra) || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
 }
 
-function buildBudget(constraints) {
+function buildBudget(constraints, { effectCapable = false } = {}) {
   const budget = { ...DEFAULT_BUDGET, ...(constraints.budget ?? {}) };
   // Token consumption is enforceable: the controller caps input and clamps the child's output
   // request. Money is not — no provider exposes a synchronous spend ledger, and subscription
@@ -230,7 +232,10 @@ function buildBudget(constraints) {
   if (Object.hasOwn(budget, "maxCostMicros") || Object.hasOwn(constraints.budget?.enforcement ?? {}, "cost")) {
     throw new Error("money budgets are not supported; constrain input/output tokens and learn efficiency from verified outcomes");
   }
-  const enforcement = constraints.budget?.enforcement ?? { input: "hard", output: "hard" };
+  const enforcement = constraints.budget?.enforcement ?? {
+    input: effectCapable ? "hard" : "metered_best_effort",
+    output: "hard",
+  };
   return Object.freeze({
     ...(Number.isSafeInteger(budget.maxInputTokens) ? { maxInputTokens: budget.maxInputTokens } : {}),
     ...(Number.isSafeInteger(budget.maxOutputTokens) ? { maxOutputTokens: budget.maxOutputTokens } : {}),
@@ -257,7 +262,10 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
   }
 
   const requirement = deriveTaskRequirement(taskDescription, constraints);
-  const budget = buildBudget(constraints);
+  const admissionMode = apexAdmissionKind(constraints.apexAdmission);
+  const budget = buildBudget(admissionMode === "rescue" ? {
+    ...constraints, budget: { ...constraints.budget, maxAttempts: Math.min(constraints.budget?.maxAttempts ?? 2, 2) },
+  } : constraints, { effectCapable: requirement.effectCapable });
   const hardBudget = requiresHardBudget(budget);
   const live = availabilityIndex(availability);
   const currencyLookup = currencyIndex(currency);
@@ -276,7 +284,8 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
 
   const profiles = candidateProfiles(registry, requirement.capabilities);
   if (profiles.length === 0) return deny("no approved profile supports the required capabilities");
-  const modelTier = taskModelTier(requirement, constraints.modelTier);
+  const modelTier = admissionMode ? "apex" : taskModelTier(requirement, constraints.modelTier);
+  if (modelTier === "apex" && !admissionMode) return deny("apex requires controller admission");
   const preferenceEntries = preferences?.tiers?.[modelTier] ?? [];
 
   let sawLegacy = false;
@@ -289,9 +298,13 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         if (excluded.has(id)) continue;
         if (allowedProviders && !allowedProviders.has(resource.model?.provider ?? id)) continue;
         const identity = resource.model ?? parseResourceModel(id);
+        const quality = qualityForModel(identity);
+        if (quality === "apex" && !apexAdmissionAllows(constraints.apexAdmission, identity, taskDescription)) continue;
+        if (admissionMode && (quality !== "apex" || !apexAdmissionAllows(constraints.apexAdmission, identity, taskDescription))) continue;
         if (requiredIdentity
           && (identity?.provider !== requiredIdentity.provider || identity?.modelId !== requiredIdentity.modelId)) continue;
-        const explicitlyAllowed = Boolean(userOnly && identity && preferenceMatches(preferenceEntries, identity));
+        const explicitlyAllowed = Boolean(admissionMode === "owner_primary"
+          || (userOnly && identity && preferenceMatches(preferenceEntries, identity)));
         if (userOnly && !explicitlyAllowed) continue;
         // Empty user tiers mean controller auto mode, not "any model the aggregator happens
         // to list". Require the researched quality floor before efficiency ranking can participate.
@@ -327,7 +340,17 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         // A class spanning several accounts can absorb one dying; a class living in one account
         // cannot. Surfacing it lets a caller prefer breadth when throughput matters.
         capacityGroups: Object.freeze([...new Set(entries.map((entry) => entry.resource.capacityGroup))]),
-        resources: Object.freeze(rankResources(entries, userOnly ? undefined : learnedRanker, requirement.capabilities, modelTier).map((entry) => Object.freeze({
+        resources: Object.freeze(rankResources(entries, userOnly || admissionMode ? undefined : learnedRanker, requirement.capabilities, modelTier, {context: constraints.learningContext})
+          .sort((left, right) => {
+            if (!admissionMode) return 0;
+            const anchor = constraints.apexAnchor ?? { modelId: "gpt-6-astra" };
+            const priority = (entry) => {
+              const model = entry.resource.model ?? parseResourceModel(entry.id);
+              if (model.modelId === anchor.modelId) return 0;
+              return model.modelId.startsWith(anchor.modelId.startsWith("gpt-") ? "gpt-" : "claude-") ? 1 : 2;
+            };
+            return priority(left) - priority(right);
+          }).map((entry) => Object.freeze({
           resourceId: entry.id,
           capacityGroup: entry.resource.capacityGroup,
           confidence: entry.resource.confidence,
@@ -368,7 +391,16 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
       : "no live resource serves the required capabilities");
   }
 
-  const chosen = tiers[0];
+  let chosen = tiers[0];
+  if (constraints.allowExploration === true && typeof learnedRanker === 'function' && preferenceSource !== 'user' && !admissionMode) {
+    const ids=chosen.resources.map(entry=>entry.resourceId);
+    try {
+      const ranked=learnedRanker({resourceIds:ids,capabilities:requirement.capabilities,context:constraints.learningContext,selectionId:constraints.taskId,explore:true});
+      if(Array.isArray(ranked) && ranked.length===ids.length && new Set(ranked).size===ids.length && ranked.every(id=>ids.includes(id))) {
+        chosen={...chosen,resources:[...chosen.resources].sort((a,b)=>ranked.indexOf(a.resourceId)-ranked.indexOf(b.resourceId))};
+      }
+    } catch { /* historical learning never widens eligibility or prevents dispatch */ }
+  }
   const preferred = chosen.resources[0];
   const expectedModel = preferred.model ?? parseResourceModel(preferred.resourceId);
   if (!expectedModel) return deny("selected resource carries no provider and model identity");
@@ -401,6 +433,7 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
       candidateCount: chosen.resources.length,
       capacityGroupCount: chosen.capacityGroups.length,
       modelTier,
+      ...(admissionMode ? { admissionMode } : {}),
       preferenceSource,
       policyGeneration: modelPolicyGeneration(preferences ?? { schemaVersion: 0 }),
       ...(preferred.provenance ? {

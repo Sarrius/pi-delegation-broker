@@ -12,6 +12,7 @@ import {
   selectModelForTask,
 } from "../src/model-selector.mjs";
 import { catalogToBrokerRegistry } from "../src/provider-catalog.mjs";
+import { authorizeApexRescue, createOwnerModelAdmission } from "../src/apex-admission.mjs";
 
 const DIGEST = "b".repeat(64);
 
@@ -56,6 +57,25 @@ test("a code task additionally asks for code reasoning", () => {
 test("a whole-repository task additionally asks for a large context", () => {
   const requirement = deriveTaskRequirement("audit the entire repository for unused exports");
   assert.ok(requirement.capabilities.includes("large_context"));
+});
+
+test("read-only work meters provider input instead of rejecting exact-token work from a byte upper bound", () => {
+  const registry = registryOf([account("solo")]);
+  const selected = selectModelForTask({
+    taskDescription: "audit the repository and return evidence",
+    registry,
+    constraints: baseConstraints({ operationClass: "observe" }),
+  });
+  assert.equal(selected.action, "allow");
+  assert.deepEqual(selected.contract.budget.enforcement, { input: "metered_best_effort", output: "hard" });
+  assert.equal(selected.contract.budget.maxInputTokens, 1_000_000);
+  withBroker(registry, (broker) => {
+    const reservation = broker.reserve(selected.contract, 1_000);
+    assert.equal(reservation.status, "leased", JSON.stringify(reservation));
+    const resource = broker.inventory(1_000).find((row) => row.resourceId === reservation.lease.resourceId);
+    assert.deepEqual(resource.enforcement, { input: "hard", output: "hard" });
+    assert.deepEqual(reservation.lease.enforcement, { input: "metered_best_effort", output: "hard" });
+  });
 });
 
 test("an effect-capable task never lands on the weakest class and is budgeted in what the controller can enforce", () => {
@@ -159,6 +179,107 @@ test("an exact identity request narrows selection and never bypasses a gate", ()
     }),
     /requireModelIdentity must be \{provider, modelId\}/,
   );
+});
+
+function apexRegistry() {
+  return registryOf([
+    {
+      provider: "openai-codex-account-2", api: "openai-codex-responses", baseUrl: "https://codex.example",
+      models: [
+        { id: "gpt-6-astra", name: "Astra", contextWindow: 272_000, maxTokens: 128_000, reasoning: true, input: ["text", "image"] },
+        { id: "gpt-5.6-sol", name: "Sol", contextWindow: 272_000, maxTokens: 128_000, reasoning: true, input: ["text", "image"] },
+      ],
+    },
+    {
+      provider: "openai-codex-account-3", api: "openai-codex-responses", baseUrl: "https://codex.example",
+      models: [{ id: "gpt-6-astra", name: "Astra", contextWindow: 272_000, maxTokens: 128_000, reasoning: true, input: ["text", "image"] }],
+    },
+    {
+      provider: "anthropic", api: "anthropic-messages", baseUrl: "https://anthropic.example",
+      models: [
+        { id: "claude-fable-5-1", name: "Fable 5.1", contextWindow: 1_000_000, maxTokens: 128_000, reasoning: true, input: ["text", "image"] },
+        { id: "claude-fable-5", name: "Fable 5", contextWindow: 1_000_000, maxTokens: 128_000, reasoning: true, input: ["text", "image"] },
+        { id: "claude-opus-5", name: "Opus", contextWindow: 200_000, maxTokens: 64_000, reasoning: true, input: ["text", "image"] },
+      ],
+    },
+    {
+      provider: "openai", api: "openai-responses", baseUrl: "https://api.openai.com/v1",
+      models: [{ id: "gpt-6-astra", name: "Paid Astra", contextWindow: 272_000, maxTokens: 128_000, reasoning: true, input: ["text", "image"] }],
+    },
+  ], { confidence: "observed" });
+}
+
+test("ordinary frontier routing quarantines Astra/Fable even though they exceed the quality floor", () => {
+  const registry = apexRegistry();
+  const currency = Object.fromEntries(Object.keys(registry.resources).map((id) => [id, { generation: 0, listed: true, legacy: false }]));
+  const selected = selectModelForTask({
+    taskDescription: "implement the parser fix", registry, currency,
+    enforceQuality: true, enforceProvenance: true,
+    constraints: baseConstraints({ modelTier: "frontier" }),
+  });
+  assert.equal(selected.action, "allow");
+  assert.ok(!/astra|fable/i.test(selected.expectedModel.modelId));
+  assert.equal(selected.selection.modelTier, "frontier");
+});
+
+test("owner-selected inherit identity admits exact paid or subscription apex without opening the pool", () => {
+  const registry = apexRegistry();
+  const currency = Object.fromEntries(Object.keys(registry.resources).map((id) => [id, { generation: 0, listed: true, legacy: false }]));
+  const identity = { provider: "openai", modelId: "gpt-6-astra" };
+  const selected = selectModelForTask({
+    taskDescription: "implement the parser fix", registry, currency,
+    enforceQuality: true, enforceProvenance: true,
+    constraints: baseConstraints({
+      modelTier: "frontier",
+      requireModelIdentity: identity,
+      apexAdmission: createOwnerModelAdmission(identity),
+    }),
+  });
+  assert.equal(selected.action, "allow");
+  assert.deepEqual(selected.expectedModel, identity);
+  assert.equal(selected.selection.modelTier, "apex");
+  assert.equal(selected.selection.admissionMode, "owner_primary");
+
+  const unbranded = selectModelForTask({
+    taskDescription: "implement the parser fix", registry, currency,
+    enforceQuality: true, enforceProvenance: true,
+    constraints: baseConstraints({ modelTier: "frontier", requireModelIdentity: identity }),
+  });
+  assert.equal(unbranded.action, "deny");
+});
+
+test("a controller-validated rescue enters apex and preserves exact/same-family/cross-family failover order", async () => {
+  const { createHash } = await import("node:crypto");
+  const task = "implement the hard parser fix";
+  const taskDigest = createHash("sha256").update(task).digest("hex");
+  const now = 1_000_000;
+  const reports = {
+    r1: { taskId: "r1", logicalId: "r1", status: "failed", task, taskDigest, failureClass: "semantic_rejection", routeSteps: [{ resourceId: "openai-codex-account-2/gpt-5.6-sol", outcome: "verification_rejected" }], startedAt: now - 100, completedAt: now - 50 },
+    r2: { taskId: "r2", logicalId: "r2", status: "failed", task, taskDigest, failureClass: "semantic_failure", routeSteps: [{ resourceId: "anthropic/claude-opus-5", outcome: "fatal" }], startedAt: now - 90, completedAt: now - 40 },
+  };
+  const admission = authorizeApexRescue({
+    task, reportIds: ["r1", "r2"], loadReport: (id) => reports[id],
+    loadJob: (id) => ({ jobId: id, ownerSessionId: "owner" }), ownerSessionId: "owner", now: () => now,
+  });
+  const registry = apexRegistry();
+  const currency = Object.fromEntries(Object.keys(registry.resources).map((id) => [id, { generation: 0, listed: true, legacy: false }]));
+  const pick = (excludeResources = [], apexAnchor) => selectModelForTask({
+    taskDescription: task, registry, currency, enforceQuality: true, enforceProvenance: true,
+    constraints: baseConstraints({ apexAdmission: admission, excludeResources, ...(apexAnchor ? { apexAnchor } : {}) }),
+  });
+  const first = pick();
+  assert.equal(first.action, "allow");
+  assert.equal(first.selection.modelTier, "apex");
+  assert.equal(first.selection.admissionMode, "rescue");
+  const anchor = first.expectedModel;
+  const firstId = first.selection.resourceId;
+  const sibling = pick([firstId], anchor);
+  assert.equal(sibling.expectedModel.provider, "openai-codex-account-3");
+  assert.equal(sibling.expectedModel.modelId, "gpt-6-astra");
+  const sameFamily = pick([firstId, sibling.selection.resourceId], anchor);
+  // If the first family is Codex there is no older Astra variant, so the next admissible route is Fable.
+  assert.match(sameFamily.expectedModel.modelId, /fable/);
+  assert.notEqual(sameFamily.expectedModel.provider, "openai", "unconfigured paid API capacity stays closed");
 });
 
 test("a class weaker than required is never selected, even as the only survivor", () => {
@@ -286,6 +407,12 @@ test("the selected contract actually leases against a real broker", () => {
     const reservation = broker.reserve(selected.contract, now);
     assert.equal(reservation.status, "leased", JSON.stringify(reservation));
     assert.equal(reservation.lease.profile, selected.contract.capability.minimumProfile);
+    assert.deepEqual(selected.contract.budget.enforcement, { input: "metered_best_effort", output: "hard" });
+    assert.deepEqual(reservation.lease.enforcement, selected.contract.budget.enforcement);
+    assert.deepEqual(
+      broker.inventory(now).find((row) => row.resourceId === reservation.lease.resourceId).enforcement,
+      { input: "hard", output: "hard" },
+    );
 
     const resolveModel = createResourceModelResolver(registry);
     const leasedModel = resolveModel(reservation.lease.resourceId);

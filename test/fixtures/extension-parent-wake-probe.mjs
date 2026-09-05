@@ -13,6 +13,8 @@ for (const [name, value] of Object.entries({
 const tools = new Map();
 const hooks = new Map();
 let wakeResolve;
+let wakeResolved = false;
+let hostBusy = false;
 const wakePromise = new Promise((resolve) => { wakeResolve = resolve; });
 const pi = {
   events: { on() {}, emit() {} },
@@ -20,7 +22,11 @@ const pi = {
   registerCommand() {},
   registerTool(definition) { tools.set(definition.name, definition); },
   sendUserMessage() { throw new Error("controller wake must never impersonate the user"); },
-  sendMessage(message, options) { wakeResolve({ message, options }); },
+  sendMessage(message, options) {
+    assert.equal(hostBusy, false, "lifecycle wake must wait until the active parent turn settles");
+    wakeResolved = true;
+    wakeResolve({ message, options });
+  },
 };
 (await import(extensionPath)).default(pi);
 assert.match(
@@ -30,9 +36,13 @@ assert.match(
 const ctx = {
   cwd: process.cwd(),
   modelRegistry: { getAll() { return []; } },
+  isIdle() { return !hostBusy; },
+  hasPendingMessages() { return false; },
   ui: { notify() {} },
 };
 await hooks.get("session_start")?.({}, ctx);
+hostBusy = true;
+await hooks.get("agent_start")?.({}, ctx);
 const result = await tools.get("delegate").execute(
   "wake-probe-tool",
   { task: "Read one file and report its name.", idempotencyKey: "wake-probe-task", deadlineMs: 2_000 },
@@ -41,6 +51,19 @@ const result = await tools.get("delegate").execute(
   ctx,
 );
 assert.equal(result.details.background, true);
+await new Promise((resolve) => setTimeout(resolve, 100));
+assert.equal(wakeResolved, false, "terminal background work must remain pending while parent is busy");
+await hooks.get("agent_end")?.({}, ctx);
+hostBusy = false;
+await hooks.get("agent_settled")?.({}, ctx);
+// Another settled listener can start the next turn before the deferred release.
+hostBusy = true;
+await hooks.get("agent_start")?.({}, ctx);
+await new Promise((resolve) => setTimeout(resolve, 50));
+assert.equal(wakeResolved, false, "an old settlement must not unlock a newer parent turn");
+await hooks.get("agent_end")?.({}, ctx);
+hostBusy = false;
+await hooks.get("agent_settled")?.({}, ctx);
 const wake = await Promise.race([
   wakePromise,
   new Promise((_, reject) => setTimeout(() => reject(new Error("automatic parent wake timed out")), 4_000)),

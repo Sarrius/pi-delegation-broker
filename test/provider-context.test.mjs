@@ -24,11 +24,15 @@ test("provider context captures one frozen closed-schema snapshot", () => {
   assert.match(captured.canonical, /systemPrompt/);
 });
 
-test("provider context rejects ambiguous replay/options/modalities instead of dropping them", () => {
+test("provider context preserves the closed text/image vocabulary and rejects ambiguous replay options", () => {
   assert.throws(() => captureProviderContext(context({ options: {} })), /unknown field options/);
   assert.throws(() => captureProviderContext(context({ providerResponseId: "opaque-state" })), /unknown field providerResponseId/);
-  assert.throws(() => captureProviderContext(context({ messages: [{ role: "user", content: [{ type: "text", text: "not silently transformed" }] }] })), /bounded printable text/);
+  const blocks = [{ type: "text", text: "not silently transformed" }, { type: "image", data: "iVBORw==", mimeType: "image/png" }];
+  const captured = captureProviderContext(context({ messages: [{ role: "user", content: blocks }] }));
+  assert.deepEqual(captured.value.messages[0].content, blocks);
+  assert.notEqual(captured.value.messages[0].content, blocks);
   assert.throws(() => captureProviderContext(context({ messages: [{ role: "user", content: "delete\u007fcontrol" }] })), /bounded printable text/);
+  assert.throws(() => captureProviderContext(context({ messages: [{ role: "user", content: [{ type: "image", data: "iVBORw==", mimeType: "image/svg+xml" }] }] })), /mimeType is unsupported/);
   assert.throws(() => captureProviderContext(context({ tools: [{ name: "read", description: "x", schema: {} }] })), /unknown field schema/);
 });
 

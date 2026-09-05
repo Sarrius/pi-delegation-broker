@@ -54,6 +54,7 @@ function choose(registry, currency, allowedProviders) {
 test("version parser recognizes current provider families without hardcoded model lists", () => {
   assert.deepEqual(parseModelVersion("glm-5.3"), { family: "glm", version: [5, 3] });
   assert.deepEqual(parseModelVersion("gpt-5.6-luna"), { family: "gpt", version: [5, 6] });
+  assert.deepEqual(parseModelVersion("gpt-6-astra"), { family: "gpt-astra", version: [6] });
   assert.deepEqual(parseModelVersion("minimax-m3"), { family: "minimax-m", version: [3] });
   assert.deepEqual(parseModelVersion("kimi-k3"), { family: "kimi-k", version: [3] });
   assert.deepEqual(parseModelVersion("deepseek-v4-pro-0813"), { family: "deepseek", version: [4] });
@@ -61,17 +62,17 @@ test("version parser recognizes current provider families without hardcoded mode
   assert.deepEqual(parseModelVersion("claude-opus-5"), { family: "claude-opus", version: [5] });
 });
 
-test("all stale generations are excluded: glm-4, gpt-3.5/4, and MiniMax-M2 never win", () => {
+test("stale generations are excluded while premium Astra does not obsolete the ordinary current lineup", () => {
   const registry = registryFor([
     { provider: "zai", models: [model("glm-4.7", "zai"), model("glm-5.2", "zai"), model("glm-5.3", "zai")] },
-    { provider: "openai", models: [model("gpt-3.5-turbo", "openai"), model("gpt-4", "openai"), model("gpt-5.4-mini", "openai"), model("gpt-5.6-luna", "openai")] },
+    { provider: "openai", models: [model("gpt-3.5-turbo", "openai"), model("gpt-4", "openai"), model("gpt-5.4-mini", "openai"), model("gpt-5.6-luna", "openai"), model("gpt-6-astra", "openai")] },
     { provider: "minimax", models: [model("minimax-m2", "minimax"), model("minimax-m2.7", "minimax"), model("minimax-m3", "minimax")] },
   ]);
   const currency = buildCurrencyMap({
     resources: resourcesFor(registry),
     liveListings: new Map([
       ["zai", new Map([["glm-4.7", 1_650_000_000_000], ["glm-5.2", 1_750_000_000_000], ["glm-5.3", 1_780_000_000_000]])],
-      ["openai", new Map([["gpt-3.5-turbo", 1_670_000_000_000], ["gpt-4", 1_690_000_000_000], ["gpt-5.4-mini", 1_750_000_000_000], ["gpt-5.6-luna", 1_780_000_000_000]])],
+      ["openai", new Map([["gpt-3.5-turbo", 1_670_000_000_000], ["gpt-4", 1_690_000_000_000], ["gpt-5.4-mini", 1_750_000_000_000], ["gpt-5.6-luna", 1_780_000_000_000], ["gpt-6-astra", 1_790_000_000_000]])],
       ["minimax", new Map([["minimax-m2", 1_650_000_000_000], ["minimax-m2.7", 1_750_000_000_000], ["minimax-m3", 1_780_000_000_000]])],
     ]),
   });
@@ -88,6 +89,9 @@ test("all stale generations are excluded: glm-4, gpt-3.5/4, and MiniMax-M2 never
       `${provider} must never choose a legacy model while a current one lives`);
   }
   assert.equal(choose(registry, currency, ["zai"]).expectedModel.modelId, "glm-5.3");
+  assert.equal(currency["openai/gpt-5.6-luna"].legacy, false);
+  assert.equal(currency["openai/gpt-5.6-luna"].generation, 0);
+  assert.equal(currency["openai/gpt-6-astra"].generation, 0);
   assert.equal(choose(registry, currency, ["openai"]).expectedModel.modelId, "gpt-5.6-luna");
   assert.equal(choose(registry, currency, ["minimax"]).expectedModel.modelId, "minimax-m3");
 });

@@ -52,6 +52,32 @@ test("proxy preserves Cursor Grok's LF-joined tool-call identity across replay",
   assert.equal(context.messages[2].toolCallId, toolCallId);
 });
 
+test("proxy preserves bounded image blocks from read tool results for a vision route", () => {
+  const image = { type: "image", data: "iVBORw==", mimeType: "image/png" };
+  const context = proxyCanonicalContext({
+    systemPrompt: "Review the supplied logo.",
+    messages: [
+      { role: "user", content: [{ type: "text", text: "inspect logo.png" }, image] },
+      { role: "assistant", content: [{ type: "toolCall", id: "call_image", name: "read", arguments: { path: "logo.png" } }] },
+      { role: "toolResult", toolCallId: "call_image", toolName: "read", content: [{ type: "text", text: "Image Size: 64x64." }, image], isError: false },
+    ],
+    tools: [{ name: "read", description: "Read one bounded path.", parameters: { type: "object" } }],
+  });
+  assert.deepEqual(context.messages[0].content, [{ type: "text", text: "inspect logo.png" }, image]);
+  assert.deepEqual(context.messages[2].content, [{ type: "text", text: "Image Size: 64x64." }, image]);
+  assert.notEqual(context.messages[0].content[1], image, "provider context must be detached");
+});
+
+test("proxy accepts an image-bearing context larger than the old 512 KiB text-only ceiling", () => {
+  const data = "a".repeat(700_000);
+  const context = proxyCanonicalContext({
+    systemPrompt: "Inspect.",
+    messages: [{ role: "user", content: [{ type: "image", data, mimeType: "image/jpeg" }] }],
+    tools: [],
+  });
+  assert.equal(context.messages[0].content[0].data.length, data.length);
+});
+
 test("proxy makes non-printable tool output safe for the next provider turn", () => {
   const context = proxyCanonicalContext({
     systemPrompt: "Be concise.",
@@ -70,7 +96,9 @@ test("proxy makes non-printable tool output safe for the next provider turn", ()
 
 test("proxy fails closed on unsupported modalities, replay state, and unapproved tools", () => {
   assert.throws(() => proxyCanonicalContext({ systemPrompt: "", messages: [], tools: [{ name: "read", description: "x" }] }), /parameters is required/);
-  assert.throws(() => proxyCanonicalContext({ systemPrompt: "", messages: [{ role: "user", content: [{ type: "image", data: "x" }] }], tools: [] }), /non-text/);
+  assert.throws(() => proxyCanonicalContext({ systemPrompt: "", messages: [{ role: "user", content: [{ type: "image", data: "x" }] }], tools: [] }), /unsupported image metadata|unknown field|mimeType/);
+  assert.throws(() => proxyCanonicalContext({ systemPrompt: "", messages: [{ role: "user", content: [{ type: "image", data: "not-base64!", mimeType: "image/png" }] }], tools: [] }), /canonical base64/);
+  assert.throws(() => proxyCanonicalContext({ systemPrompt: "", messages: [{ role: "user", content: [{ type: "image", data: "eA==", mimeType: "image/svg+xml" }] }], tools: [] }), /unsupported image metadata/);
   assert.throws(() => proxyCanonicalContext({
     systemPrompt: "",
     messages: [{ role: "assistant", content: [{ type: "toolCall", id: "call_1", name: "write", arguments: {} }] }],
@@ -101,5 +129,6 @@ test("proxy terminal mapping never converts an unknown/failed provider terminal 
   assert.equal(proxyTerminalError({ payload: { outcome: "rate_limited" } }), "controller provider terminal: rate_limited");
   assert.equal(proxyTerminalError({ payload: { outcome: "rejected_before_send", httpStatus: 400 } }), "controller provider terminal: rejected_before_send (400)");
   assert.equal(proxyTerminalError({ payload: { outcome: "rejected_before_send", httpStatus: 400, providerReason: "invalid_model" } }), "controller provider terminal: rejected_before_send (400, invalid_model)");
+  assert.equal(proxyTerminalError({ payload: { outcome: "controller_failure", finishReason: "phase_invalid" } }), "controller provider terminal: controller_failure (phase_invalid)");
   assert.equal(proxyTerminalError({ payload: { outcome: "bad value" } }), "controller provider returned an invalid terminal");
 });

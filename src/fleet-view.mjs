@@ -259,6 +259,36 @@ export function buildFleetProjection({
   });
 }
 
+/**
+ * Render one durable job with the controller's volatile attempt projection overlaid. Durable
+ * workflow `running` means only that the scheduler owns an unresolved promise; it must never be
+ * presented as proof that a provider/model is executing. This formatter is shared by
+ * delegate_status so its answer agrees with the live fleet widget.
+ */
+export function formatDelegationStatus(job, fleet) {
+  if (!isRecord(job) || typeof job.jobId !== "string") throw new Error("delegation status requires a job");
+  if (!isRecord(fleet) || !Array.isArray(fleet.rows)) throw new Error("delegation status requires a fleet projection");
+  const jobId = safeId(job.jobId);
+  const header = `${jobId}: ${safeText(job.status, "unknown", 40)}`;
+  if (job.kind !== "workflow" || !Array.isArray(job.nodes)) return header;
+  const rows = new Map(fleet.rows.map((row) => [row.id, row]));
+  const lines = job.nodes.map((node) => {
+    const nodeId = safeId(node?.id);
+    const durableState = safeText(node?.state, "pending", 40);
+    const row = rows.get(`${jobId}/${nodeId}`);
+    const liveState = safeText(row?.state, durableState, 40);
+    const route = safeText(row?.route, "route:pending", 240);
+    const details = [];
+    if (row?.attemptId !== undefined || liveState !== durableState) details.push(route);
+    if (liveState !== durableState) details.push(`durable=${durableState}`);
+    if (Number.isSafeInteger(row?.attempt)) details.push(`attempt=${row.attempt}`);
+    if (typeof row?.liveness === "string") details.push(`liveness=${safeText(row.liveness, "unknown", 40)}`);
+    const report = typeof node?.result?.reportTaskId === "string" ? `; report=${safeId(node.result.reportTaskId)}` : "";
+    return `- ${nodeId}: ${liveState}${details.length ? ` (${details.join("; ")})` : ""}${report}`;
+  });
+  return `${header}\n${lines.join("\n")}`;
+}
+
 function compactNumber(value) {
   if (!value) return "0";
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}m`;

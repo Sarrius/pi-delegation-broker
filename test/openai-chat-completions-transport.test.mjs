@@ -95,10 +95,13 @@ test("Cursor subscription policy rejection is classified without retaining the p
   assert.equal(JSON.stringify(events).includes("third-party subscription"), false);
 });
 
-test("tool-bearing context and malformed provider frames fail closed", async () => {
+test("tool/image-bearing context and malformed provider frames fail closed", async () => {
   let sends = 0;
   const transport = adapter({ fetchImpl: async () => { sends += 1; return successSse(); } });
   await assert.rejects(() => collect(transport, snapshot(), context({ tools: [{ name: "read", description: "read", inputSchema: { type: "object" } }] })), OpenAIChatCompletionsTransportError);
+  await assert.rejects(() => collect(transport, snapshot(), context({
+    messages: [{ role: "user", content: [{ type: "image", data: "iVBORw==", mimeType: "image/png" }] }],
+  })), /cannot be replayed by this adapter/);
   assert.equal(sends, 0);
 
   const malformed = await collect(adapter({ fetchImpl: async () => sse([{ id: "chat-1", choices: [{ index: 0, delta: { content: "x" }, finish_reason: null }] }, "not-json"]) }));

@@ -1,6 +1,6 @@
 {
   "name": "@sars267/pi-delegation-broker",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Non-production, single-host reference broker for capability-scoped Pi child delegation.",
   "type": "module",
   "main": "./src/index.mjs",
@@ -30,7 +30,7 @@
   },
   "scripts": {
     "check": "node --check src/*.mjs && node --check test/*.mjs && node scripts/check-public-tree.mjs && node scripts/check-tracked-privacy.mjs",
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test test/*.test.mjs test/*.test.ts",
     "pack:check": "node scripts/check-package.mjs",
     "install:check": "node scripts/check-installed-package.mjs",
     "release:check": "npm run check && npm test && npm run pack:check && npm run install:check",
@@ -61,10 +61,10 @@
     "tag": "next"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "^0.84.2",
-    "typebox": "^1.3.7"
+    "@earendil-works/pi-ai": "^0.84.4",
+    "typebox": "^1.3.27"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.2"
+    "@earendil-works/pi-coding-agent": "^0.84.4"
   }
 }
