@@ -586,6 +586,101 @@ test("real input reservations reconcile to observed usage instead of consuming t
   broker.release(lease.leaseId, lease.fencingToken, "test", 1_006);
 }));
 
+test("metered input admits one bounded request below the observed cap and reconciles before enforcing it", () => withBroker((broker) => {
+  const lease = leased(broker, fixtureContract({
+    budget: { maxInputTokens: 100, maxOutputTokens: 100, enforcement: { input: "metered_best_effort", output: "hard" } },
+  }));
+  assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 60, 1_001).status, "reserved");
+  const first = broker.recordProviderUsage(
+    lease.leaseId,
+    lease.fencingToken,
+    { input: 10, output: 1 },
+    1_002,
+    { inputReserved: true, reservedInputUpperBound: 60 },
+  );
+  assert.deepEqual(first, { status: "recorded", inputTokensUsed: 10, outputTokensUsed: 1 });
+  // The byte-safe upper bound would exceed the remaining token cap, but exact provider usage is
+  // unknowable before dispatch. Metered read-only work admits it and reconciles afterward.
+  assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 150, 1_003).status, "reserved");
+  const second = broker.recordProviderUsage(
+    lease.leaseId,
+    lease.fencingToken,
+    { input: 80, output: 2 },
+    1_004,
+    { inputReserved: true, reservedInputUpperBound: 150 },
+  );
+  assert.deepEqual(second, { status: "recorded", inputTokensUsed: 90, outputTokensUsed: 3 });
+  assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 150, 1_005).status, "reserved");
+  const exceeded = broker.recordProviderUsage(
+    lease.leaseId,
+    lease.fencingToken,
+    { input: 20, output: 1 },
+    1_006,
+    { inputReserved: true, reservedInputUpperBound: 150 },
+  );
+  assert.deepEqual(exceeded, { status: "budget_exceeded", dimension: "input", used: 110, cap: 100 });
+  assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 1, 1_007).status, "budget_exceeded");
+  assert.ok(broker.events().some((event) => event.type === "BudgetExceeded" && event.payload.overshoot === 10));
+  broker.release(lease.leaseId, lease.fencingToken, "test", 1_008);
+}));
+
+test("a metered observe lease is not upgraded to the resource hard input ceiling", () => withBroker((broker) => {
+  const lease = leased(broker, fixtureContract({
+    taskId: "observe-metered",
+    budget: { maxInputTokens: 1_000_000, maxOutputTokens: 16_000, enforcement: { input: "metered_best_effort", output: "hard" } },
+  }));
+  const resource = broker.inventory(1_000).find((row) => row.resourceId === lease.resourceId);
+  // Catalog resources advertise hard/hard as a capability ceiling. Copying that onto the lease
+  // would turn a read-only metered contract back into the UTF-8 byte denial the ceiling allows.
+  assert.deepEqual(resource.enforcement, { input: "hard", output: "hard" });
+  assert.notDeepEqual(lease.enforcement, resource.enforcement);
+  assert.deepEqual(lease.enforcement, { input: "metered_best_effort", output: "hard" });
+  assert.equal(lease.maxInputTokens, 1_000_000);
+  broker.release(lease.leaseId, lease.fencingToken, "test", 1_001);
+}));
+
+test("incident used=804330 requested=236663 cap=1000000 is a hard UTF-8 denial, not a metered token cap", () => {
+  // workflow-mtmzxk2i-4-evidence-audit on cursor/composer-2.5: 27 healthy turns reconciled to
+  // 804330 observed input tokens. The next canonical payload was 236663 UTF-8 bytes. cacheRead
+  // was absent. Hard enforcement added the byte bound onto the token ledger and denied before
+  // dispatch (804330+236663>1000000) even though observed prompt tokens that turn were 43630.
+  const seed = (broker, enforcement, taskId) => {
+    const lease = leased(broker, fixtureContract({
+      taskId,
+      budget: { maxInputTokens: 1_000_000, maxOutputTokens: 16_000, enforcement },
+    }));
+    assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 804330, 1_001).status, "reserved");
+    assert.deepEqual(
+      broker.recordProviderUsage(lease.leaseId, lease.fencingToken, { input: 804330, output: 7301 }, 1_002, {
+        inputReserved: true, reservedInputUpperBound: 804330,
+      }),
+      { status: "recorded", inputTokensUsed: 804330, outputTokensUsed: 7301 },
+    );
+    return lease;
+  };
+  withBroker((broker) => {
+    const lease = seed(broker, { input: "hard", output: "hard" }, "incident-hard");
+    assert.deepEqual(
+      broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 236663, 1_003),
+      { status: "budget_exceeded", dimension: "input", used: 804330, requested: 236663, cap: 1_000_000 },
+    );
+    broker.release(lease.leaseId, lease.fencingToken, "test", 1_004);
+  });
+  withBroker((broker) => {
+    const lease = seed(broker, { input: "metered_best_effort", output: "hard" }, "incident-metered");
+    assert.equal(broker.reserveProviderInput(lease.leaseId, lease.fencingToken, 236663, 1_003).status, "reserved");
+    const observed = broker.recordProviderUsage(
+      lease.leaseId,
+      lease.fencingToken,
+      { input: 43630, output: 453 },
+      1_004,
+      { inputReserved: true, reservedInputUpperBound: 236663 },
+    );
+    assert.deepEqual(observed, { status: "recorded", inputTokensUsed: 847960, outputTokensUsed: 7754 });
+    broker.release(lease.leaseId, lease.fencingToken, "test", 1_005);
+  });
+});
+
 test("typed effect receipts are approval-bound and idempotent", () => {
   const registry = fixtureRegistry();
   withBroker((broker) => {
@@ -666,9 +761,12 @@ test("a dynamic broker reconciles a changed catalog at startup through the drain
   const changed = fixtureRegistry();
   delete changed.resources.R2;
   delete changed.capacityGroups["G-independent"];
+  changed.capacityGroups["G-shared"].maxConcurrent = 5;
   try {
     const restarted = new SqliteLeaseBroker({ path, registry: changed, reconcileRegistryOnStart: true });
-    assert.deepEqual(restarted.inventory(Date.now()).map((row) => row.resourceId).sort(), ["R1", "R1_ALIAS", "R3"]);
+    const inventory = restarted.inventory(Date.now());
+    assert.deepEqual(inventory.map((row) => row.resourceId).sort(), ["R1", "R1_ALIAS", "R3"]);
+    assert.equal(inventory.find((row) => row.resourceId === "R1").maxConcurrent, 5, "idle persisted groups adopt the new worker bound");
     assert.ok(restarted.events().some((event) => event.type === "RegistryUpdated"));
     restarted.close();
   } finally { rmSync(directory, { recursive: true, force: true }); }

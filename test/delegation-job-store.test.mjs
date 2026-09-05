@@ -42,6 +42,32 @@ function workflow(jobId = "workflow-a", overrides = {}) {
   };
 }
 
+test("session recovery cannot requeue another live owner's work or ownerless legacy jobs", () => {
+  const s = store();
+  try {
+    submitJob(s.root, task("mine", { status: "running", ownerSessionId: "session-a" }));
+    submitJob(s.root, task("foreign", { status: "running", ownerSessionId: "session-b" }));
+    submitJob(s.root, task("legacy", { status: "running" }));
+    const recovered = recoverJobs(s.root, 300, { ownerSessionId: "session-a" });
+    assert.deepEqual(recovered.map((job) => job.jobId), ["mine"]);
+    assert.equal(readJob(s.root, "foreign").status, "running");
+    assert.equal(readJob(s.root, "foreign").updatedAt, 100);
+    assert.equal(readJob(s.root, "legacy").status, "running");
+  } finally { s.done(); }
+});
+
+test("idempotency keys belong to an owner session and cannot return a foreign task", () => {
+  const s = store();
+  try {
+    submitJob(s.root, task("first", { ownerSessionId: "a", idempotencyKey: "read-1" }));
+    const second = submitJob(s.root, task("second", { ownerSessionId: "b", idempotencyKey: "read-1" }));
+    assert.equal(second.created, true);
+    const replay = submitJob(s.root, task("third", { ownerSessionId: "b", idempotencyKey: "read-1" }));
+    assert.equal(replay.created, false);
+    assert.equal(replay.job.jobId, "second");
+  } finally { s.done(); }
+});
+
 test("submission is durable and an idempotency key returns the original job", () => {
   const s = store();
   try {
@@ -166,4 +192,20 @@ test("attested skill identities persist on a task contract and invalid ones fail
       /path, sha256 digest and byte size/,
     );
   } finally { s.done(); }
+});
+
+test('independent processes atomically reuse identical active work and permit a new run after completion',async()=>{
+ const {spawn}=await import('node:child_process');
+ const root=mkdtempSync(join(tmpdir(),'job-submit-race-'));
+ try {
+   const url=new URL('../src/delegation-job-store.mjs',import.meta.url).href;
+   const job={schemaVersion:1,kind:'task',ownerSessionId:'owner',status:'queued',task:'same',workFingerprint:'a'.repeat(64),cwd:root,submittedAt:1000,updatedAt:1000};
+   await Promise.all(Array.from({length:4},(_,i)=>new Promise((resolve,reject)=>{
+     const script=`import {submitJob} from ${JSON.stringify(url)};submitJob(${JSON.stringify(root)},${JSON.stringify({...job,jobId:'job-'+i,idempotencyKey:'tool-'+i})});`;
+     const child=spawn(process.execPath,['--input-type=module','-e',script]);let error='';child.stderr.on('data',d=>error+=d);child.on('error',reject);child.on('exit',code=>code===0?resolve():reject(new Error(error)));
+   })));
+   const jobs=listJobs(root);assert.equal(jobs.length,1);
+   updateJob(root,jobs[0].jobId,j=>({...j,status:'completed',completedAt:2000}),2000);
+   assert.equal(submitJob(root,{...job,jobId:'fresh',idempotencyKey:'new-request',submittedAt:3000,updatedAt:3000}).created,true);
+ } finally {rmSync(root,{recursive:true,force:true});}
 });

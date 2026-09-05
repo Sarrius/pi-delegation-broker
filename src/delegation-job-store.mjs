@@ -1,7 +1,9 @@
+import { DatabaseSync } from "node:sqlite";
 import {
-  existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync,
 } from "node:fs";
 import { join, resolve, sep } from "node:path";
+import { activeAssignments, overlappingAssignment } from "./delegation-policy.mjs";
 import { assertStoredContract } from "./child-contract.mjs";
 import { validateTeamState } from "./team.mjs";
 
@@ -41,6 +43,7 @@ function validate(job) {
   }
   if (typeof job.cwd !== "string" || job.cwd.length < 1 || job.cwd.length > 4096 || /\0/.test(job.cwd)) fail("cwd is invalid");
   if (job.ownerSessionId !== undefined && (typeof job.ownerSessionId !== "string" || !SESSION_ID.test(job.ownerSessionId))) fail("ownerSessionId is invalid");
+  if (job.workFingerprint !== undefined && !/^[a-f0-9]{64}$/.test(job.workFingerprint)) fail("workFingerprint is invalid");
   if (job.kind === "task" && (typeof job.task !== "string" || job.task.length < 1 || job.task.length > 256 * 1024)) fail("task text is invalid");
   // The contract is durable intent: a malformed one must not survive a restart and silently
   // resolve into different spending than the caller asked for. Node contracts are the same
@@ -106,16 +109,42 @@ export function listJobs(root) {
   return Object.freeze(jobs);
 }
 
+function withJobLock(root, action) {
+  mkdirSync(root,{recursive:true,mode:0o700});
+  const path=join(root,'submission-lock.sqlite');
+  const db=new DatabaseSync(path);chmodSync(path,0o600);
+  try {
+    db.exec('PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS gate (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE');
+    try {const result=action();db.exec('COMMIT');return result;}
+    catch(error){db.exec('ROLLBACK');throw error;}
+  } finally {db.close();}
+}
 export function submitJob(root, job) {
+  return withJobLock(root,()=>submitJobLocked(root,job));
+}
+function submitJobLocked(root, job) {
+  if(job?.workFingerprint) {
+    const existing=listJobs(root).find(candidate=>candidate.ownerSessionId===job.ownerSessionId && candidate.workFingerprint===job.workFingerprint && !TERMINAL.has(candidate.status));
+    if(existing) return Object.freeze({created:false,job:existing});
+  }
   if (job?.idempotencyKey !== undefined) {
-    const existing = listJobs(root).find((candidate) => candidate.idempotencyKey === job.idempotencyKey);
+    const existing = listJobs(root).find((candidate) => candidate.idempotencyKey === job.idempotencyKey
+      && candidate.ownerSessionId === job.ownerSessionId);
     if (existing) return Object.freeze({ created: false, job: existing });
+  }
+  const assignments=activeAssignments(listJobs(root),job.ownerSessionId);
+  for(const work of job.kind==='workflow' ? (job.nodes??[]).map(node=>node.contract?.work) : [job.contract?.work]) {
+    const conflict=overlappingAssignment(work,assignments);
+    if(conflict) fail(`work is already owned by ${conflict.id}`);
   }
   if (readJob(root, job?.jobId)) fail("job id already exists");
   return Object.freeze({ created: true, job: writeJob(root, job) });
 }
 
 export function updateJob(root, jobId, update, now = Date.now()) {
+  return withJobLock(root,()=>updateJobLocked(root,jobId,update,now));
+}
+function updateJobLocked(root, jobId, update, now) {
   if (typeof update !== "function") fail("update must be a function");
   const current = readJob(root, jobId);
   if (!current) return undefined;
@@ -137,9 +166,11 @@ export function requestJobCancellation(root, jobId, now = Date.now(), ownerSessi
  * started, not that the old process still owns it. Read-only work is requeued; an outstanding
  * cancellation is settled rather than relaunched.
  */
-export function recoverJobs(root, now = Date.now()) {
+export function recoverJobs(root, now = Date.now(), { ownerSessionId } = {}) {
+  if (ownerSessionId !== undefined && (typeof ownerSessionId !== "string" || !SESSION_ID.test(ownerSessionId))) fail("ownerSessionId is invalid");
   const recovered = [];
   for (const current of listJobs(root)) {
+    if (ownerSessionId !== undefined && current.ownerSessionId !== ownerSessionId) continue;
     if (TERMINAL.has(current.status)) continue;
     const next = updateJob(root, current.jobId, (job) => {
       if (job.status === "cancellation_requested") {

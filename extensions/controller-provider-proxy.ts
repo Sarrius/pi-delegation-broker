@@ -131,6 +131,10 @@ export default function controllerProviderProxy(pi: ExtensionAPI): void {
   const modelId = process.env.PI_BROKER_PROXY_MODEL_ID;
   if (!modelId || !process.env.PI_BROKER_SOCKET || !process.env.PI_BROKER_CAPABILITY) return;
   const maxTokens = Number.parseInt(process.env.PI_BROKER_MAX_OUTPUT_TOKENS ?? "8192", 10);
+  const inputModalities = process.env.PI_BROKER_PROXY_INPUT_MODALITIES ?? "text";
+  if (inputModalities !== "text" && inputModalities !== "text,image") {
+    throw new Error("controller-provider-proxy received invalid PI_BROKER_PROXY_INPUT_MODALITIES");
+  }
   pi.registerProvider(PROVIDER_ID, {
     name: "Controller broker proxy",
     baseUrl: "http://controller.invalid/v1",
@@ -142,7 +146,7 @@ export default function controllerProviderProxy(pi: ExtensionAPI): void {
       id: modelId,
       name: `Controller proxy: ${modelId}`,
       reasoning: true,
-      input: ["text"],
+      input: inputModalities === "text,image" ? ["text", "image"] : ["text"],
       contextWindow: 200_000,
       maxTokens: Number.isSafeInteger(maxTokens) && maxTokens > 0 ? maxTokens : 8_192,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

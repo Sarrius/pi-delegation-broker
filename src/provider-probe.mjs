@@ -47,6 +47,10 @@ export function parseModelVersion(modelId) {
   // Aggregators namespace models (`anthropic/claude-opus-5`, `~openai/gpt-latest`).
   // Generation belongs to the terminal model identity, not the reseller/vendor prefix.
   const normalized = modelId.toLowerCase().replace(/^~/, "").split("/").at(-1);
+  // Premium models coexist with the ordinary lineup. Their release must not make
+  // current Sol/Terra/Luna routes stale and force ordinary work into premium capacity.
+  const apex = /^gpt-(\d+(?:\.\d+)*)-astra(?:-|$)/.exec(normalized);
+  if (apex) return { family: "gpt-astra", version: apex[1].split(".").map(Number) };
   const match = VERSION_PATTERN.exec(normalized);
   if (!match) return { family: normalized.split(/[-_.:/]/)[0] || normalized, version: null };
   const family = match[1];

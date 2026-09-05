@@ -14,8 +14,9 @@ import { appendWorkflowNodes, closeWorkflow, TaskOrchestrator } from "../src/wor
 import { readJob, requestJobCancellation, recoverJobs } from "../src/delegation-job-store.mjs";
 
 test("default team attempt budget allows one bounded route handoff per admitted node", () => {
-  assert.equal(normalizeTeamBudgets({ maxNodes: 4 }, { concurrency: 4 }).maxAttempts, 8);
-  assert.equal(normalizeTeamBudgets({}, { concurrency: 4 }).maxAttempts, 2_000);
+  assert.equal(normalizeTeamBudgets({ maxNodes: 4 }, { concurrency: 4 }).maxAttempts, 32);
+  assert.equal(normalizeTeamBudgets({ maxNodes: 2 }, { concurrency: 2 }).maxAttempts, 16);
+  assert.equal(normalizeTeamBudgets({}, { concurrency: 4 }).maxAttempts, 8_000);
   assert.equal(normalizeTeamBudgets({ maxNodes: 4, maxAttempts: 3 }, { concurrency: 4 }).maxAttempts, 3);
 });
 

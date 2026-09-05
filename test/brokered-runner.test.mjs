@@ -12,7 +12,7 @@ test("route-specific provider policy rejection is failover-eligible", () => {
   assert.equal(classifyChildFailure("controller provider terminal: auth_fatal (401)"), "auth_fatal");
   assert.equal(classifyChildFailure("controller provider terminal: rejected_before_send (400, subscription_extra_usage_required)"), "account_exhausted");
   assert.equal(classifyChildFailure("controller provider terminal: transport_before_headers"), "unavailable");
-  assert.equal(classifyChildFailure("controller provider terminal: controller_failure"), "unavailable");
+  assert.equal(classifyChildFailure("controller provider terminal: controller_failure"), "controller_failure");
   assert.equal(classifyChildFailure("controller input budget exhausted: input_budget_exceeded (used=10, requested=20, cap=25)"), "budget_exhausted");
   assert.equal(classifyChildFailure("controller output budget exhausted: output_budget_exceeded (used=10, cap=10)"), "budget_exhausted");
   assert.equal(classifyChildFailure("provider returned input_budget_exceeded"), "fatal");

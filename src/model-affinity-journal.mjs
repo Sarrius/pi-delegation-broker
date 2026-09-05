@@ -14,7 +14,8 @@
  * what a route consumed to produce an accepted result — tokens, wall-clock latency, and how many
  * attempts it took. That is the currency this journal keeps.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute } from "node:path";
 
 const RESOURCE_ID = /^[A-Za-z0-9~][A-Za-z0-9._/:~-]{0,191}$/;
@@ -91,15 +92,14 @@ function load(path) {
 function reliability(entry) {
   const total = entry.accepted + entry.rejected;
   if (total < MIN_OBSERVATIONS) return undefined;
-  // Wilson-like conservative prior: a route with 3/3 wins ranks below a route with a long,
-  // equally clean record less often than a raw percentage would. Rejections hurt sharply.
-  return (entry.accepted + 1) / (total + 2) * Math.log2(total + 1);
+  // Beta(1,1) posterior mean. Sample size expresses confidence, never a volume bonus.
+  return (entry.accepted + 1) / (total + 2);
 }
 
 function means(entry) {
   const total = Math.max(1, entry.accepted + entry.rejected);
   return {
-    tokens: entry.tokenTotal / total,
+    tokens: entry.tokenSamples ? entry.tokenTotal / entry.tokenSamples : undefined,
     latencyMs: entry.latencyTotalMs / total,
     attempts: (entry.attemptTotal || total) / total,
   };
@@ -112,7 +112,7 @@ function means(entry) {
  * same accepted work.
  */
 function efficiencyDiscount(observed, best) {
-  const ratio = (value, floor) => (best[floor] > 0 ? Math.max(1, value / best[floor]) : 1);
+  const ratio = (value, floor) => (value !== undefined && best[floor] > 0 ? Math.max(1, value / best[floor]) : 1);
   const excess = TOKEN_WEIGHT * (ratio(observed.tokens, "tokens") - 1)
     + LATENCY_WEIGHT * (ratio(observed.latencyMs, "latencyMs") - 1)
     + ATTEMPT_WEIGHT * (ratio(observed.attempts, "attempts") - 1);
@@ -124,17 +124,21 @@ export class ModelAffinityJournal {
   #path;
   #state;
   #now;
+  #store;
+  #context;
 
-  constructor({ path, now = () => Date.now() } = {}) {
-    if (typeof path !== "string" || !isAbsolute(path)) throw new Error("model affinity journal requires an absolute path");
+  constructor({ path, store, context = "legacy", now = () => Date.now() } = {}) {
+    if (!store && (typeof path !== "string" || !isAbsolute(path))) throw new Error("model affinity journal requires an absolute path");
     if (typeof now !== "function") throw new Error("model affinity journal requires a clock");
     this.#path = path;
     this.#now = now;
-    this.#state = load(path);
+    this.#store = store;
+    this.#context = context;
+    this.#state = store ? fresh() : load(path);
   }
 
   /** Called only by a controller verifier bridge after receipt validation. */
-  recordVerified({ resourceId, capabilities, outcome, latencyMs, tokens, attempts, timestamp = this.#now() } = {}) {
+  recordVerified({ resourceId, capabilities, outcome, latencyMs, tokens, attempts, observationId, context = this.#context, timestamp = this.#now() } = {}) {
     if (typeof resourceId !== "string" || !RESOURCE_ID.test(resourceId)) throw new Error("model affinity requires a valid resource id");
     if (outcome !== "accepted" && outcome !== "rejected") throw new Error("model affinity outcome must be accepted or rejected");
     if (!Number.isSafeInteger(latencyMs) || latencyMs < 0 || !Number.isSafeInteger(timestamp) || timestamp < 0) {
@@ -143,12 +147,20 @@ export class ModelAffinityJournal {
     if (tokens !== undefined && (!Number.isSafeInteger(tokens) || tokens < 0)) throw new Error("model affinity tokens must be non-negative");
     if (attempts !== undefined && (!Number.isSafeInteger(attempts) || attempts < 1)) throw new Error("model affinity attempts must be a positive count");
     const taskClass = capabilityClass(capabilities);
+    if (this.#store) {
+      this.#store.append({ id: observationId ?? `quality:${randomUUID()}`, kind: "quality", timestamp,
+        data: {resourceId, capabilities, outcome, latencyMs, context, ...(tokens === undefined ? {} : {tokens}), ...(attempts === undefined ? {} : {attempts})} });
+      this.#refresh(context);
+      const entry = this.#state.observations[`${taskClass}\u0000${resourceId}`];
+      return Object.freeze({...entry, reliability: reliability(entry), efficiency: means(entry)});
+    }
     const key = `${taskClass}\u0000${resourceId}`;
     const entry = this.#state.observations[key]
       ?? { taskClass, resourceId, accepted: 0, rejected: 0, latencyTotalMs: 0, tokenTotal: 0, attemptTotal: 0, lastObservedAt: 0 };
     entry[outcome] += 1;
     entry.latencyTotalMs += latencyMs;
     entry.tokenTotal += tokens ?? 0;
+    if (tokens !== undefined) entry.tokenSamples = (entry.tokenSamples ?? 0) + 1;
     entry.attemptTotal += attempts ?? 1;
     entry.lastObservedAt = Math.max(entry.lastObservedAt, timestamp);
     this.#state.observations[key] = entry;
@@ -160,7 +172,8 @@ export class ModelAffinityJournal {
   }
 
   /** Return a complete candidate ordering; unproven routes retain caller order. */
-  rank({ resourceIds, capabilities } = {}) {
+  rank({ resourceIds, capabilities, context = this.#context, selectionId, explore = false } = {}) {
+    this.#refresh(context);
     if (!Array.isArray(resourceIds) || resourceIds.some((id) => typeof id !== "string" || !RESOURCE_ID.test(id)) || new Set(resourceIds).size !== resourceIds.length) {
       throw new Error("model affinity rank requires unique resource ids");
     }
@@ -183,18 +196,56 @@ export class ModelAffinityJournal {
         latencyMs: Number.isFinite(best.latencyMs) ? best.latencyMs : 0,
         attempts: Number.isFinite(best.attempts) ? best.attempts : 0,
       };
-      entry.score = entry.reliability * efficiencyDiscount(entry.observed, floor);
+      entry.score = entry.reliability;
+      entry.efficiency = efficiencyDiscount(entry.observed, floor);
     }
-    measured.sort((left, right) => (right.score - left.score) || (left.index - right.index));
-    return Object.freeze([...measured.map((entry) => entry.resourceId), ...unmeasured.map((entry) => entry.resourceId)]);
+    // Quality bands keep cost a tie-breaker, so cheap wrong work cannot buy a higher tier.
+    const ordered = [...measured, ...unmeasured.map(entry => ({...entry, score: 0.5, efficiency: 1}))]
+      .sort((a,b) => (Math.floor(b.score * 20) - Math.floor(a.score * 20)) || (b.efficiency-a.efficiency) || a.index-b.index);
+    if (this.#store && selectionId && explore && unmeasured.length && measured.some(entry => entry.score >= 0.5)) {
+      this.#store.transaction(() => {
+      const id = `decision:${selectionId}`;
+      const prior = this.#store.list({kind: "decision", limit: 100000}).filter(row => row.data.context === context && row.data.taskClass === taskClass);
+      const existing = prior.find(row => row.id === id);
+      // One eligible, low-risk exploration per ten decisions. Preview/rank without selectionId is pure.
+      const chosen = existing ? existing.data.explorationResource : (prior.length % 10 === 9
+        ? unmeasured[Math.floor(prior.length / 10) % unmeasured.length].resourceId : null);
+      this.#store.append({id,kind: "decision",data: {context,taskClass,explorationResource:chosen}});
+      const index = ordered.findIndex(entry => entry.resourceId === chosen);
+      if (index > 0) ordered.unshift(...ordered.splice(index,1));
+      });
+    }
+    return Object.freeze(ordered.map(entry => entry.resourceId));
   }
 
-  snapshot() {
+  snapshot(context = this.#context) {
+    this.#refresh(context);
     return Object.freeze(structuredClone(this.#state));
+  }
+
+  #refresh(context) {
+    if (!this.#store) return;
+    const state = fresh();
+    // A bounded recent evidence window permits recovery from model/harness drift.
+    for (const {data, timestamp} of this.#store.list({kind:"quality",limit:100000})) {
+      if (data.context !== context) continue;
+      if (timestamp < this.#now() - 30 * 24 * 60 * 60 * 1000) continue;
+      const taskClass = capabilityClass(data.capabilities);
+      const key = `${taskClass}\u0000${data.resourceId}`;
+      const entry = state.observations[key] ??= {taskClass,resourceId:data.resourceId,accepted:0,rejected:0,latencyTotalMs:0,tokenTotal:0,tokenSamples:0,attemptTotal:0,lastObservedAt:0};
+      entry[data.outcome]++;
+      entry.latencyTotalMs += data.latencyMs;
+      if (data.tokens !== undefined) {entry.tokenTotal += data.tokens; entry.tokenSamples++;}
+      entry.attemptTotal += data.attempts ?? 1;
+      entry.lastObservedAt = Math.max(entry.lastObservedAt,timestamp);
+    }
+    this.#state = state;
   }
 
   #persist() {
     mkdirSync(dirname(this.#path), { recursive: true, mode: 0o700 });
-    writeFileSync(this.#path, `${JSON.stringify(this.#state, null, 2)}\n`, { mode: 0o600 });
+    const temporary = `${this.#path}.${randomUUID()}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(this.#state, null, 2)}\n`, { mode: 0o600 });
+    renameSync(temporary, this.#path);
   }
 }

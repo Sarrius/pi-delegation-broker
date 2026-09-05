@@ -19,9 +19,25 @@ const submittedAt = Date.now() - 100;
 submitJob(jobs, {
   schemaVersion: 1, jobId: "delegate-recovered-cancel-1", kind: "task", status: "queued",
   task: "cancel me", cwd: packageRoot, submittedAt, updatedAt: submittedAt,
+  ownerSessionId: "recovered-owner",
   idempotencyKey: "recovered-cancel", policyGeneration: "unresolved",
 });
-requestJobCancellation(jobs, "delegate-recovered-cancel-1", submittedAt + 10);
+requestJobCancellation(jobs, "delegate-recovered-cancel-1", submittedAt + 10, "recovered-owner");
+submitJob(jobs, {
+  schemaVersion: 1, jobId: "foreign-live", kind: "task", status: "running",
+  ownerSessionId: "another-owner", task: "keep working", cwd: packageRoot,
+  submittedAt, updatedAt: submittedAt,
+});
+const { writeReport, readReport } = await import(pathToFileURL(join(packageRoot, "src", "report-store.mjs")));
+submitJob(jobs, {
+  schemaVersion: 1, jobId: "foreign-done", kind: "task", status: "completed",
+  ownerSessionId: "another-owner", task: "foreign result", cwd: packageRoot,
+  submittedAt, updatedAt: submittedAt + 20, completedAt: submittedAt + 20,
+});
+writeReport(join(brokerState, "reports"), {
+  taskId: "foreign-done", status: "completed", task: "foreign result", text: "FOREIGN_MARKER",
+  startedAt: submittedAt, completedAt: submittedAt + 20,
+});
 
 const tools = new Map(), hooks = new Map();
 let wakeResolve;
@@ -35,13 +51,19 @@ const pi = {
   sendMessage(message, options) { wakeResolve({ message, options }); },
 };
 (await import(extensionPath)).default(pi);
-const ctx = { cwd: packageRoot, modelRegistry: { getAll() { return []; } }, ui: { notify() {} } };
+const ctx = { cwd: packageRoot, sessionManager: { getSessionId() { return "recovered-owner"; } }, modelRegistry: { getAll() { return []; } }, ui: { notify() {} } };
 await hooks.get("session_start")?.({}, ctx);
 const wake = await Promise.race([
   wakePromise,
   new Promise((_, reject) => setTimeout(() => reject(new Error("recovered cancellation did not wake")), 2_000)),
 ]);
 assert.match(wake.message.content, /delegate-recovered-cancel-1: failed/);
+assert.doesNotMatch(wake.message.content, /foreign/);
+assert.equal(readJob(jobs, "foreign-live").status, "running");
+assert.equal(readJob(jobs, "foreign-live").updatedAt, submittedAt);
+assert.equal(readReport(join(brokerState, "reports"), "foreign-done").wakeClaimedAt, null);
+const unread = await tools.get("delegate_collect").execute("list", {}, new AbortController().signal);
+assert.doesNotMatch(JSON.stringify(unread), /foreign/);
 assert.equal(wake.options.triggerTurn, true);
 await hooks.get("message_start")?.({ message: {
   role: "custom", customType: wake.message.customType, details: wake.message.details,

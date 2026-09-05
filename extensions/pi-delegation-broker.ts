@@ -1,3 +1,4 @@
+import { createControllerProvider } from "../src/pi-native-provider.ts";
 /**
  * Parent-side Pi extension for the delegation broker.
  *
@@ -103,15 +104,20 @@ import {
   initialReportWakeAt, ParentWakeCoordinator, PARENT_WAKE_SYSTEM_RULE,
 } from "../src/parent-wake.mjs";
 import { planUnreadNotice, seedNotifiedUnread } from "../src/unread-notice.mjs";
-import { buildFleetProjection, fleetSummary, formatFleetDetails, formatFleetWidget } from "../src/fleet-view.mjs";
+import { buildFleetProjection, fleetSummary, formatDelegationStatus, formatFleetDetails, formatFleetWidget } from "../src/fleet-view.mjs";
 import { normalizeContract, renderRoleFraming, resolveContract } from "../src/child-contract.mjs";
 import { RecursiveAdmissionStore, normalizeRecursivePolicy } from "../src/recursive-admission.mjs";
 import { isCatalogOnlyNativeProvider } from "../src/native-provider-routing.mjs";
+import { captureChildRuntime } from "../src/child-runtime-snapshot.mjs";
+import { createOwnerModelAdmission } from "../src/apex-admission.mjs";
+
+import { RoutingHistoryStore } from "../src/routing-history-store.mjs";
+import { TASK_CLASSES, withWorkBudget, activeAssignments, assignmentNotice, learningContext, overlappingAssignment, parentWriteConflict, taskFingerprint } from "../src/delegation-policy.mjs";
+import { importLegacyAffinity, ownerKey, routeFact, historySummary, qualitySummary, legacyQualitySummary } from "../src/delegation-history.mjs";
+import { delegationInventory, inventorySummary, modelLearningIdentity, rankAdmittedResources } from "../src/delegation-inventory.mjs";
 
 const EXTENSIONS_DIR = dirname(fileURLToPath(import.meta.url));
-const CHILD_SHIM_PATH = join(EXTENSIONS_DIR, "child-shim.ts");
-const CONTROLLER_PROXY_PATH = join(EXTENSIONS_DIR, "controller-provider-proxy.ts");
-const BEHAVIORAL_ENFORCEMENT_PATH = join(EXTENSIONS_DIR, "pi-behavioral-enforcement.ts");
+const CHILD_RUNTIME_CAPTURE = captureChildRuntime(dirname(EXTENSIONS_DIR));
 const PARENT_AGENT_DIR = join(homedir(), ".pi", "agent");
 const STATE_DIR = join(PARENT_AGENT_DIR, "delegation-broker");
 // Every live Pi controller owns its IPC socket/token lifecycle. Capacity and health remain shared
@@ -140,8 +146,6 @@ const CURRENCY_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1_000;
 const FLEET_REFRESH_MS = 1_000;
 const FLEET_WIDGET_ROWS = 5;
 const FLEET_DURABLE_LIMIT = 256;
-const MODEL_CATALOG_REQUEST_EVENT = "pi:model-catalog:request:v1";
-const MODEL_CATALOG_SNAPSHOT_EVENT = "pi:model-catalog:snapshot:v1";
 // Cursor's subscription bridge and the parent-owned Anthropic/Codex OAuth slot proxy do not
 // expose a safe generic `/models` endpoint for the controller's currency probe. In particular,
 // the controller already holds the real access token while the loopback child proxy deliberately
@@ -195,6 +199,15 @@ const ACCEPTANCE_CHECK = Type.Object({
   timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 120000 })),
 }, { description: "Fixed controller-owned checks. Executable argv and caller-supplied claims are not accepted." });
 
+const WORK_PLAN = Type.Object({
+  taskClass: StringEnum([...TASK_CLASSES]),
+  maxAttempts: Type.Optional(Type.Integer({minimum:1,maximum:8,description:"Whole-child physical attempt cap; default 3. Retries consume this same allowance."})),
+  deliverable: Type.String({minLength:1,maxLength:1000,description:"The exact result the child owns."}),
+  benefit: Type.String({minLength:1,maxLength:1000,description:"Why delegation is worth briefing, waiting and integration cost."}),
+  parentWork: Type.String({minLength:1,maxLength:1000,description:"Independent work the parent will do, or wait for this result."}),
+  purpose: Type.Optional(StringEnum(["produce","review"] as const)),
+  ownedPaths: Type.Optional(Type.Array(Type.String({maxLength:4096}),{maxItems:16,description:"Absolute files/directories exclusively assigned for production. Parent write/edit is blocked until terminal; shell writes must respect the same ownership."})),
+});
 const WORKFLOW_NODE = Type.Object({
   id: Type.String({ description: "Stable workflow node id." }),
   task: Type.String({ description: "Self-contained child instruction for this stage." }),
@@ -217,13 +230,14 @@ const WORKFLOW_NODE = Type.Object({
   dependsOn: Type.Optional(Type.Array(Type.String(), { maxItems: 64 })),
   inputs: Type.Optional(Type.Array(Type.String(), {
     maxItems: 64,
-    description: "Completed dependency node ids whose verified reports are appended to this node's instruction.",
+    description: "Completed dependency node ids whose terminal reports are appended to this node's instruction.",
   })),
   capabilities: Type.Optional(Type.Array(StringEnum([...CAPABILITIES]))),
   tier: Type.Optional(StringEnum(["cheap", "standard", "frontier"] as const)),
   thinking: Type.Optional(StringEnum([...THINKING_MODES])),
   route: Type.Optional(StringEnum([...ROUTE_MODES])),
   role: Type.Optional(ROLE),
+  work: WORK_PLAN,
   skills: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
     maxItems: 8,
     description: "Absolute paths of controller-reviewed skill files. Ambient skill discovery stays off; each path is hashed and passed as an explicit --skill. A skill cannot grant tools or effect capability.",
@@ -305,6 +319,7 @@ const DELEGATE_PARAMS = Type.Object({
     description: "auto lets the selector choose; inherit_model asks for this session's exact model when it is current and admissible; peer asks for a proven quality-equivalent and fails closed while no calibrated equivalence exists.",
   })),
   role: Type.Optional(ROLE),
+  work: WORK_PLAN,
   skills: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
     maxItems: 8,
     description: "Absolute paths of controller-reviewed skill files. Ambient skill discovery stays off; each path is hashed and passed as an explicit --skill. A skill cannot grant tools or effect capability.",
@@ -318,6 +333,8 @@ interface BrokerRuntime {
   stopCurrencyRefresh: () => void;
   lastRoute?: { summary: string; at: number };
   routingAudit: any;
+  history: any;
+  learningContexts: Map<string,string>;
   currency: () => Record<string, any>;
   checkpointStore: any;
   defectStore: any;
@@ -472,7 +489,11 @@ function catalogOnlyListings(registry: any, probedRoutes: Map<string, unknown>) 
 
 function controllerProviderPair(ctx: any) {
   const value = ctx?.controllerProvider;
-  if (value === undefined) return undefined;
+  if (value === undefined) {
+    // Pi owns models, runtime implementations and auth. No sibling extension bootstraps us.
+    if (typeof ctx?.modelRegistry?.getApiKeyAndHeaders !== "function" || typeof ctx?.modelRegistry?.getProvider !== "function") return undefined;
+    return createControllerProvider({modelRegistry:ctx.modelRegistry});
+  }
   const keys = value && typeof value === "object" && !Array.isArray(value)
     ? Object.keys(value).sort().join(",")
     : "";
@@ -501,19 +522,15 @@ function controllerRepairAdapter(ctx: any) {
   return Object.freeze({ ...value });
 }
 
-function liveProviderCatalog(ctx: any, supplementalModels: any[] = []) {
+function liveProviderCatalog(ctx: any) {
   const runtimeModels = ctx?.modelRegistry?.getAll?.() ?? ctx?.modelRegistry?.getAvailable?.();
   if (!Array.isArray(runtimeModels)) throw new Error("Pi live model registry is unavailable");
-  const suppliedProviders = new Set(supplementalModels.map((model) => model?.provider).filter(Boolean));
-  const merged = [
-    ...runtimeModels.filter((model: any) => !suppliedProviders.has(model?.provider)),
-    ...supplementalModels,
-  ];
+  const merged = runtimeModels;
   const auth = readJson(join(PARENT_AGENT_DIR, "auth.json"));
   return modelRegistryToProviderCatalog(merged, { authorizedProviders: activeAuthorizedProviders(auth) });
 }
 
-async function startBroker(ctx: any, getSupplementalModels: () => any[], recursiveRequester?: (event: any) => any): Promise<BrokerRuntime> {
+async function startBroker(ctx: any, recursiveRequester?: (event: any) => any): Promise<BrokerRuntime> {
   if (!existsSync(PREFERENCES_PATH)) writeModelPreferences(PREFERENCES_PATH, DEFAULT_MODEL_PREFERENCES);
   else {
     const normalized = loadModelPreferences(PREFERENCES_PATH);
@@ -526,7 +543,7 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
   // An empty authorized fleet is a valid runtime state: all subscription credentials may be
   // expired or temporarily unavailable. The signed controller registry then denies new work
   // cleanly instead of retaining an account that is no longer usable.
-  const registry = catalogToBrokerRegistry(liveProviderCatalog(ctx, getSupplementalModels()), { confidence: "observed", allowEmpty: true });
+  const registry = catalogToBrokerRegistry(liveProviderCatalog(ctx), { confidence: "observed", allowEmpty: true });
   const now = Date.now();
   const payload = {
     registryVersion: `session-${now}`,
@@ -580,13 +597,17 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     signedRegistry,
     trustedRegistryKeys: { [REGISTRY_KEY_ID]: keys.publicKey },
     ...(controllerProvider ?? {}),
+    resourceRanker: rankAdmittedResources,
     dynamicProviders: true,
-    dynamicProviderCatalog: () => liveProviderCatalog(ctx, getSupplementalModels()),
+    dynamicProviderCatalog: () => liveProviderCatalog(ctx),
     sweepIntervalMs: 1_000,
   });
   await supervisor.start();
   const acceptancePlans = new Map<string, any>();
-  const affinityJournal = new ModelAffinityJournal({ path: join(CONTROLLER_PRIVATE_DIR, "model-affinity.json") });
+  const history = new RoutingHistoryStore({path:join(STATE_DIR,"routing-history.sqlite")});
+  importLegacyAffinity(history,STATE_DIR);
+  const learningContexts = new Map<string,string>();
+  const affinityJournal = new ModelAffinityJournal({store:history});
   const routingAudit = new RoutingAuditJournal({ path: join(CONTROLLER_PRIVATE_DIR, "routing-audit.json") });
   const verifiedRouting = new ControllerVerifiedRoutingBoard({
     routingBoard: new RoutingBoard(), verificationAuthority, affinityJournal,
@@ -610,6 +631,9 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
       if (!routingObservation) return { status: "not_recorded" };
       return verifiedRouting.recordFinalized({ taskId, leaseId, fencingToken, verification, outcome,
         resourceId: routingObservation.resourceId, capabilities: routingObservation.capabilities,
+        learningResourceId: modelLearningIdentity(routingObservation.resourceId,supervisor.providerWatcher.currentRegistry()),
+        context: learningContexts.get(taskId) ?? learningContext(undefined),
+        observationId: `verified:${createHash("sha256").update(`${taskId}:${leaseId}:${fencingToken}`).digest("hex")}`,
         latencyMs: routingObservation.latencyMs,
         ...(routingObservation.tokens === undefined ? {} : { tokens: routingObservation.tokens }),
         ...(routingObservation.attempts === undefined ? {} : { attempts: routingObservation.attempts }) });
@@ -727,7 +751,6 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
       // Ask the owner-side catalog publisher for a fresh snapshot before reading the broker
       // registry. This closes the window where models.json/auth.json changed but the long-lived
       // Pi model registry had not yet reached the watcher.
-      try { ctx?.events?.emit?.(MODEL_CATALOG_REQUEST_EVENT); } catch { /* snapshot is best effort; readiness still fails closed */ }
       const watcher = supervisor.providerWatcher;
       if (!watcher) throw new Error("provider watcher is unavailable");
       const registryRefresh = await watcher.refresh();
@@ -748,25 +771,50 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     availability: () => supervisor.inventory(),
     currency,
     preferences: () => loadModelPreferences(PREFERENCES_PATH),
-    learnedRanker: (input: any) => affinityJournal.rank(input),
+    learnedRanker: (input: any) => {
+      const registry = supervisor.providerWatcher.currentRegistry();
+      const identities = new Map(input.resourceIds.map((id: string) => [id, modelLearningIdentity(id,registry)]));
+      const ranked = affinityJournal.rank({...input,resourceIds:[...new Set(identities.values())]});
+      return [...input.resourceIds].sort((a,b) => ranked.indexOf(identities.get(a))-ranked.indexOf(identities.get(b)));
+    },
     enforceQuality: true,
     enforceProvenance: true,
   });
-  const childExtensions = [CHILD_SHIM_PATH, ...(controllerProvider ? [CONTROLLER_PROXY_PATH] : []), BEHAVIORAL_ENFORCEMENT_PATH];
+  const childRuntime = CHILD_RUNTIME_CAPTURE.materialize(CONTROLLER_PRIVATE_DIR);
+  const behavioralPath = childRuntime.extensionPath("pi-behavioral-enforcement.ts");
+  const childExtensions = [childRuntime.extensionPath("child-shim.ts"),
+    ...(controllerProvider ? [childRuntime.extensionPath("controller-provider-proxy.ts")] : []), behavioralPath];
   const resolver = new BrokeredLaunchResolver({
     socketPath: supervisor.socketPath,
     controllerToken: supervisor.controllerToken,
     agentRoot: join(STATE_DIR, "child-agents"),
     extensionPaths: childExtensions,
     launcherAttestationConfig: {
-      behavioralExtensionPath: BEHAVIORAL_ENFORCEMENT_PATH,
+      behavioralExtensionPath: behavioralPath,
       trustedExtensionDigests: childExtensions
         .map((path) => createHash("sha256").update(readFileSync(path)).digest("hex")),
     },
     offline: false,
     // Tracking happens only after the runner knows which failover attempt actually completed.
     // Marking the first attempt here could verify stale work before a later route succeeds.
-    selectContract: (request: any) => baseSelectContract(request),
+    selectContract: (request: any) => {
+      childRuntime.verify();
+      const taskId = request.capabilityRequest?.taskId ?? request.childId;
+      const context = request.capabilityRequest?.learningContext ?? learningContexts.get(taskId) ?? learningContext(undefined);
+      learningContexts.set(taskId,context);
+      request = {...request,capabilityRequest:{...request.capabilityRequest,learningContext:context}};
+      const requested = request.capabilityRequest?.requireModelIdentity;
+      // Only a controller-resolved inherit_model request matching the live parent
+      // may reuse a premium route. A plain tier/preference never grants this.
+      if (requested && requested.provider === ctx.model?.provider
+        && requested.modelId === (ctx.model?.id ?? ctx.model?.modelId)
+        && qualityForModel(requested) === "apex") {
+        return baseSelectContract({ ...request, capabilityRequest: {
+          ...request.capabilityRequest, apexAdmission: createOwnerModelAdmission(requested),
+        } });
+      }
+      return baseSelectContract(request);
+    },
     ...(controllerProvider ? {
       refreshProviderState,
       routePreflight: controllerProvider.routePreflight,
@@ -778,7 +826,7 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
       ? { controllerProxy: { providerId: "broker-proxy" } }
       : {
         // Compatibility only: this writes one scoped auth record into the child and is not
-        // permitted by the live-validation gate. Owner hosts should inject controllerProvider.
+        // permitted by the live-validation gate. Modern Pi hosts use the native provider adapter above.
         provisionChildAuth: ({ agentDir, model }: { agentDir: string; model?: { provider: string; modelId: string } }) => {
           if (!model?.provider) throw new Error("broker leased a resource with no resolvable model");
           return writeScopedChildAuth({ agentDir, provider: model.provider, parentAgentDir: PARENT_AGENT_DIR });
@@ -800,6 +848,7 @@ async function startBroker(ctx: any, getSupplementalModels: () => any[], recursi
     stopCurrencyRefresh: () => clearInterval(currencyTimer),
     lastRoute: undefined,
     routingAudit,
+    history, learningContexts,
     currency,
     checkpointStore,
     defectStore,
@@ -820,7 +869,6 @@ export default function piDelegationBroker(pi: any) {
   // Task ids already surfaced, or already sitting unread when this session started.
   // Seeded on session_start so a restart cannot dump yesterday's inbox onto the first prompt.
   let notifiedUnread = new Set<string>();
-  let supplementalModels: any[] = [];
   const activeTasks = new Map<string, {
     controller: AbortController;
     promise: Promise<any>;
@@ -838,6 +886,8 @@ export default function piDelegationBroker(pi: any) {
   // current `_runAgentPrompt` is still settling. Starting an automatic wake there
   // can race a queued owner message and surface a generic AbortError. Hold wakes
   // until the next agent_start/settled boundary instead.
+  let parentAgentActive = false;
+  let parentTurnGeneration = 0;
   let parentWakeSettling = false;
   let fleetTimer: ReturnType<typeof setInterval> | undefined;
   const fleetJobs = new Map<string, any>();
@@ -848,6 +898,8 @@ export default function piDelegationBroker(pi: any) {
   const sessionBindings = new SessionBindingStore({ root: SESSION_BINDINGS_DIR });
 
   const currentSessionId = (ctx: any = lastCtx) => sessionIdentity(ctx);
+  const ownsJob = (job: any, ctx: any = lastCtx) => job?.ownerSessionId === currentSessionId(ctx);
+  const ownsReport = (report: any) => ownsJob(readJob(JOBS_DIR, report?.taskId));
   const assertRepairOwner = (proposal: any, ctx: any) => {
     const owner = proposal?.metadata?.ownerSessionId;
     if (owner !== undefined && owner !== currentSessionId(ctx)) throw new Error("repair owner session does not match");
@@ -855,7 +907,7 @@ export default function piDelegationBroker(pi: any) {
   const activeRootJobs = () => {
     try {
       return listJobs(JOBS_DIR)
-        .filter((job: any) => !isTerminalJobStatus(job.status))
+        .filter((job: any) => ownsJob(job) && !isTerminalJobStatus(job.status))
         .map((job: any) => job.jobId)
         .slice(0, 64);
     } catch { return []; }
@@ -966,13 +1018,12 @@ export default function piDelegationBroker(pi: any) {
     parentWake = new ParentWakeCoordinator({
       // The check and send are synchronous at the extension boundary. If a user
       // message is already queued while the session reports idle, leave the
-      // durable report pending; agent_start will call notifyReady() and the wake
-      // will then be a normal follow-up instead of a competing fresh turn.
+      // durable report pending until the latest agent_settled boundary.
       canDispatch: () => {
-        if (parentWakeSettling) return false;
+        if (parentAgentActive || parentWakeSettling) return false;
         const ctx = lastCtx;
         if (typeof ctx?.isIdle !== "function" || typeof ctx?.hasPendingMessages !== "function") return true;
-        return !(ctx.isIdle() === true && ctx.hasPendingMessages() === true);
+        return ctx.isIdle() === true && ctx.hasPendingMessages() === false;
       },
       sendMessage: (message: any, options: any) => pi.sendMessage(message, options),
       claimWake: (taskId: string) => claimReportWake(REPORTS_DIR, taskId),
@@ -988,7 +1039,7 @@ export default function piDelegationBroker(pi: any) {
   };
 
   const enqueueParentWake = (report: any) => {
-    if (!report || report.readAt !== null || report.wakeClaimedAt !== null
+    if (!report || !ownsReport(report) || report.readAt !== null || report.wakeClaimedAt !== null
       || report.wakeAt !== null || !parentWake) return false;
     const queued = parentWake.enqueue(report);
     if (queued) notifiedUnread.add(report.taskId);
@@ -1010,7 +1061,7 @@ export default function piDelegationBroker(pi: any) {
       const text = String(report.text ?? "");
       bytes += Buffer.byteLength(text);
       if (bytes > 256 * 1024) throw new Error("dependency reports exceed the 256 KiB workflow input bound");
-      sections.push(`Dependency ${input.fromNode} (verified report ${reportTaskId}):\n${text}`);
+      sections.push(`Dependency ${input.fromNode} (terminal report ${reportTaskId}; verification ${report.verificationStatus ?? "unverified"}):\n${text}`);
     }
     return `${node.task}${WORKFLOW_INPUT_HEADER}${sections.join("\n\n")}`;
   };
@@ -1037,6 +1088,9 @@ export default function piDelegationBroker(pi: any) {
       }
     } catch { /* audit storage cannot change task completion semantics */ }
     const completedAt = Date.now();
+    try { broker.history.append({id:`route:${childId}`,kind:"route",timestamp:completedAt,data:routeFact({taskId:childId,ownerSessionId:readJob(JOBS_DIR,logicalId.split("/")[0])?.ownerSessionId??currentSessionId(lastCtx),context:broker.learningContexts.get(childId)??learningContext(undefined),result,startedAt,completedAt})}); }
+    catch { /* durable report remains the authoritative fallback when telemetry is unavailable */ }
+    broker.learningContexts.delete(childId);
     const persistedReport = writeReport(REPORTS_DIR, {
       taskId: childId,
       logicalId,
@@ -1160,6 +1214,7 @@ export default function piDelegationBroker(pi: any) {
       .filter((report: any) => typeof report.logicalId === "string")
       .map((report: any) => [report.logicalId, report]));
     for (const job of listJobs(JOBS_DIR)) {
+      if (!ownsJob(job)) continue;
       if (isTerminalJobStatus(job.status)) continue;
       const top = byTaskId.get(job.jobId);
       if (top && top.completedAt >= job.submittedAt) {
@@ -1283,6 +1338,9 @@ export default function piDelegationBroker(pi: any) {
             taskId,
             taskDescription: initial.task,
             operationClass: "observe",
+            ...(contract.work ? {budget:{maxAttempts:contract.work.maxAttempts}} : {}),
+            learningContext: learningContext(contract.work,contract.requestedThinking),
+            allowExploration: Boolean(initial.acceptance?.length && ['lookup','summary'].includes(contract.work?.taskClass)) ,
             ...(initial.capabilities?.length ? { requiredCapabilities: initial.capabilities } : {}),
             ...(initial.tier ? { modelTier: initial.tier } : {}),
           },
@@ -1337,7 +1395,7 @@ export default function piDelegationBroker(pi: any) {
           status: cancelled ? "cancelled" : status,
           completedAt: Date.now(),
           terminalReason: cancelled ? "cancelled by controller; terminal child artifact preserved"
-            : reportError ?? result.error ?? "controller verified child result",
+            : reportError ?? result.error ?? "child execution completed",
           policyGeneration: result.selection?.policyGeneration ?? job.policyGeneration,
         };
       });
@@ -1427,7 +1485,9 @@ export default function piDelegationBroker(pi: any) {
               role: nodeContract.role?.name ?? "worker",
             },
             ...(recursionPolicy ? { recursion: { mode: "depth2_readonly_canary", context: recursionPolicy } } : {}),
-            capabilityRequest: workflowObserveCapabilityRequest({ ...node, task }, childId, node.controllerBudget),
+            capabilityRequest: {...withWorkBudget(workflowObserveCapabilityRequest({ ...node, task }, childId, node.controllerBudget),nodeContract.work),
+              learningContext:learningContext(nodeContract.work,nodeContract.requestedThinking),
+              allowExploration:Boolean(node.acceptance?.length && ['lookup','summary'].includes(nodeContract.work?.taskClass))},
             ...(node.attemptBudget ? { attemptBudget: node.attemptBudget } : {}),
             trackForVerification: Boolean(node.acceptance?.length),
           });
@@ -1596,12 +1656,7 @@ export default function piDelegationBroker(pi: any) {
     await Promise.allSettled(active.map((workflow) => workflow.promise));
   };
 
-  pi.events?.on?.(MODEL_CATALOG_SNAPSHOT_EVENT, (payload: any) => {
-    if (payload?.schemaVersion !== 1 || !Array.isArray(payload.models) || payload.models.length > 10_000) return;
-    const valid = payload.models.filter((model: any) => model && typeof model.provider === "string" && typeof model.id === "string");
-    supplementalModels = valid.map((model: any) => ({ ...model }));
-    runtime?.supervisor?.providerWatcher?.refresh?.().catch(() => undefined);
-  });
+
 
   const disposeRuntime = async (current: BrokerRuntime | undefined) => {
     if (!current) return;
@@ -1609,6 +1664,7 @@ export default function piDelegationBroker(pi: any) {
     await current.runner.dispose().catch(() => undefined);
     await current.supervisor.stop().catch(() => undefined);
     current.recursiveStore?.close?.();
+    current.history?.close?.();
   };
 
   const ensureBroker = (ctx: any = lastCtx): Promise<BrokerRuntime> => {
@@ -1616,7 +1672,7 @@ export default function piDelegationBroker(pi: any) {
     if (!ctx) return Promise.reject(new Error("delegation broker has no active Pi context"));
     if (!starting) {
       const generation = startGeneration;
-      starting = startBroker(ctx, () => supplementalModels, handleRecursiveRequest)
+      starting = startBroker(ctx, handleRecursiveRequest)
         .then(async (started) => {
           if (generation !== startGeneration) {
             await disposeRuntime(started);
@@ -1647,12 +1703,13 @@ export default function piDelegationBroker(pi: any) {
 
   pi.on("session_start", (_event: any, ctx: any) => {
     lastCtx = ctx;
+    parentTurnGeneration += 1;
+    parentAgentActive = false;
     parentWakeSettling = false;
     openParentWake();
-    pi.events?.emit?.(MODEL_CATALOG_REQUEST_EVENT, { schemaVersion: 1 });
     try { pruneReports(REPORTS_DIR); } catch { /* pruning is best effort */ }
     let sessionUnread: any[] = [];
-    try { sessionUnread = [...unreadReports(REPORTS_DIR)]; } catch { /* malformed reports are skipped */ }
+    try { sessionUnread = unreadReports(REPORTS_DIR).filter(ownsReport); } catch { /* malformed reports are skipped */ }
     for (const report of sessionUnread.slice(0, FLEET_DURABLE_LIMIT)) rememberFleetReport(report);
     // More durable unread work than the live projection can hold is itself a bounded view.
     if (sessionUnread.length > FLEET_DURABLE_LIMIT) fleetEvicted = true;
@@ -1678,7 +1735,7 @@ export default function piDelegationBroker(pi: any) {
       );
     }
     let recovered: any[] = [];
-    try { recovered = [...recoverJobs(JOBS_DIR)]; } catch { /* malformed job files are skipped by the store */ }
+    try { recovered = [...recoverJobs(JOBS_DIR, Date.now(), { ownerSessionId: currentSessionId(ctx) })]; } catch { /* malformed job files are skipped by the store */ }
     for (const job of recovered) {
       rememberFleetJob(job);
       projectRecoveredTerminalReport(job);
@@ -1717,11 +1774,11 @@ export default function piDelegationBroker(pi: any) {
 
   // Fallback for a failed automatic custom wake: inject through systemPrompt, never
   // `{ message }`. Pi converts a before_agent_start message payload to a user turn and
-  // can steal pi-multi-account's failover continuation.
+  // can steal another extension's recovery continuation.
   pi.on("before_agent_start", async (event: { prompt?: string; systemPrompt?: string }) => {
     let unread;
     try {
-      unread = unreadReports(REPORTS_DIR).filter((report: any) => report.wakeAt === null);
+      unread = unreadReports(REPORTS_DIR).filter((report: any) => ownsReport(report) && report.wakeAt === null);
     } catch { return; }
     const planned = planUnreadNotice({
       unread,
@@ -1731,6 +1788,15 @@ export default function piDelegationBroker(pi: any) {
     });
     notifiedUnread = planned.notifiedIds;
     const additions = [];
+    try {
+      const assignments = activeAssignments(listJobs(JOBS_DIR),currentSessionId(lastCtx));
+      const notice = assignmentNotice(assignments);
+      if (notice) additions.push(notice);
+      if (runtime) additions.push(inventorySummary(delegationInventory({
+        registry:runtime.supervisor.providerWatcher.currentRegistry(),inventory:runtime.supervisor.inventory(),
+        currency:runtime.currency(),preferences:loadModelPreferences(PREFERENCES_PATH),enabled,
+      })));
+    } catch { /* best effort context; launch still enforces admission */ }
     if (planned.inject && planned.systemPrompt) additions.push(planned.systemPrompt);
     else if (typeof event?.systemPrompt === "string" && event.systemPrompt.length > 0) additions.push(event.systemPrompt);
     try {
@@ -1758,11 +1824,16 @@ export default function piDelegationBroker(pi: any) {
   });
 
   pi.on("agent_start", () => {
+    parentTurnGeneration += 1;
+    // A lifecycle wake is never submitted while the parent is already running.
+    // Pi 0.84.2 has a narrow isIdle/isStreaming race where sendMessage(triggerTurn)
+    // otherwise reaches _runAgentPrompt and throws "Agent is already processing".
+    parentAgentActive = true;
     parentWakeSettling = false;
-    void parentWake?.notifyReady();
   });
 
   pi.on("agent_settled", async () => {
+    const settledGeneration = parentTurnGeneration;
     if (activeTasks.size === 0 && activeWorkflows.size === 0) {
       await disposeBrokeredChildProcesses();
     }
@@ -1771,7 +1842,8 @@ export default function piDelegationBroker(pi: any) {
     // wake that was held without claiming it.
     const wake = parentWake;
     const release = setTimeout(() => {
-      if (parentWake !== wake) return;
+      if (parentWake !== wake || parentTurnGeneration !== settledGeneration) return;
+      parentAgentActive = false;
       parentWakeSettling = false;
       void wake?.notifyReady();
     }, 0);
@@ -1779,6 +1851,8 @@ export default function piDelegationBroker(pi: any) {
   });
 
   pi.on("session_shutdown", async (_event: any, ctx: any) => {
+    parentTurnGeneration += 1;
+    parentAgentActive = false;
     parentWakeSettling = false;
     stopFleet();
     parentWake?.close();
@@ -1790,14 +1864,25 @@ export default function piDelegationBroker(pi: any) {
   });
 
   pi.registerCommand("delegation-broker", {
-    description: "Control delegation: start|stop|status|fleet [active|all|id <job>|<job>]|models [provider]|tier <frontier|standard|cheap> <list|add|remove>",
+    description: "Control delegation: start|stop|status|history|fleet [active|all|id <job>|<job>]|models [provider]|tier <frontier|standard|cheap> <list|add|remove>",
     handler: async (args: string, ctx: any) => {
       const tokens = args.trim().split(/\s+/).filter(Boolean);
       const action = (tokens[0] ?? "").toLowerCase();
+      if(action==='history') {
+        const store=runtime?.history??new RoutingHistoryStore({path:join(STATE_DIR,'routing-history.sqlite')});
+        try {ctx.ui.notify(JSON.stringify({performance:qualitySummary(store),legacy:legacyQualitySummary(store),recent:historySummary(store,{limit:30})},null,2),'info');}
+        finally {if(!runtime)store.close();}
+        return;
+      }
       if (action === "start") {
         enabled = true;
         writeEnabled(true);
-        await ensureBroker(ctx).catch(() => undefined);
+        try { await ensureBroker(ctx); }
+        catch (error) {
+          renderFleet(ctx);
+          ctx.ui.notify(`Delegation broker could not start: ${String((error as Error).message).slice(0, 240)}`, "error");
+          return;
+        }
         renderFleet(ctx);
         ctx.ui.notify("Delegation broker enabled", "info");
         return;
@@ -1813,10 +1898,13 @@ export default function piDelegationBroker(pi: any) {
       if (action === "status") {
         const preferences = loadModelPreferences(PREFERENCES_PATH);
         const state = runtime ? runtime.supervisor.status().state : "not_started";
+        const incarnation = ` Code: ${CHILD_RUNTIME_CAPTURE.generation.slice(0, 12)}; ${CHILD_RUNTIME_CAPTURE.sourceChanged()
+          ? "source changed; children keep the captured code; restart Pi after active work finishes to adopt changes"
+          : "source matches this process"}.`;
         const last = runtime?.lastRoute ? ` Last route: ${runtime.lastRoute.summary}` : "";
         const metrics = runtime?.routingAudit?.summary?.().metrics;
         const audit = metrics ? ` Audit: ${metrics.routes} routes, ${metrics.failovers} failovers, ${metrics.legacyTransitions} legacy transitions.` : "";
-        ctx.ui.notify(`Delegation broker: ${enabled ? "enabled" : "stopped"}; runtime: ${state}; frontier preferences: ${preferences.tiers.frontier.length}; standard: ${preferences.tiers.standard.length}; cheap: ${preferences.tiers.cheap.length}.${audit}${last} Use /delegation-broker fleet [active|all|id <job>|<job>], models [provider], or tier <tier> <list|add|remove>.`, "info");
+        ctx.ui.notify(`Delegation broker: ${enabled ? "enabled" : "stopped"}; runtime: ${state}; frontier preferences: ${preferences.tiers.frontier.length}; standard: ${preferences.tiers.standard.length}; cheap: ${preferences.tiers.cheap.length}.${incarnation}${audit}${last} Use /delegation-broker fleet [active|all|id <job>|<job>], models [provider], or tier <tier> <list|add|remove>.`, "info");
         return;
       }
       if (action === "fleet") {
@@ -1884,7 +1972,44 @@ export default function piDelegationBroker(pi: any) {
         ctx.ui.notify("Usage: /delegation-broker tier <tier> list | add <model> <provider...> | remove <model> [provider...]", "warning");
         return;
       }
-      ctx.ui.notify("Usage: /delegation-broker start|stop|status|fleet [active|all|id <job>|<job>]|models [provider]|tier <tier> <list|add|remove>", "warning");
+      ctx.ui.notify("Usage: /delegation-broker start|stop|status|history|fleet [active|all|id <job>|<job>]|models [provider]|tier <tier> <list|add|remove>", "warning");
+    },
+  });
+
+  pi.on("tool_call", async (event:any,ctx:any) => {
+    if (!['write','edit'].includes(event.toolName)) return;
+    const conflict=parentWriteConflict(event.input?.path,ctx?.cwd??lastCtx?.cwd,activeAssignments(listJobs(JOBS_DIR),currentSessionId(ctx??lastCtx)));
+    if(conflict) return {block:true,reason:`${conflict.id} owns this path. Collect its result or cancel and wait for terminal status before editing.`};
+  });
+
+  pi.registerTool({
+    name:"delegate_inventory",label:"Delegation options",
+    description:"Read available providers/models, quality tiers, cooldown and capacity before choosing work. Does not probe or spend tokens; availability is advisory and launch rechecks it. Includes observed routing history when history=true.",
+    parameters:Type.Object({provider:Type.Optional(Type.String({maxLength:200})),history:Type.Optional(Type.Boolean())}),
+    async execute(_id:string,params:{provider?:string;history?:boolean},_signal:any,_update:any,ctx:any) {
+      lastCtx=ctx??lastCtx;
+      if(!runtime) return {content:[{type:"text",text:enabled?"Broker runtime is starting or unavailable. No verified availability snapshot yet; do not assume a catalog model is ready.":"Broker is stopped."}],details:{enabled,rows:[],availabilityGuarantee:false}};
+      const snapshot=delegationInventory({registry:runtime.supervisor.providerWatcher.currentRegistry(),inventory:runtime.supervisor.inventory(),currency:runtime.currency(),preferences:loadModelPreferences(PREFERENCES_PATH),enabled});
+      const rows=snapshot.rows.filter((row:any)=>!params.provider || row.provider===params.provider).slice(0,100);
+      const performance=params.history?qualitySummary(runtime.history):undefined;
+      const legacy=params.history?legacyQualitySummary(runtime.history):undefined;
+      const history=params.history?historySummary(runtime.history,{owner:ownerKey(currentSessionId(lastCtx)),limit:50}):undefined;
+      return {content:[{type:"text",text:inventorySummary(snapshot)+"\n"+JSON.stringify({models:rows,...(history?{history,performance,legacy}:{})})}],details:{...snapshot,rows,totalModels:snapshot.rows.length,...(history?{history,performance,legacy}:{})}};
+    },
+  });
+  pi.registerTool({
+    name:"delegate_feedback",label:"Delegation usefulness",
+    description:"Record the parent's final integration outcome once: used, reworked, redundant, or unused. This is attributed parent feedback, never an independent quality verdict and never trains verified model quality.",
+    parameters:Type.Object({taskId:Type.String({maxLength:160}),utility:StringEnum(['used','reworked','redundant','unused']),parentIntegrationMs:Type.Optional(Type.Integer({minimum:0,maximum:86400000}))}),
+    async execute(_id:string,params:any,_signal:any,_update:any,ctx:any) {
+      const broker=await ensureBroker(ctx);
+      const owner=ownerKey(currentSessionId(ctx));
+      const route=broker.history.list({kind:"route",limit:100000}).find((row:any)=>row.data.taskId===params.taskId && row.data.owner===owner);
+      if(!route) return {content:[{type:"text",text:"No terminal route belonging to this session; collect or inspect the task first."}],isError:true};
+      try {
+        broker.history.append({id:`feedback:${params.taskId}`,kind:"feedback",data:{taskId:params.taskId,owner,utility:params.utility,source:"parent_report",...(params.parentIntegrationMs===undefined?{}:{parentIntegrationMs:params.parentIntegrationMs})}});
+        return {content:[{type:"text",text:"Integration outcome recorded separately from controller-verified quality."}]};
+      } catch(error) {return {content:[{type:"text",text:(error as Error).message}],isError:true};}
     },
   });
 
@@ -1896,7 +2021,7 @@ export default function piDelegationBroker(pi: any) {
       + "The broker selects a current, quality-sufficient model/account and learns efficiency only from controller-verified outcomes, then spawns an isolated Pi child with only that account's credential, "
       + "and retries on another account if the provider throttles mid-task. Read-only work returns a durable task id immediately by default; a terminal durable report automatically wakes the parent to collect it and continue. "
       + "Route every task deliberately before doing it yourself: "
-      + "self = needs this conversation's context, edits the parent harness, or judges the user's intent; "
+      + "self = small work, tightly coupled work, this conversation's context, parent harness edits, or judgement of user intent; "
       + "one cheap child = self-contained read/summarize/grep/draft; "
       + "one standard child = self-contained code reasoning at non-frontier difficulty; "
       + "one frontier child = self-contained, hard, or effect-capable via proposeChangesIn; "
@@ -1905,8 +2030,8 @@ export default function piDelegationBroker(pi: any) {
       + "and route=inherit_model asks for this session's exact model when a peer-level pair of hands is needed. role names what the child is for; it never grants authority.",
     promptSnippet: "Delegate a self-contained subtask to an isolated brokered child agent (cheap/standard/frontier tier, or delegate_workflow for a team)",
     promptGuidelines: [
-      "Before doing work yourself, ask: is this self-contained? If yes, delegate; if no, be able to say why. Self is a decision, not a default.",
-      "Use delegate when a subtask is self-contained: reading or summarizing files, answering a focused question, drafting text that does not need this conversation's context.",
+      "Do small or tightly coupled work yourself. Delegate only when independent specialization or parallel work outweighs briefing, waiting, verification and integration cost. A self-contained task alone is not a reason to delegate.",
+      "Use work to declare taskClass, deliverable, benefit, parentWork and exclusive ownedPaths before launching. Check delegate_inventory when availability matters. Unknown readiness is not confirmed capacity.",
       "Do not use delegate for work that needs this conversation's history or your judgement about the user's intent.",
       "Pick the tier explicitly: cheap for read/summarize/draft, standard for code reasoning, frontier for hard or effect-capable work. Omit tier only when the task is genuinely ambiguous.",
       "Raise thinking when the work is hard rather than long, and use thinking:inherit or route:inherit_model when you need a genuine peer for reasoning instead of a cheaper helper.",
@@ -1914,10 +2039,10 @@ export default function piDelegationBroker(pi: any) {
       "For 2+ independent subtasks use delegate_workflow instead of sequential delegate calls.",
       "To get a code change, pass proposeChangesIn with the repository path and acceptance checks: the child edits an isolated worktree and the controller returns a verified patch that you or the user still have to apply.",
       "Write the delegate task as a complete brief: the child sees nothing of this conversation, so include file paths, context, and exactly what output you expect.",
-      "Read-only delegation is asynchronous by default. Keep working after submission; the controller wakes the parent once the terminal report is durable, then collect it and continue the owner task.",
+      "Read-only delegation is asynchronous by default. Work ONLY on your declared independent part. Do not redo the child deliverable. Collect and integrate it; if taking over, cancel and await terminal status first. Report utility with delegate_feedback: used, reworked, redundant or unused. Cancellation requested is not yet a handoff.",
     ],
     parameters: DELEGATE_PARAMS,
-    async execute(toolCallId: string, params: { task: string; capabilities?: string[]; tier?: "cheap" | "standard" | "frontier"; background?: boolean; wait?: boolean; idempotencyKey?: string; deadlineMs?: number; acceptance?: Array<{ id: string; path?: string; content?: string; timeoutMs?: number }>; proposeChangesIn?: string }, _signal: AbortSignal, onUpdate: any, ctx: any) {
+    async execute(toolCallId: string, params: { task: string; work?: any; capabilities?: string[]; tier?: "cheap" | "standard" | "frontier"; background?: boolean; wait?: boolean; idempotencyKey?: string; deadlineMs?: number; acceptance?: Array<{ id: string; path?: string; content?: string; timeoutMs?: number }>; proposeChangesIn?: string }, _signal: AbortSignal, onUpdate: any, ctx: any) {
       // An effect nobody can check is not delegable: without controller-owned checks the only
       // evidence a patch is good would be the child's own word for it.
       if (params.proposeChangesIn && !params.acceptance?.length) {
@@ -1946,9 +2071,16 @@ export default function piDelegationBroker(pi: any) {
         return { content: [{ type: "text", text: (error as Error).message }], isError: true };
       }
       const submittedAt = Date.now();
-      const childId = `delegate-${submittedAt.toString(36)}-${++counter}`;
+      const childId = `delegate-${submittedAt.toString(36)}-${CONTROLLER_RUNTIME_NAMESPACE}-${++counter}`;
       const asynchronous = !params.proposeChangesIn && params.wait !== true && params.background !== false;
       if (asynchronous) {
+        const assignments = activeAssignments(listJobs(JOBS_DIR),currentSessionId(ctx));
+        const fingerprint = taskFingerprint({task:params.task,cwd:ctx.cwd,contract:submittedContract,acceptance:normalizedAcceptance,capabilities:params.capabilities,tier:params.tier});
+        const duplicate = !params.idempotencyKey && listJobs(JOBS_DIR).find((job:any)=>job.ownerSessionId===currentSessionId(ctx) && !isTerminalJobStatus(job.status) && job.workFingerprint===fingerprint);
+        const submissionKey = params.idempotencyKey ?? duplicate?.idempotencyKey ?? `tool:${toolCallId}`;
+        const existing = listJobs(JOBS_DIR).find((job:any)=>job.ownerSessionId===currentSessionId(ctx) && job.idempotencyKey===submissionKey);
+        const conflict = !existing && overlappingAssignment(submittedContract.work,assignments);
+        if (conflict) return {content:[{type:"text",text:`Delegation overlaps work owned by ${conflict.id}. Collect it or cancel and wait for terminal status before taking over.`}],isError:true,details:{cause:"ownership_conflict",retryable:false,taskId:conflict.id,nextAction:"collect_or_cancel"}};
         let submission: any;
         try {
           submission = submitJob(JOBS_DIR, {
@@ -1964,7 +2096,8 @@ export default function piDelegationBroker(pi: any) {
             ownerSessionId: currentSessionId(ctx),
             submittedAt,
             updatedAt: submittedAt,
-            idempotencyKey: params.idempotencyKey ?? `tool:${toolCallId}`,
+            idempotencyKey: submissionKey,
+            workFingerprint: fingerprint,
             ...(params.deadlineMs ? { deadlineAt: submittedAt + params.deadlineMs } : {}),
             ...(params.capabilities?.length ? { capabilities: [...params.capabilities] } : {}),
             ...(params.tier ? { tier: params.tier } : {}),
@@ -1977,16 +2110,18 @@ export default function piDelegationBroker(pi: any) {
         const taskId = submission.job.jobId;
         rememberFleetJob(submission.job);
         try { refreshSessionBinding(ctx, "active"); } catch { /* fleet state remains durable even if the parent binding is unavailable */ }
-        if (!isTerminalJobStatus(submission.job.status)) startTask(taskId, ctx).catch(() => undefined);
+        if (submission.created && !isTerminalJobStatus(submission.job.status)) startTask(taskId, ctx).catch(() => undefined);
         return {
           content: [{
             type: "text",
-            text: `${submission.created ? "Delegation submitted" : "Existing idempotent delegation returned"}: ${taskId}. The parent is free; use delegate_status, delegate_list, delegate_collect, or delegate_cancel.`,
+            text: `${submission.created ? "Delegation submitted" : "Existing idempotent delegation returned"}: ${taskId}. The child owns this deliverable. Continue only independent work; collect before integrating. To take over, cancel and wait for terminal status. Use delegate_status, delegate_list, delegate_collect, or delegate_cancel.`,
           }],
           details: { taskId, status: submission.job.status, background: true, idempotentReplay: !submission.created },
         };
       }
 
+      const syncConflict = overlappingAssignment(submittedContract.work,activeAssignments(listJobs(JOBS_DIR),currentSessionId(ctx)));
+      if(syncConflict) return {content:[{type:"text",text:`Work owned by ${syncConflict.id}; collect or cancel and await terminal status before another producer starts.`}],isError:true};
       let broker: BrokerRuntime;
       try {
         broker = await ensureBroker(ctx);
@@ -2032,6 +2167,9 @@ export default function piDelegationBroker(pi: any) {
           // effect-capable. Leaving it unset would fall back to keyword guessing over the
           // task text, which misfires on negations ("do not modify anything" → propose_patch).
           operationClass: params.proposeChangesIn ? "propose_patch" : "observe",
+          ...(syncContract.work ? {budget:{maxAttempts:syncContract.work.maxAttempts}} : {}),
+          learningContext: learningContext(syncContract.work,syncContract.requestedThinking),
+          allowExploration: Boolean(!params.proposeChangesIn && normalizedAcceptance.length && ['lookup','summary'].includes(syncContract.work?.taskClass)),
           ...(params.capabilities?.length ? { requiredCapabilities: params.capabilities } : {}),
           ...(params.tier ? { modelTier: params.tier } : {}),
         },
@@ -2073,6 +2211,15 @@ export default function piDelegationBroker(pi: any) {
         }
       } catch { /* audit storage must never change task completion semantics */ }
 
+      const recordSyncHistory = (verification?: string) => {
+        const syncFinishedAt = Date.now();
+        try { const fact=routeFact({taskId:childId,ownerSessionId:currentSessionId(ctx),context:learningContext(syncContract.work,syncContract.requestedThinking),result,startedAt:submittedAt,completedAt:syncFinishedAt});
+          if(verification) fact.verification=verification;
+          broker.history.append({id:`route:${childId}`,kind:"route",data:fact,timestamp:syncFinishedAt});
+        } catch { /* task result remains authoritative */ }
+        broker.learningContexts.delete(childId);
+      };
+      if (!params.proposeChangesIn || result.status !== "completed") recordSyncHistory();
       if (result.status === "completed" && params.proposeChangesIn) {
         onUpdate?.({ content: [{ type: "text", text: "Verifying the proposed patch in a controller-owned scratch tree…" }] });
         const receipt = await verifyProposedPatch({
@@ -2082,12 +2229,24 @@ export default function piDelegationBroker(pi: any) {
           changed: result.changed,
           checks: normalizedAcceptance,
         });
+        recordSyncHistory(receipt.verified ? "accepted" : "rejected");
+        // This verdict is produced by the awaited controller scratch-tree checks above,
+        // never a receipt supplied by the child or the tool caller.
+        if(result.resource?.id && result.selection?.capabilities?.length) {
+          try { broker.history.append({id:`patch-quality:${childId}`,kind:"quality",data:{
+            resourceId:modelLearningIdentity(result.resource.id,broker.supervisor.providerWatcher.currentRegistry()),
+            capabilities:result.selection.capabilities,context:learningContext(syncContract.work,syncContract.requestedThinking),
+            outcome:receipt.verified?"accepted":"rejected",source:"controller_scratch_tree_checks",
+            latencyMs:Date.now()-submittedAt,attempts:Math.max(1,result.route?.length??1),
+            ...(result.usage ? {tokens:observedCount(result.usage.input)+observedCount(result.usage.output)} : {}),
+          }}); } catch { /* scratch-tree verdict remains authoritative if learning is unavailable */ }
+        }
         const summary = receipt.checks.map((entry: any) => `${entry.ok ? "pass" : `fail(${entry.exitCode})`} ${entry.id}`).join(", ");
         if (!receipt.verified) {
           return {
             content: [{ type: "text", text: `Proposed change rejected by controller verification (${receipt.reason}).${summary ? `\nChecks: ${summary}` : ""}\nRoute: ${route}\nSelection: ${routeExplanation}` }],
             isError: true,
-            details: { route, routeExplanation, receipt },
+            details: { taskId:childId, route, routeExplanation, receipt },
           };
         }
         return {
@@ -2096,7 +2255,7 @@ export default function piDelegationBroker(pi: any) {
             text: `Controller-verified patch against ${receipt.baseCommit.slice(0, 12)} — NOT applied to ${params.proposeChangesIn}.\n`
               + `Files: ${receipt.changed.join(", ")}\nChecks: ${summary}\nRoute: ${route}\nSelection: ${routeExplanation}\n\n${result.patch}`,
           }],
-          details: { route, routeExplanation, receipt, patch: result.patch, applied: false },
+          details: { taskId:childId, route, routeExplanation, receipt, patch: result.patch, applied: false },
         };
       }
 
@@ -2104,7 +2263,7 @@ export default function piDelegationBroker(pi: any) {
         const usage = result.usage ? ` (${result.usage.input} in / ${result.usage.output} out)` : "";
         return {
           content: [{ type: "text", text: result.text }],
-          details: { route, routeExplanation, usage: result.usage, note: `Completed via ${route}${usage}; ${routeExplanation}` },
+          details: { taskId:childId, route, routeExplanation, usage: result.usage, note: `Completed via ${route}${usage}; ${routeExplanation}` },
         };
       }
       return {
@@ -2122,10 +2281,10 @@ export default function piDelegationBroker(pi: any) {
     name: "delegate_collect",
     label: "Collect delegation reports",
     description:
-      "Read controller-verified reports from background delegate runs. "
-      + "Called with no argument it lists unread reports (task id, status, failure cause); called with a taskId it returns the full verified report and marks it read. "
-      + "Reports are written only after the run settled and the controller verified the result, so a listed report is always final.",
-    promptSnippet: "Read verified reports from background delegations",
+      "Read terminal reports and their verification evidence from background delegate runs. "
+      + "Called with no argument it lists unread reports (task id, status, failure cause); called with a taskId it returns the full terminal report and marks it read. "
+      + "Reports are final after the run settles. Completed means execution finished; only an explicit verificationStatus establishes controller acceptance.",
+    promptSnippet: "Read terminal reports and verification evidence from background delegations",
     promptGuidelines: [
       PARENT_WAKE_SYSTEM_RULE,
       "When a turn announces ready delegation reports, call delegate_collect with no argument to see them, then with a taskId for the full text of the ones that matter.",
@@ -2136,7 +2295,7 @@ export default function piDelegationBroker(pi: any) {
     }),
     async execute(_toolCallId: string, params: { taskId?: string }, _signal: AbortSignal) {
       if (!params.taskId) {
-        const unread = unreadReports(REPORTS_DIR);
+        const unread = unreadReports(REPORTS_DIR).filter(ownsReport);
         if (unread.length === 0) {
           return { content: [{ type: "text", text: "No unread delegation reports." }] };
         }
@@ -2158,7 +2317,7 @@ export default function piDelegationBroker(pi: any) {
             ? `; nodes ${job.nodes.map((node: any) => `${node.id}:${node.state}`).join(", ")}`
             : "";
           return {
-            content: [{ type: "text", text: `${job.jobId}: ${job.status}${nodes}. The terminal verified report is not ready yet.` }],
+            content: [{ type: "text", text: `${job.jobId}: ${job.status}${nodes}. The terminal report is not ready yet.` }],
             details: job,
           };
         }
@@ -2187,10 +2346,14 @@ export default function piDelegationBroker(pi: any) {
     async execute(_toolCallId: string, params: { id: string }) {
       const job = readJob(JOBS_DIR, params.id);
       if (job) {
-        const nodes = job.kind === "workflow"
-          ? `\n${job.nodes.map((node: any) => `- ${node.id}: ${node.state}${node.result?.reportTaskId ? ` (${node.result.reportTaskId})` : ""}`).join("\n")}`
-          : "";
-        return { content: [{ type: "text", text: `${job.jobId}: ${job.status}${nodes}` }], details: job };
+        // Durable node `running` means the scheduler owns an unresolved run promise. Overlay the
+        // volatile runner projection so route selection/capacity waits cannot masquerade as a
+        // model that is actively working; this must agree with the fleet footer/widget.
+        const fleet = fleetProjection();
+        return {
+          content: [{ type: "text", text: formatDelegationStatus(job, fleet) }],
+          details: { ...job, live: fleet.rows.filter((row: any) => row.rootId === job.jobId) },
+        };
       }
       const report = readReport(REPORTS_DIR, params.id);
       if (report) return { content: [{ type: "text", text: `${report.taskId}: ${report.status} (terminal report ready)` }], details: report };
@@ -2255,7 +2418,7 @@ export default function piDelegationBroker(pi: any) {
       if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
       lastCtx = ctx;
       const submittedAt = Date.now();
-      const proposedId = `workflow-${submittedAt.toString(36)}-${++counter}`;
+      const proposedId = `workflow-${submittedAt.toString(36)}-${CONTROLLER_RUNTIME_NAMESPACE}-${++counter}`;
       const dynamicPolicy = params.dynamic && typeof params.dynamic === "object" ? params.dynamic : {};
       const teamBudgets = {
         ...(params.budgets ?? {}),
@@ -2267,11 +2430,16 @@ export default function piDelegationBroker(pi: any) {
       const orchestrator = new TaskOrchestrator({
         root: JOBS_DIR,
         jobId: proposedId,
-        concurrency: params.concurrency ?? 4,
+        concurrency: params.concurrency ?? 2,
         run: async () => { throw new Error("submission orchestrator cannot execute nodes"); },
       });
       let submission: any;
       try {
+        const replay=listJobs(JOBS_DIR).find((job:any)=>job.ownerSessionId===currentSessionId(ctx) && job.idempotencyKey===(params.idempotencyKey??`tool:${toolCallId}`));
+        if(!replay) for(const node of params.nodes) {
+          const conflict=overlappingAssignment(normalizeContract(node.contract??node).work,activeAssignments(listJobs(JOBS_DIR),currentSessionId(ctx)));
+          if(conflict) throw new Error(`work is already owned by ${conflict.id}; collect or cancel first`);
+        }
         submission = orchestrator.initialize(params.nodes, {
           cwd: ctx.cwd,
           ownerSessionId: currentSessionId(ctx),
@@ -2289,7 +2457,7 @@ export default function piDelegationBroker(pi: any) {
       const workflowId = submission.job.jobId;
       rememberFleetJob(submission.job);
       try { refreshSessionBinding(ctx, "active"); } catch { /* workflow state remains durable even if the parent binding is unavailable */ }
-      const promise = isTerminalJobStatus(submission.job.status)
+      const promise = isTerminalJobStatus(submission.job.status) || (!submission.created && !activeWorkflows.has(workflowId))
         ? Promise.resolve(submission.job)
         : startWorkflow(workflowId, ctx, params.wait ? onUpdate : undefined, !params.wait);
       if (params.wait) {
@@ -2301,7 +2469,7 @@ export default function piDelegationBroker(pi: any) {
       return {
         content: [{
           type: "text",
-          text: `${submission.created ? "Workflow submitted" : "Existing idempotent workflow returned"}: ${workflowId}. The parent is free; use delegate_status, delegate_list, delegate_collect, or delegate_cancel.`,
+          text: `${submission.created ? "Workflow submitted" : "Existing idempotent workflow returned"}: ${workflowId}. The child owns this deliverable. Continue only independent work; collect before integrating. To take over, cancel and wait for terminal status. Use delegate_status, delegate_list, delegate_collect, or delegate_cancel.`,
         }],
         details: { workflowId, status: submission.job.status, background: true, idempotentReplay: !submission.created },
       };
@@ -2324,6 +2492,10 @@ export default function piDelegationBroker(pi: any) {
       if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
       lastCtx = ctx;
       try {
+        for(const node of params.nodes) {
+          const conflict=overlappingAssignment(normalizeContract(node.contract??node).work,activeAssignments(listJobs(JOBS_DIR),currentSessionId(ctx)).filter((a:any)=>a.id!==params.workflowId));
+          if(conflict) throw new Error(`work is already owned by ${conflict.id}`);
+        }
         const result = appendWorkflowNodes(JOBS_DIR, params.workflowId, params.nodes, {
           joins: params.joins ?? [],
           ownerSessionId: currentSessionId(ctx),

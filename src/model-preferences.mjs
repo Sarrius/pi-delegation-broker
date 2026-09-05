@@ -2,7 +2,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-const TIERS = new Set(["frontier", "standard", "cheap"]);
+const TIERS = new Set(["apex", "frontier", "standard", "cheap"]);
 export const MODEL_PREFERENCE_TIERS = Object.freeze([...TIERS]);
 const MODEL_ID = /^[A-Za-z0-9~][A-Za-z0-9._/:~-]{0,159}$/;
 const PROVIDER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\*?$/;
@@ -27,6 +27,7 @@ export const DEFAULT_MODEL_PREFERENCES = Object.freeze({
   // Empty means strict automatic subscription-native/current-only selection. Entries are
   // explicit allowlists and may intentionally admit an aggregator or mixed-provider route.
   tiers: Object.freeze({
+    apex: Object.freeze([]),
     frontier: Object.freeze([]),
     standard: Object.freeze([]),
     cheap: Object.freeze([]),
@@ -37,6 +38,7 @@ function clone(value) { return JSON.parse(JSON.stringify(value)); }
 
 function isLegacySeed(value) {
   if (!value || value.schemaVersion !== 1 || !value.tiers || !Array.isArray(value.tiers.frontier)
+    || (value.tiers.apex?.length ?? 0) !== 0
     || (value.tiers.standard?.length ?? 0) !== 0 || (value.tiers.cheap?.length ?? 0) !== 0) return false;
   const key = (entry) => `${entry?.model ?? ""}|${Array.isArray(entry?.via) ? entry.via.join(",") : ""}`;
   const required = new Set(LEGACY_SEEDED_MODEL_PREFERENCES.tiers.frontier.map(key));

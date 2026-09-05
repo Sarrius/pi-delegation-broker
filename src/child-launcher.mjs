@@ -421,7 +421,7 @@ const ALLOWED_POLICY_ENVIRONMENT = new Set([
   // Leased hard output cap; the shim clamps the provider payload with it.
   "PI_BROKER_MAX_OUTPUT_TOKENS",
   // Non-secret model identity used only by the explicit controller IPC proxy provider.
-  "PI_BROKER_PROXY_MODEL_ID", "PI_BROKER_EXPECT_BEHAVIORAL_TOOLS",
+  "PI_BROKER_PROXY_MODEL_ID", "PI_BROKER_PROXY_INPUT_MODALITIES", "PI_BROKER_EXPECT_BEHAVIORAL_TOOLS",
 ]);
 
 function isolatedEnv(policy, shimSpecPath) {

@@ -98,3 +98,20 @@ test("repair admission fails closed without an accepted checkpoint or after the 
     assert.deepEqual(controller.propose({ defectId: noCheckpoint.defectId, rootId: "root", taskId: "task", summary: "no", affectedPaths: ["src/foo.mjs"] }), { status: "rejected", reason: "accepted_checkpoint_required" });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+for (const gate of ['verifyProposal','freshProcessCanary','reconcile','resume']) {
+ test(`a throwing ${gate} leaves a terminal failed repair and an unresolved defect`,async()=>{
+  const s=setup();
+  try {
+   const gates={verifyProposal:async()=>({status:'passed'}),freshProcessCanary:async()=>({status:'passed'}),reconcile:async()=>({status:'reconciled'}),resume:async()=>undefined};
+   gates[gate]=async()=>{throw new Error('private provider error')};
+   const controller=new RepairController({defectStore:s.defects,checkpointStore:s.checkpoints,store:s.store,...gates});
+   const proposal=controller.propose({defectId:s.defect.defectId,rootId:'root',taskId:'task',summary:'recover',affectedPaths:['src/report-store.mjs'],tokenBudget:100});
+   assert.deepEqual(await controller.run(proposal.repairId),{status:'failed',repairId:proposal.repairId});
+   assert.equal(s.store.read(proposal.repairId).status,'failed');
+   assert.notEqual(s.defects.read(s.defect.defectId).status,'resolved');
+   assert.equal(JSON.stringify(s.store.read(proposal.repairId)).includes('private provider error'),false);
+   assert.equal((await controller.run(proposal.repairId)).status,'failed');
+  } finally {rmSync(s.root,{recursive:true,force:true})}
+ });
+}

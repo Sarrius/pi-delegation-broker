@@ -123,7 +123,7 @@ export class ParentWakeCoordinator {
       const selected = [...this.#pending.values()].slice(0, MAX_REPORTS_PER_WAKE);
       // Do not claim a wake while the host is in a transition where a queued owner message may
       // be promoted. The claim is durable and therefore cannot be safely undone if the host then
-      // aborts the turn. The extension calls notifyReady() from the next agent_start/settled
+      // aborts the turn. The extension calls notifyReady() only after the next agent_settled
       // boundary, so the report remains a live pending item rather than becoming ambiguous.
       if (this.#canDispatch) {
         let canDispatch = false;
@@ -138,7 +138,10 @@ export class ParentWakeCoordinator {
       const reports = [];
       for (const candidate of candidates) {
         try {
-          const claimed = await Promise.resolve(this.#claimWake(candidate.taskId));
+          const claim = this.#claimWake(candidate.taskId);
+          // The filesystem claim is synchronous. Do not introduce a microtask gap
+          // between the host-idle guard and its synchronous enqueue boundary.
+          const claimed = claim && typeof claim.then === "function" ? await claim : claim;
           if (validReport(claimed) && claimed.readAt === null && Number.isSafeInteger(claimed.wakeClaimedAt)
             && claimed.wakeAt === null) reports.push(claimed);
         } catch (error) {

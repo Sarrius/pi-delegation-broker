@@ -1,3 +1,4 @@
+import { assertIndependentNodeScopes } from "./delegation-policy.mjs";
 import { basename, dirname, isAbsolute } from "node:path";
 import { normalizeControllerAcceptanceSpecs } from "./acceptance-plan.mjs";
 import { normalizeContract } from "./child-contract.mjs";
@@ -98,10 +99,10 @@ function normalizeNodes(nodes, { knownIds = [] } = {}) {
     }
     // Node normalization is an allowlist, so a new contract axis must be carried here
     // explicitly: anything omitted is silently dropped and the stage quietly runs on defaults.
-    const contract = node.contract !== undefined || node.thinking !== undefined
+    const contract = node.contract !== undefined || node.work !== undefined || node.thinking !== undefined
       || node.route !== undefined || node.role !== undefined || node.skills !== undefined
       ? normalizeContract(node.contract ?? {
-        thinking: node.thinking, route: node.route, role: node.role, skills: node.skills,
+        work: node.work, thinking: node.thinking, route: node.route, role: node.role, skills: node.skills,
       })
       : undefined;
     return {
@@ -135,6 +136,7 @@ function normalizeNodes(nodes, { knownIds = [] } = {}) {
     visited.add(id);
   };
   for (const id of ids) visit(id);
+  assertIndependentNodeScopes(normalized);
   return normalized;
 }
 
@@ -164,6 +166,7 @@ export function appendWorkflowNodes(root, jobId, nodes, { joins = [], proposalId
     appendCount: current.team.appendCount,
     concurrency: current.concurrency,
   });
+  assertIndependentNodeScopes([...current.nodes,...admitted.added]);
   const additionIds = new Set(additions.map((join) => join.id));
   if (additionIds.size !== additions.length) fail("appended join ids must be unique");
   const existingJoinIds = new Set(current.team.joins.map((join) => join.id));

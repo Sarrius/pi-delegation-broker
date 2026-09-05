@@ -292,7 +292,7 @@ export function loadControllerRouteConfiguration(path) {
 }
 
 /**
- * Controller-only snapshot adapter for pi-multi-account/Pi modelRegistry.
+ * Controller-only snapshot adapter for the public Pi modelRegistry.
  * It accepts an injected reader, stores no credentials, and emits only an
  * observed catalog-derived registry candidate that still needs signing/policy.
  */

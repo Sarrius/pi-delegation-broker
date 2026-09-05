@@ -651,8 +651,10 @@ export class SqliteLeaseBroker {
   /**
    * Reserve a conservative controller-side input upper bound before a real provider send.
    * The real proxy supplies canonical UTF-8 bytes, which are an upper bound on token count.
-   * The reservation is reconciled to observed provider usage when the stream settles; keeping
-   * the upper bound until then is fail-closed for a provider that dies without reporting usage.
+   * Hard enforcement denies against that upper bound before dispatch. Metered-best-effort input
+   * admits one bounded request while observed usage is below the cap, reconciles afterward, and
+   * denies every later request once the observed cap is reached. This is honest about tokenizers:
+   * exact provider token usage does not exist at the controller before a send.
    */
   reserveProviderInput(leaseId, fencingToken, inputUpperBound, now) {
     return this.#transaction(() => {
@@ -663,6 +665,13 @@ export class SqliteLeaseBroker {
       if (!Number.isSafeInteger(inputUpperBound) || inputUpperBound < 0) return { status: "denied_budget", reason: "invalid input upper bound" };
       const enforcement = parseJson(lease.enforcement);
       const used = lease.input_tokens_used ?? 0;
+      if (enforcement.input === "metered_best_effort" && lease.max_input_tokens !== null && used >= lease.max_input_tokens) {
+        this.#record(now, "BudgetExceeded", {
+          leaseId, dimension: "input", used, requested: inputUpperBound, cap: lease.max_input_tokens,
+          enforcement: "metered_best_effort",
+        });
+        return { status: "budget_exceeded", dimension: "input", used, requested: inputUpperBound, cap: lease.max_input_tokens };
+      }
       const next = used + inputUpperBound;
       if (enforcement.input === "hard" && lease.max_input_tokens !== null && next > lease.max_input_tokens) {
         this.#record(now, "BudgetExceeded", { leaseId, dimension: "input", used, requested: inputUpperBound, cap: lease.max_input_tokens });
@@ -701,7 +710,7 @@ export class SqliteLeaseBroker {
       const inputObserved = (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
       const inputDelta = reservedInputUpperBound !== undefined
         ? inputObserved - reservedInputUpperBound
-        : inputReserved && enforcement.input === "hard" ? 0 : inputObserved;
+        : inputReserved ? 0 : inputObserved;
       const inputUsed = Math.max(0, (lease.input_tokens_used ?? 0) + inputDelta);
       const outputUsed = (lease.output_tokens_used ?? 0) + (usage.output ?? 0);
       if (enforcement.input === "hard" && lease.max_input_tokens !== null && inputUsed > lease.max_input_tokens) {
@@ -718,10 +727,19 @@ export class SqliteLeaseBroker {
         leaseId,
         input: usage.input ?? 0,
         output: usage.output ?? 0,
+        cacheRead: usage.cacheRead ?? 0,
+        cacheWrite: usage.cacheWrite ?? 0,
         ...(reservedInputUpperBound === undefined ? {} : { reservedInputUpperBound, inputDelta }),
         inputTokensUsed: inputUsed,
         outputTokensUsed: outputUsed,
       });
+      if (enforcement.input === "metered_best_effort" && lease.max_input_tokens !== null && inputUsed > lease.max_input_tokens) {
+        this.#record(now, "BudgetExceeded", {
+          leaseId, dimension: "input", used: inputUsed, cap: lease.max_input_tokens,
+          enforcement: "metered_best_effort", overshoot: inputUsed - lease.max_input_tokens,
+        });
+        return { status: "budget_exceeded", dimension: "input", used: inputUsed, cap: lease.max_input_tokens };
+      }
       return { status: "recorded", inputTokensUsed: inputUsed, outputTokensUsed: outputUsed };
     });
   }
@@ -937,7 +955,7 @@ export class SqliteLeaseBroker {
       SELECT
         r.id, r.capacity_group, r.profile, r.state, r.retiring, r.cooldown_until,
         r.inventory_confidence AS resource_confidence, r.enforcement,
-        g.inventory_confidence AS group_confidence, g.max_concurrent,
+        g.inventory_confidence AS group_confidence, g.max_concurrent, g.control_reserve, g.verify_reserve,
         g.cooldown_until AS group_cooldown_until, g.breaker_state, g.probe_lease_id
       FROM resources r JOIN capacity_groups g ON g.id = r.capacity_group
       ORDER BY r.id
@@ -961,6 +979,8 @@ export class SqliteLeaseBroker {
       confidence: row.resource_confidence,
       groupConfidence: row.group_confidence,
       maxConcurrent: row.max_concurrent,
+      controlReserve: row.control_reserve,
+      verifyReserve: row.verify_reserve,
       activeLeases: active.get(row.capacity_group) ?? 0,
       enforcement: parseJson(row.enforcement),
     })));
@@ -1580,7 +1600,11 @@ export class SqliteLeaseBroker {
         fencingToken: fenceRow.fencing_token,
         issuedAt: now,
         expiresAt: now + (contract.leaseTtlMs ?? 30_000),
-        enforcement: parseJson(resource.enforcement),
+        // Resource enforcement is a capability ceiling checked by #resourceMatchesContract.
+        // The lease carries the contract's requested policy, not the resource's strongest mode:
+        // silently upgrading metered read-only input to hard would reintroduce byte/token false
+        // denials even though the selected controller supports both enforcement strengths.
+        enforcement: structuredClone(contract.budget?.enforcement ?? {}),
         admissionClass: contract.admissionClass,
         behavioralEnforcement: this.#behavioralEnforcement,
         probe,
@@ -1618,7 +1642,7 @@ export class SqliteLeaseBroker {
   #rankResources(rows, contract, now) {
     if (!this.#resourceRanker || rows.length < 2) return rows;
     const resourceIds = Object.freeze(rows.map((row) => row.id));
-    const rankerContract = Object.freeze({ capability: Object.freeze({ required: Object.freeze([...contract.capability.required]) }) });
+    const rankerContract = Object.freeze({ capability: Object.freeze({ required: Object.freeze([...contract.capability.required]), ...(contract.capability.allowedResources ? {allowedResources:Object.freeze([...contract.capability.allowedResources])} : {}) }) });
     const ranking = this.#resourceRanker(Object.freeze({ contract: rankerContract, resourceIds, now }));
     if (!Array.isArray(ranking) || ranking.length !== resourceIds.length
       || ranking.some((resourceId) => typeof resourceId !== "string")

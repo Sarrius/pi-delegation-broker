@@ -28,8 +28,57 @@ test("catalog converts provider entries into a broker registry with derived prof
   assert.ok(anthropicProfile.supports.includes("large_context"));
 
   const group = registry.capacityGroups["G-fake-anthropic"];
-  assert.equal(group.maxConcurrent, 2, "one slot is reserved for control admission, so a single slot admits no work");
+  assert.equal(group.maxConcurrent, 5, "four workers remain available beside the reserved control slot");
   assert.equal(group.confidence, "assumed");
+});
+
+test("GPT API Astra metadata derives the complete native vision/reasoning profile", () => {
+  const registry = catalogToBrokerRegistry([{
+    provider: "openai",
+    baseUrl: "https://api.openai.com/v1",
+    api: "openai-responses",
+    models: [{
+      id: "gpt-6-astra",
+      name: "GPT-6 Astra",
+      contextWindow: 272_000,
+      maxTokens: 128_000,
+      reasoning: true,
+      input: ["text", "image"],
+      cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+    }],
+  }], { confidence: "observed" });
+  const resource = registry.resources["openai/gpt-6-astra"];
+  assert.deepEqual(resource.catalog, { name: "GPT-6 Astra", contextWindow: 272_000, maxTokens: 128_000 });
+  assert.deepEqual(registry.profiles[resource.profile].supports, ["code_reasoning", "large_context", "text_generation", "vision_input"]);
+});
+
+test("one healthy provider can run four independent work leases without consuming control reserve", () => {
+  const dir = mkdtempSync(join(tmpdir(), "broker-provider-parallel-"));
+  try {
+    const registry = catalogToBrokerRegistry(fixtureCatalog(), { confidence: "measured" });
+    const resourceId = "fake-anthropic/claude-fake-1";
+    const profile = registry.resources[resourceId].profile;
+    const broker = new SqliteLeaseBroker({ path: join(dir, "b.sqlite"), registry });
+    const now = Date.now();
+    const contract = (taskId, admissionClass) => fixtureContract({
+      taskId,
+      admissionClass,
+      capability: {
+        minimumProfile: profile,
+        required: ["text_generation"],
+        downgradePolicy: "forbid",
+        allowedResources: [resourceId],
+      },
+      budget: { maxInputTokens: 1_000, maxOutputTokens: 100, enforcement: { input: "hard", output: "hard" } },
+    });
+    const work = Array.from({ length: 4 }, (_, index) => broker.reserve(contract(`parallel-work-${index + 1}`, "work"), now + index));
+    assert.deepEqual(work.map((result) => result.status), ["leased", "leased", "leased", "leased"]);
+    assert.equal(broker.reserve(contract("parallel-work-5", "work"), now + 5).status, "denied_capacity");
+    assert.equal(broker.reserve(contract("parallel-control", "control"), now + 6).status, "leased", "control reserve remains usable");
+    broker.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("two accounts offering equivalent models share one capability tier", () => {

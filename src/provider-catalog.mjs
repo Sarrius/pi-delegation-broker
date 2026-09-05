@@ -1,16 +1,9 @@
 /**
- * Converts a Pi modelRegistry snapshot (the provider/model catalog that
- * pi-multi-account and other extensions populate) into a broker registry.
- *
- * The broker does NOT know about multi-account. It consumes a plain
- * catalog snapshot — an array of provider entries with model definitions —
- * and derives capacity groups, profiles, and resources from it. The
- * catalog source is controller-owned: it could come from Pi's modelRegistry,
- * a static file, or a signed distribution. The broker never reaches into
- * extension internals.
- *
- * Architecture: pi-multi-account → Pi modelRegistry → snapshot → broker registry.
- * The broker trusts the snapshot, not the extension.
+ * Converts a public Pi modelRegistry snapshot into the broker registry.
+ * Catalog origins are opaque: built-in providers, user configuration and any
+ * independently registered provider use the same host contract. This module
+ * derives capacity groups, profiles and resources without reading extension
+ * internals. The catalog source and admission policy remain controller-owned.
  */
 
 import { deriveModelProvenance } from "./model-provenance-policy.mjs";
@@ -129,8 +122,11 @@ export function capabilityTierId(supports) {
  * - one profile per capability tier — shared across providers, so a contract
  *   pinning a tier can be served by whichever provider is alive right now.
  *
- * maxConcurrent defaults to 2 rather than 1: the group reserves one slot for
- * control-class admission, so a single-slot group can never admit work.
+ * maxConcurrent defaults to 5: the runner has four execution permits and the group reserves one
+ * additional slot for control-class admission. Therefore one healthy account can keep all four
+ * independent workers live instead of serializing them behind one work lease. This is a bounded
+ * controller concurrency limit, not a claim about provider quota; an observed 429 still cools the
+ * shared account group and routes work elsewhere.
  *
  * Returns { profiles, capacityGroups, resources } in broker registry format.
  * Resources additionally carry a controller-side `model` identity and
@@ -143,7 +139,7 @@ export function catalogToBrokerRegistry(catalog, options = {}) {
   }
   const maxConcurrentPerProvider = Number.isSafeInteger(options.maxConcurrentPerProvider)
     ? options.maxConcurrentPerProvider
-    : 2;
+    : 5;
   const confidence = typeof options.confidence === "string" ? options.confidence : "assumed";
   const cooldownDefaultMs = Number.isSafeInteger(options.cooldownDefaultMs) ? options.cooldownDefaultMs : 21_600_000;
   const cooldownProbeIntervalMs = Number.isSafeInteger(options.cooldownProbeIntervalMs) ? options.cooldownProbeIntervalMs : 300_000;

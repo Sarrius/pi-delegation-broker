@@ -285,6 +285,9 @@ test("malformed context and unsupported adapter route fail before credential res
     fetchImpl: async () => { sent += 1; return sse(successEvents()); },
   });
   await assert.rejects(() => collect(transport, snapshot(), context({ extra: true })), /context has unknown field/);
+  await assert.rejects(() => collect(transport, snapshot(), context({
+    messages: [{ role: "user", content: [{ type: "image", data: "iVBORw==", mimeType: "image/png" }] }],
+  })), /bounded printable text/);
   await assert.rejects(() => collect(transport, snapshot({ apiDialect: "other" }), context()), /apiDialect/);
   assert.equal(resolved, 0);
   assert.equal(sent, 0);

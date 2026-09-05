@@ -14,6 +14,7 @@
  *             paths are injected. A skill is guidance. It cannot add a tool or grant effect.
  */
 
+import { normalizeWork } from "./delegation-policy.mjs";
 import { assertStoredSkills, normalizeSkills, reviewSkills } from "./child-skills.mjs";
 
 export const THINKING_LEVELS = Object.freeze(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -86,11 +87,12 @@ function normalizeRole(role) {
 }
 
 /** Validate the caller-facing contract without resolving it against a live session. */
-export function normalizeContract({ thinking, route, role, skills } = {}) {
+export function normalizeContract({ thinking, route, role, skills, work } = {}) {
   if (thinking !== undefined && !THINKING_MODES.includes(thinking)) fail("thinking mode is invalid");
   if (route !== undefined && !ROUTE_MODES.includes(route)) fail("route mode is invalid");
   const reviewedSkills = skills !== undefined ? normalizeSkills(skills) : undefined;
   const normalized = {
+    ...(work !== undefined ? {work: normalizeWork(work)} : {}),
     thinking: thinking ?? "auto",
     route: route ?? "auto",
     ...(role !== undefined ? { role: normalizeRole(role) } : {}),
@@ -118,7 +120,7 @@ export function assertStoredContract(contract) {
   if (contract.thinking === undefined || contract.route === undefined) fail("contract must include thinking and route");
   // Validate axes and role without reading the filesystem. Skill identities on durable records
   // are attested data; live re-hash happens at resolve/launch, not at list/read.
-  const normalized = normalizeContract({ thinking: contract.thinking, route: contract.route, role: contract.role });
+  const normalized = normalizeContract({ thinking: contract.thinking, route: contract.route, role: contract.role, work: contract.work });
   const skills = contract.skills !== undefined ? assertStoredSkills(contract.skills) : undefined;
   return Object.freeze({ ...normalized, ...(skills ? { skills } : {}) });
 }
@@ -159,6 +161,7 @@ export function resolveContract(contract, parent = {}) {
   }
 
   return Object.freeze({
+    ...(normalized.work ? {work: normalized.work} : {}),
     thinkingMode: normalized.thinking,
     requestedThinking,
     routeMode: normalized.route,

@@ -7,6 +7,13 @@ test("quality catalog rejects free/unknown aggregator models and admits research
   assert.equal(qualityForModel({ provider: "openrouter", modelId: "mistralai/mistral-nemo" }), undefined);
   assert.equal(qualityForModel({ provider: "zai", modelId: "glm-4.7" }), undefined);
   assert.equal(qualityForModel({ provider: "zai", modelId: "glm-5.3" }), "frontier");
+  assert.equal(qualityForModel({ provider: "openai", modelId: "gpt-6-astra" }), "apex");
+  assert.equal(qualityForModel({ provider: "openai-codex-account-2", modelId: "gpt-6-astra" }), "apex");
+  assert.equal(qualityForModel({ provider: "anthropic", modelId: "claude-fable-5-1" }), "apex");
+  assert.equal(qualityForModel({ provider: "anthropic-account-3", modelId: "claude-fable-5" }), "apex");
+  assert.equal(qualityForModel({ provider: "openrouter", modelId: "anthropic/claude-fable-5.1" }), "apex");
+  assert.equal(qualityForModel({ provider: "openrouter", modelId: "anthropic/claude-fable-5.1:batch" }), "apex");
+  assert.equal(qualityForModel({ provider: "cursor", modelId: "claude-fable-5-1-high", generation: 0 }), undefined, "uncalibrated aliases cannot inherit apex or generic frontier by freshness alone");
   assert.equal(qualityForModel({ provider: "openai-codex-account-2", modelId: "gpt-5.6-sol" }), "frontier");
   assert.equal(qualityForModel({ provider: "openai-codex-account-2", modelId: "gpt-5.6-terra" }), "standard");
   assert.equal(qualityForModel({ provider: "openai-codex-account-2", modelId: "gpt-5.6-luna" }), "cheap");
@@ -17,6 +24,7 @@ test("quality catalog rejects free/unknown aggregator models and admits research
   assert.equal(qualityForModel({ provider: "zai", modelId: "glm-5.4" }), undefined);
   assert.equal(qualityForModel({ provider: "openrouter", modelId: "somevendor/brand-new-9", generation: 0 }), undefined);
   assert.equal(meetsQualityFloor({ provider: "cursor", modelId: "composer-3", generation: 0 }, "standard"), true);
+  assert.equal(meetsQualityFloor({ provider: "anthropic", modelId: "claude-fable-5-1" }, "apex"), true);
 });
 
 test("the contract carries the vetted candidate set so the broker cannot lease a filtered model", async () => {
