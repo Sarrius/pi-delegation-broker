@@ -4,6 +4,7 @@ import { accessSync, constants, mkdirSync, readFileSync, realpathSync, rmSync, s
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnChildRpc } from "./child-rpc.mjs";
+import { openPartialOutputJournal } from "./partial-output-journal.mjs";
 import { reviewSkills } from "./child-skills.mjs";
 import { baseProviderFor } from "./scoped-child-auth.mjs";
 
@@ -372,8 +373,24 @@ export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPi
     throw error;
   }
 
+  // Separate attempt files retain public streaming text even if no message_end
+  // or final response survives a deadline, crash or provider failover.
+  let partialJournal;
+  try {
+    mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+    partialJournal = openPartialOutputJournal(join(sessionsDir, `partial-${randomUUID()}.jsonl`));
+    rpc.onEvent((event) => {
+      try { partialJournal.record(event); }
+      catch { rpc.kill("SIGKILL"); } // storage failure must not silently continue
+    });
+  } catch (error) {
+    rpc.kill("SIGKILL");
+    await rpc.exited;
+    throw error;
+  }
   ACTIVE_RPCS.add(rpc);
   void Promise.resolve(rpc.exited).finally(() => {
+    partialJournal.close();
     ACTIVE_RPCS.delete(rpc);
     rmSync(specPath, { force: true });
     rmSync(toolReportPath, { force: true });

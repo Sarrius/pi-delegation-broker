@@ -23,6 +23,9 @@ submitJob(jobs, {
   idempotencyKey: "recovered-cancel", policyGeneration: "unresolved",
 });
 requestJobCancellation(jobs, "delegate-recovered-cancel-1", submittedAt + 10, "recovered-owner");
+const retainedDir = join(brokerState, 'sessions', 'delegate-recovered-cancel-1', 'sessions');
+mkdirSync(retainedDir, {recursive:true});
+writeFileSync(join(retainedDir,'partial-attempt.jsonl'), '{"type":"text_delta","text":"PARTIAL_WORK"}\n');
 submitJob(jobs, {
   schemaVersion: 1, jobId: "foreign-live", kind: "task", status: "running",
   ownerSessionId: "another-owner", task: "keep working", cwd: packageRoot,
@@ -64,6 +67,10 @@ assert.equal(readJob(jobs, "foreign-live").updatedAt, submittedAt);
 assert.equal(readReport(join(brokerState, "reports"), "foreign-done").wakeClaimedAt, null);
 const unread = await tools.get("delegate_collect").execute("list", {}, new AbortController().signal);
 assert.doesNotMatch(JSON.stringify(unread), /foreign/);
+const foreignCollect = await tools.get('delegate_collect').execute('foreign', {taskId:'foreign-done'}, undefined);
+assert.equal(foreignCollect.isError, true);
+assert.doesNotMatch(JSON.stringify(foreignCollect), /FOREIGN_MARKER/);
+assert.equal(readReport(join(brokerState,'reports'),'foreign-done').readAt, null);
 assert.equal(wake.options.triggerTurn, true);
 await hooks.get("message_start")?.({ message: {
   role: "custom", customType: wake.message.customType, details: wake.message.details,
@@ -74,6 +81,12 @@ const report = JSON.parse(await (await import("node:fs/promises")).readFile(
   join(brokerState, "reports", "delegate-recovered-cancel-1.json"), "utf8",
 ));
 assert.equal(report.status, "failed");
+const collected = await tools.get('delegate_collect').execute('collect', {taskId:'delegate-recovered-cancel-1'}, undefined, undefined, ctx);
+assert.match(collected.content[0].text, /Retained work \(unverified/);
+assert.equal(collected.details.retainedWork.artifacts.length, 1);
+assert.equal(collected.details.retainedWork.artifacts[0].path, join(retainedDir,'partial-attempt.jsonl'));
+assert.equal(collected.details.status, 'failed');
+assert.doesNotMatch(collected.content[0].text, /PARTIAL_WORK/); // raw content is not injected
 assert.ok(Number.isSafeInteger(report.wakeClaimedAt));
 assert.ok(Number.isSafeInteger(report.wakeAt));
 await hooks.get("session_shutdown")?.();
