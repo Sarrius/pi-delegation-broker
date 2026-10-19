@@ -84,5 +84,9 @@ const report = JSON.parse(await (await import("node:fs/promises")).readFile(
   join(agent, "delegation-broker", "reports", `${result.details.taskId}.json`), "utf8",
 ));
 assert.ok(Number.isSafeInteger(report.wakeAt), "wake dispatch must be durable");
+const feedback = await tools.get('delegate_feedback').execute('feedback', {taskId:result.details.taskId,utility:'unused'}, undefined, undefined, ctx);
+assert.notEqual(feedback.isError, true, JSON.stringify(feedback));
+const foreignFeedback = await tools.get('delegate_feedback').execute('foreign', {taskId:'nonexistent',utility:'unused'}, undefined, undefined, ctx);
+assert.equal(foreignFeedback.isError, true);
 await hooks.get("session_shutdown")?.();
 console.log(JSON.stringify({ taskId: result.details.taskId, customType: wake.message.customType, triggerTurn: wake.options.triggerTurn }));

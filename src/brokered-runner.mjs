@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { spawnBrokeredChild } from "./child-launcher.mjs";
 import { Semaphore } from "./semaphore.mjs";
 import { effectiveThinkingLevel } from "./model-thinking-policy.mjs";
@@ -847,8 +848,18 @@ export class BrokeredChildRunner {
         });
       }
       if (worktree) {
-        try { await cleanupWorktree(worktree.sourceCwd, worktree.tree.path); }
-        catch { /* worktree retained; child work still on disk */ }
+        // Never delete an isolated attempt until its patch is recoverable,
+        // including exceptions, cancellation and unsuccessful verification.
+        try {
+          const captured = await this.#collectWorktree(worktree);
+          if (captured.error) throw new Error(captured.error);
+          const evidenceDir = join(this.#sessionsRoot, handle.id, "sessions");
+          mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+          writeFileSync(join(evidenceDir, `patch-${randomUUID()}.jsonl`),
+            JSON.stringify({ kind: "proposed_patch", verificationStatus: "unverified", ...captured }) + "\n",
+            { mode: 0o600, flag: "wx", flush: true });
+          await cleanupWorktree(worktree.sourceCwd, worktree.tree.path);
+        } catch { /* capture failed: retain the original worktree, never discard it */ }
       }
       try { handle.fleetUnsubscribe?.(); } catch { /* fleet observation is best effort */ }
       this.#handles.delete(handle.id);

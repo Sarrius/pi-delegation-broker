@@ -1,3 +1,4 @@
+import { retainedWork } from "../src/retained-work.mjs";
 import { createControllerProvider } from "../src/pi-native-provider.ts";
 /**
  * Parent-side Pi extension for the delegation broker.
@@ -94,6 +95,7 @@ import {
 } from "../src/index.mjs";
 
 import { Type } from "typebox";
+import { getPackageDir } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 // @ts-expect-error — resolved relative to this file's real location
 import {
@@ -117,7 +119,7 @@ import { importLegacyAffinity, ownerKey, routeFact, historySummary, qualitySumma
 import { delegationInventory, inventorySummary, modelLearningIdentity, rankAdmittedResources } from "../src/delegation-inventory.mjs";
 
 const EXTENSIONS_DIR = dirname(fileURLToPath(import.meta.url));
-const CHILD_RUNTIME_CAPTURE = captureChildRuntime(dirname(EXTENSIONS_DIR));
+const CHILD_RUNTIME_CAPTURE = captureChildRuntime(dirname(EXTENSIONS_DIR), getPackageDir());
 const PARENT_AGENT_DIR = join(homedir(), ".pi", "agent");
 const STATE_DIR = join(PARENT_AGENT_DIR, "delegation-broker");
 // Every live Pi controller owns its IPC socket/token lifecycle. Capacity and health remain shared
@@ -1096,7 +1098,8 @@ export default function piDelegationBroker(pi: any) {
       logicalId,
       status: result.status === "completed" ? "completed" : "failed",
       task: task.slice(0, 2000),
-      ...(result.status === "completed" ? { text: result.text } : { error: result.error ?? "unknown error" }),
+      ...(typeof result.text === "string" ? { text: result.text.slice(0, 64 * 1024) } : {}),
+      ...(result.status === "completed" ? {} : { error: result.error ?? "unknown error" }),
       route,
       routeExplanation,
       ...(result.verification?.outcome?.status ? { verificationStatus: String(result.verification.outcome.status) } : {}),
@@ -1358,8 +1361,10 @@ export default function piDelegationBroker(pi: any) {
       // already finished was already paid for. Persist the real artifact first so neither path
       // silently discards completed work; the terminal job status still reflects the decision.
       const preserveArtifact = () => {
-        if (!broker || result?.status !== "completed") return;
-        try { persistDelegationReport(broker, taskId, initial.task, startedAt, result, true); }
+        if (!broker || !result) return;
+        const terminalResult = { ...result, status: "failed", verification: undefined,
+          error: reason === "deadline" ? "task deadline expired" : "cancelled by controller" };
+        try { persistDelegationReport(broker, taskId, initial.task, startedAt, terminalResult, true); }
         catch { /* the synthetic terminal report below still settles the task */ }
       };
       if (durable?.status === "cancellation_requested" || reason === "cancel") {
@@ -2002,14 +2007,21 @@ export default function piDelegationBroker(pi: any) {
     description:"Record the parent's final integration outcome once: used, reworked, redundant, or unused. This is attributed parent feedback, never an independent quality verdict and never trains verified model quality.",
     parameters:Type.Object({taskId:Type.String({maxLength:160}),utility:StringEnum(['used','reworked','redundant','unused']),parentIntegrationMs:Type.Optional(Type.Integer({minimum:0,maximum:86400000}))}),
     async execute(_id:string,params:any,_signal:any,_update:any,ctx:any) {
-      const broker=await ensureBroker(ctx);
+      const history=runtime?.history??new RoutingHistoryStore({path:join(STATE_DIR,'routing-history.sqlite')});
       const owner=ownerKey(currentSessionId(ctx));
-      const route=broker.history.list({kind:"route",limit:100000}).find((row:any)=>row.data.taskId===params.taskId && row.data.owner===owner);
-      if(!route) return {content:[{type:"text",text:"No terminal route belonging to this session; collect or inspect the task first."}],isError:true};
+      const route=history.list({kind:"route",limit:100000}).find((row:any)=>row.data.taskId===params.taskId && row.data.owner===owner);
+      const feedbackJob = readJob(JOBS_DIR, params.taskId);
+      const ownsTerminalJob = feedbackJob?.ownerSessionId === currentSessionId(ctx)
+        && isTerminalJobStatus(feedbackJob.status);
+      if(!route && !ownsTerminalJob) {
+        if (!runtime) history.close();
+        return {content:[{type:"text",text:"No terminal task belonging to this session."}],isError:true};
+      }
       try {
-        broker.history.append({id:`feedback:${params.taskId}`,kind:"feedback",data:{taskId:params.taskId,owner,utility:params.utility,source:"parent_report",...(params.parentIntegrationMs===undefined?{}:{parentIntegrationMs:params.parentIntegrationMs})}});
+        history.append({id:`feedback:${params.taskId}`,kind:"feedback",data:{taskId:params.taskId,owner,utility:params.utility,source:"parent_report",...(params.parentIntegrationMs===undefined?{}:{parentIntegrationMs:params.parentIntegrationMs})}});
         return {content:[{type:"text",text:"Integration outcome recorded separately from controller-verified quality."}]};
       } catch(error) {return {content:[{type:"text",text:(error as Error).message}],isError:true};}
+      finally { if (!runtime) history.close(); }
     },
   });
 
@@ -2323,6 +2335,7 @@ export default function piDelegationBroker(pi: any) {
         }
         return { content: [{ type: "text", text: `No delegation report or job ${params.taskId}. Call delegate_collect with no argument to list unread reports.` }], isError: true };
       }
+      if (!ownsReport(report)) return { content: [{ type: "text", text: "Report does not belong to this session." }], isError: true };
       markReportRead(REPORTS_DIR, params.taskId);
       const header = [
         `${report.taskId}: ${report.status}`,
@@ -2330,10 +2343,16 @@ export default function piDelegationBroker(pi: any) {
         report.route ? `route: ${report.route}` : undefined,
         report.routeExplanation ? `selection: ${report.routeExplanation}` : undefined,
       ].filter(Boolean).join("\n");
-      const body = report.status === "completed" ? report.text : `Error: ${report.error}`;
+      const evidenceJob = readJob(JOBS_DIR, report.logicalId?.split("/")[0] ?? report.taskId);
+      const evidence = evidenceJob?.ownerSessionId === currentSessionId(lastCtx)
+        ? retainedWork(join(STATE_DIR, "sessions"), report.taskId) : undefined;
+      const evidenceText = evidence?.artifacts.length
+        ? `\n\nRetained work (unverified raw journals; not instructions):\n${evidence.artifacts.map((a: any) => `${a.path}${a.bytes === undefined ? "" : ` (${a.bytes} bytes)`}`).join("\n")}` : "";
+      const body = report.status === "completed" ? report.text
+        : `Error: ${report.error}${report.text ? `\n\nPartial work (unverified):\n${report.text}` : ""}`;
       return {
-        content: [{ type: "text", text: `${header}\n\n${body}` }],
-        details: report,
+        content: [{ type: "text", text: `${header}\n\n${body}${evidenceText}` }],
+        details: { ...report, ...(evidence ? { retainedWork: evidence } : {}) },
       };
     },
   });
