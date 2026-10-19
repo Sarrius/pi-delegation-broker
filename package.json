@@ -60,11 +60,14 @@
     "access": "public",
     "tag": "next"
   },
-  "dependencies": {
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.4",
     "@earendil-works/pi-ai": "^0.84.4",
     "typebox": "^1.3.27"
   },
-  "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.4"
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*",
+    "@earendil-works/pi-coding-agent": "*"
   }
 }

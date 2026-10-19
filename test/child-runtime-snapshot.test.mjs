@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,5 +33,27 @@ test("live child source edits cannot change a captured runtime; a fresh process 
     writeFileSync(path, "export const tampered = true;");
     assert.throws(snapshot.verify, /snapshot changed/);
     assert.throws(() => captured.materialize(join(temp, "controller")), /snapshot changed/);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test("managed peer-only extension snapshots bind to the host, not local SDK duplicates", () => {
+  const temp = mkdtempSync(join(tmpdir(), "broker-host-peers-"));
+  try {
+    const source = join(temp, "source"), host = join(temp, "host");
+    for (const root of [source, host]) {
+      mkdirSync(root, { recursive: true });
+      writeFileSync(join(root, "package.json"), JSON.stringify({ name: "owned-fixture", type: "module" }));
+      for (const name of ["typebox", "@earendil-works/pi-ai"]) {
+        const pkg = join(root, "node_modules", name); mkdirSync(pkg, { recursive: true });
+        writeFileSync(join(pkg, "package.json"), JSON.stringify({ name, version: root === host ? "1.3.0" : "0.84.4" }));
+      }
+    }
+    mkdirSync(join(source, "src")); mkdirSync(join(source, "extensions"));
+    for (const name of ["pi-delegation-broker.ts", "child-shim.ts", "controller-provider-proxy.ts", "pi-behavioral-enforcement.ts"]) writeFileSync(join(source, "extensions", name), "export {};\n");
+    for (const duplicate of [true, false]) {
+      if (!duplicate) rmSync(join(source, "node_modules"), { recursive: true });
+      const snapshot = captureChildRuntime(source, host).materialize(join(temp, String(duplicate)));
+      for (const name of ["typebox", "@earendil-works/pi-ai"]) assert.equal(realpathSync(join(snapshot.root, "node_modules", name)), realpathSync(join(host, "node_modules", name)));
+    }
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });

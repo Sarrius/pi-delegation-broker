@@ -95,6 +95,7 @@ import {
 } from "../src/index.mjs";
 
 import { Type } from "typebox";
+import { getPackageDir } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 // @ts-expect-error — resolved relative to this file's real location
 import {
@@ -118,7 +119,7 @@ import { importLegacyAffinity, ownerKey, routeFact, historySummary, qualitySumma
 import { delegationInventory, inventorySummary, modelLearningIdentity, rankAdmittedResources } from "../src/delegation-inventory.mjs";
 
 const EXTENSIONS_DIR = dirname(fileURLToPath(import.meta.url));
-const CHILD_RUNTIME_CAPTURE = captureChildRuntime(dirname(EXTENSIONS_DIR));
+const CHILD_RUNTIME_CAPTURE = captureChildRuntime(dirname(EXTENSIONS_DIR), getPackageDir());
 const PARENT_AGENT_DIR = join(homedir(), ".pi", "agent");
 const STATE_DIR = join(PARENT_AGENT_DIR, "delegation-broker");
 // Every live Pi controller owns its IPC socket/token lifecycle. Capacity and health remain shared

@@ -17,7 +17,7 @@ function packageDirectory(require, name) {
 }
 
 /** Capture at extension activation, before source edits can alter a live child's graph. */
-export function captureChildRuntime(sourceRoot) {
+export function captureChildRuntime(sourceRoot, hostPackageRoot = sourceRoot) {
   const names = ["package.json", "extensions/pi-delegation-broker.ts", ...CHILDREN.map((name) => `extensions/${name}`)];
   const walk = (relative) => {
     for (const name of readdirSync(join(sourceRoot, relative)).sort()) {
@@ -37,7 +37,9 @@ export function captureChildRuntime(sourceRoot) {
   for (const file of files) if (hash(readFileSync(join(sourceRoot, file.name))) !== file.digest) {
     throw new Error("child runtime source changed during capture; restart after edits settle");
   }
-  const require = createRequire(join(sourceRoot, "package.json"));
+  // The extension loader owns SDK identity. Bind child snapshots to that same
+  // physical host, not a development SDK or an extension-local duplicate.
+  const require = createRequire(join(hostPackageRoot, "package.json"));
   const dependencies = ["typebox", "@earendil-works/pi-ai"].map((name) => ({ name, path: packageDirectory(require, name) }));
   const generation = hash(JSON.stringify(files.map(({ name, digest }) => [name, digest])));
   return Object.freeze({

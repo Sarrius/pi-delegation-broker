@@ -14,7 +14,7 @@ try {
   const filename = packed?.[0]?.filename;
   if (typeof filename !== "string" || !filename.endsWith(".tgz")) throw new Error("npm pack did not produce one tarball");
   writeFileSync(join(temp, "package.json"), '{"private":true}\n', { mode: 0o600 });
-  execFileSync(npm, ["install", "--ignore-scripts", "--no-audit", "--no-fund", join(temp, filename)], {
+  execFileSync(npm, ["install", "--ignore-scripts", "--legacy-peer-deps", "--no-audit", "--no-fund", join(temp, filename)], {
     cwd: temp, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
   });
   const installed = join(temp, "node_modules", "@sars267", "pi-delegation-broker");
@@ -22,7 +22,7 @@ try {
     throw new Error(`clean install unexpectedly linked the package to ${readlinkSync(installed)}`);
   }
   for (const dependency of [join(temp, "node_modules", "typebox"), join(temp, "node_modules", "@earendil-works", "pi-ai")]) {
-    if (!existsSync(dependency)) throw new Error(`declared runtime dependency was not installed: ${dependency}`);
+    if (existsSync(dependency)) throw new Error(`managed install duplicated a host-provided peer: ${dependency}`);
   }
   const home = join(temp, "home");
   const agent = join(home, ".pi", "agent");
@@ -38,7 +38,7 @@ try {
     encoding: "utf8",
     timeout: 30_000,
   });
-  if (result.status !== 0) throw new Error(`installed Pi extension activation failed (${result.status})`);
+  if (result.status !== 0) throw new Error(`installed Pi extension activation failed (${result.status}): ${result.stderr?.slice(-4000)} ${result.stdout?.slice(-4000)}`);
   const events = result.stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const response = events.find((event) => event.type === "response" && event.id === "installed-package");
   if (!response?.success || events.some((event) => event.type === "extension_error")) {
