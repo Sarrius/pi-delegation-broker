@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-export const MODEL_POLICY_VERSION = "subscription-native-current-only/v1";
+export const MODEL_POLICY_VERSION = "subscription-native-current-only/v2-antigravity";
 
 const FIRST_PARTY_SUBSCRIPTIONS = Object.freeze({
   "openai-codex": "openai",
@@ -20,7 +20,7 @@ export function baseRouteProvider(provider) {
 export function providerClassFor(provider) {
   const base = baseRouteProvider(provider);
   if (Object.hasOwn(FIRST_PARTY_SUBSCRIPTIONS, base)) return "first_party_subscription";
-  if (base === "cursor") return "mixed_subscription";
+  if (base === "cursor" || base === "google-antigravity") return "mixed_subscription";
   if (AGGREGATORS.has(base)) return "aggregator";
   if (DIRECT_APIS.has(base)) return "direct_api";
   if (/^(local|localhost|ollama-local|vllm)/.test(base)) return "self_hosted";
@@ -73,8 +73,10 @@ export function deriveModelProvenance({ provider, modelId } = {}) {
     nativeToRoute = modelDeveloper === firstPartyOwner;
     billingPool = nativeToRoute ? "native_subscription" : "third_party_subscription";
   } else if (providerClass === "mixed_subscription") {
-    nativeToRoute = cursorNativeModel(modelId);
-    billingPool = nativeToRoute ? "native_subscription" : "third_party_subscription";
+    nativeToRoute = baseProvider === "google-antigravity" ? modelDeveloper === "google" : cursorNativeModel(modelId);
+    // Subscription inclusion does not change the actual model developer.
+    billingPool = baseProvider === "google-antigravity" && ["google", "anthropic", "openai"].includes(modelDeveloper)
+      ? "included_subscription" : nativeToRoute ? "native_subscription" : "third_party_subscription";
   } else if (providerClass === "aggregator") {
     billingPool = "aggregator_payg";
   } else if (providerClass === "direct_api") {
@@ -89,6 +91,7 @@ export function deriveModelProvenance({ provider, modelId } = {}) {
     routeProvider,
     baseProvider,
     billingPool,
+    ...(baseProvider === "google-antigravity" ? { quotaObservationScope: `model:${terminalModelId(modelId)}` } : {}),
     nativeToRoute,
     source: MODEL_POLICY_VERSION,
   });
@@ -112,7 +115,8 @@ export function evaluateRouteEligibility({
   if (freshness !== "current") reasons.push(`freshness_${freshness}`);
   if (!explicitlyAllowed) {
     if (!new Set(["first_party_subscription", "mixed_subscription"]).has(provenance.providerClass)) reasons.push("provider_not_subscription_native_default");
-    if (provenance.billingPool !== "native_subscription" || provenance.nativeToRoute !== true) reasons.push("route_not_native_subscription_pool");
+    if (!(provenance.baseProvider === "google-antigravity" && provenance.providerClass === "mixed_subscription" && provenance.billingPool === "included_subscription") &&
+        (provenance.billingPool !== "native_subscription" || provenance.nativeToRoute !== true)) reasons.push("route_not_native_subscription_pool");
     if (!meetsQuality) reasons.push(`below_${requestedTier ?? "requested"}_quality_floor`);
   }
   return Object.freeze({

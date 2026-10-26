@@ -29,7 +29,7 @@ export function delegationInventory({registry, inventory=[], currency={}, prefer
       freeChildSlots:health ? Math.max(0,health.maxConcurrent-(health.controlReserve??1)-(health.verifyReserve??0)-health.activeLeases) : null,
       retryAt:health ? Math.max(health.cooldownUntil??0,health.groupCooldownUntil??0) || null : null,
       freshnessEvaluatedAt:currency[id]?.evaluatedAt??null,
-      cost:{status:policy.provenance.billingPool==='native_subscription'?'subscription_no_request_price':'unavailable',actualMoney:null}};
+      cost:{status:['native_subscription','included_subscription'].includes(policy.provenance.billingPool)?'subscription_no_request_price':'unavailable',actualMoney:null}};
   });
   return {observedAt:now,enabled,availabilityGuarantee:false,parentQuotaReserve:'not_measurable',rows};
 }

@@ -139,7 +139,13 @@ function normalizedBrokerRegistry(registry) {
       ownKeysExactly(resource.provenance, [
         "providerClass", "modelDeveloper", "routeProvider", "baseProvider",
         "billingPool", "nativeToRoute", "source",
+        ...(resource.provenance.quotaObservationScope !== undefined ? ["quotaObservationScope"] : []),
       ], `resource ${id} provenance`);
+      if (resource.provenance.quotaObservationScope !== undefined &&
+        (resource.provenance.baseProvider !== "google-antigravity" || !model ||
+          resource.provenance.quotaObservationScope !== `model:${model.modelId.toLowerCase()}`)) {
+        throw new Error(`resource ${id} provenance quotaObservationScope must identify its exact Antigravity model`);
+      }
       for (const field of ["providerClass", "modelDeveloper", "routeProvider", "baseProvider", "billingPool", "source"]) {
         requireIdentifier(resource.provenance[field], `resource ${id} provenance ${field}`);
       }
