@@ -6,6 +6,8 @@ test("parent-proxy native aliases use catalog-only currency observations", () =>
   for (const provider of [
     "cursor",
     "cursor-account-2",
+    "google-antigravity",
+    "google-antigravity-account-2",
     "anthropic-account-2",
     "openai-codex-account-2",
     "openai-codex-account-7",
@@ -15,7 +17,7 @@ test("parent-proxy native aliases use catalog-only currency observations", () =>
 });
 
 test("base native providers and unrelated providers remain generic-probe eligible", () => {
-  for (const provider of ["anthropic", "openai-codex", "openrouter", "cursor-account-x", ""]) {
+  for (const provider of ["google", "google-code-assist-account-x", "anthropic", "openai-codex", "openrouter", "cursor-account-x", ""]) {
     assert.equal(isCatalogOnlyNativeProvider(provider), false, provider);
   }
 });

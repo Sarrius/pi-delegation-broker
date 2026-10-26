@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { createEffectiveChildCapability } from "./capability-compiler.mjs";
 
+const MODEL_QUOTA_RESOURCE = /^google-antigravity(?:-account-[1-9]\d*)?\//;
 const ENFORCEMENT = Object.freeze({ hard: 2, metered_best_effort: 1, unavailable: 0 });
 const ADMISSION_CLASSES = new Set(["control", "verify", "work"]);
 const INVENTORY_CONFIDENCE = new Set(["measured", "observed", "assumed"]);
@@ -139,6 +140,7 @@ export class SqliteLeaseBroker {
       this.#db.exec("PRAGMA journal_mode = WAL;");
       this.#migrate();
       this.#seed(registry);
+      this.#migrateAntigravityQuotaScope();
     } catch (error) {
       this.#db.close();
       throw error;
@@ -786,16 +788,25 @@ export class SqliteLeaseBroker {
   }
 
   markRateLimited(resourceId, retryAfterMs, now) {
+    // Account concurrency is still shared. A model quota refusal is not evidence that
+    // every other included model is exhausted; credential failures remain account-scoped.
+    if (MODEL_QUOTA_RESOURCE.test(resourceId)) {
+      const receipt = this.markUnknown(resourceId, now, "model_quota", "resource", retryAfterMs, "dispatch");
+      return { ...receipt, status: "cooling_down", until: receipt.retryAt };
+    }
     return this.#transaction(() => {
       const resource = this.#db.prepare(`
-        SELECT r.capacity_group, g.default_cooldown_ms
+        SELECT r.capacity_group, g.default_cooldown_ms, g.cooldown_until
         FROM resources r JOIN capacity_groups g ON g.id = r.capacity_group
         WHERE r.id = ?
       `).get(resourceId);
       if (!resource) throw new Error(`Unknown resource ${resourceId}`);
       const hasUsableRetryAfter = Number.isSafeInteger(retryAfterMs) && retryAfterMs > 0 && retryAfterMs <= Number.MAX_SAFE_INTEGER - now;
+      const retainCooldown = !hasUsableRetryAfter && resource.cooldown_until > now;
       const duration = hasUsableRetryAfter ? retryAfterMs : resource.default_cooldown_ms;
-      const until = now + duration;
+      // IPC already records provider Retry-After. A later runner report lacking that header
+      // must not inflate it to the default multi-hour delay or slide it on every observation.
+      const until = Math.max(resource.cooldown_until, retainCooldown ? resource.cooldown_until : now + duration);
       this.#db.prepare(`
         UPDATE capacity_groups
         SET cooldown_until = MAX(cooldown_until, ?), breaker_state = 'cooling_down'
@@ -805,9 +816,31 @@ export class SqliteLeaseBroker {
         resourceId,
         capacityGroup: resource.capacity_group,
         until,
-        source: hasUsableRetryAfter ? "retry_after" : "registry_default",
+        source: hasUsableRetryAfter ? "retry_after" : retainCooldown ? "existing_cooldown" : "registry_default",
       });
       return { status: "cooling_down", capacityGroup: resource.capacity_group, until };
+    });
+  }
+
+  #migrateAntigravityQuotaScope() {
+    this.#transaction(() => {
+      const groups = this.#db.prepare("SELECT id, cooldown_until FROM capacity_groups WHERE breaker_state = 'cooling_down' AND probe_lease_id IS NULL").all();
+      for (const group of groups) {
+        if (!/^G-google-antigravity(?:-account-[1-9]\d*)?$/.test(group.id)) continue;
+        // Reattribute only the exact recorded legacy quota cooldown. Missing or
+        // inconsistent evidence leaves the breaker intact; no blanket health reset.
+        const rows = this.#db.prepare(`SELECT payload FROM events WHERE type = 'CapacityGroupCooldown'
+          AND json_extract(payload, '$.capacityGroup') = ? AND json_extract(payload, '$.until') = ? LIMIT 1001`)
+          .all(group.id, group.cooldown_until);
+        if (!rows.length || rows.length > 1000) continue;
+        const ids = [...new Set(rows.map(row => parseJson(row.payload).resourceId))];
+        if (ids.some(id => typeof id !== "string" || !MODEL_QUOTA_RESOURCE.test(id) ||
+          this.#db.prepare("SELECT capacity_group FROM resources WHERE id = ?").get(id)?.capacity_group !== group.id)) continue;
+        for (const id of ids) this.#db.prepare(`UPDATE resources SET state = 'unknown',
+          cooldown_until = MAX(cooldown_until, ?), unhealthy_evidence = 'dispatch' WHERE id = ?`).run(group.cooldown_until, id);
+        this.#db.prepare("UPDATE capacity_groups SET cooldown_until = 0, breaker_state = 'healthy' WHERE id = ? AND probe_lease_id IS NULL").run(group.id);
+        this.#record(Date.now(), "ModelQuotaScopeMigrated", {capacityGroup:group.id, resourceIds:ids, until:group.cooldown_until});
+      }
     });
   }
 
@@ -817,40 +850,55 @@ export class SqliteLeaseBroker {
    * resource in the capacity group shares it. Unknown is nevertheless recoverable: after the
    * registry-defined probe interval one bounded half-open attempt may prove the route live again.
    */
-  markUnknown(resourceId, now, reason = "unknown", scope = "resource", retryAfterMs) {
+  markUnknown(resourceId, now, reason = "unknown", scope = "resource", retryAfterMs, evidence = "catalog") {
     if (scope !== "resource" && scope !== "capacity_group") throw new Error("markUnknown scope must be resource or capacity_group");
+    if (evidence !== "catalog" && evidence !== "dispatch") throw new Error("markUnknown evidence must be catalog or dispatch");
     return this.#transaction(() => {
       this.#assertNondecreasingTime(now);
       const resource = this.#db.prepare(`
-        SELECT r.capacity_group, g.probe_interval_ms
+        SELECT r.capacity_group, r.state, r.cooldown_until, g.probe_interval_ms
         FROM resources r JOIN capacity_groups g ON g.id = r.capacity_group
         WHERE r.id = ?
       `).get(resourceId);
       if (!resource) throw new Error(`Unknown resource ${resourceId}`);
       const hasUsableRetryAfter = Number.isSafeInteger(retryAfterMs) && retryAfterMs > 0 && retryAfterMs <= Number.MAX_SAFE_INTEGER - now;
-      const retryAt = now + (hasUsableRetryAfter ? retryAfterMs : resource.probe_interval_ms);
+      const proposedRetryAt = now + (hasUsableRetryAfter ? retryAfterMs : resource.probe_interval_ms);
+      // Repeated discovery failures must not perpetually defer an already scheduled inference
+      // probe. Only a new dispatch failure renews an unknown route's recovery delay. A broken
+      // /models endpoint is not proof that inference is still unavailable.
+      const retryAt = evidence === "catalog" && resource.state === "unknown"
+        ? resource.cooldown_until : Math.max(resource.cooldown_until, proposedRetryAt);
+      // `unhealthy_evidence` records what the failure actually proved. A catalog/listing probe may
+      // later clear its own catalog-scoped doubt, but it must never clear a failure observed while
+      // dispatching real inference: only a leased half-open probe can prove that route live again.
       this.#db.prepare(`
-        UPDATE resources SET state = 'unknown', cooldown_until = MAX(cooldown_until, ?)
+        UPDATE resources
+        SET state = 'unknown', cooldown_until = CASE WHEN state = 'unknown' AND ? = 'catalog'
+              THEN cooldown_until ELSE MAX(cooldown_until, ?) END,
+            unhealthy_evidence = CASE WHEN unhealthy_evidence = 'dispatch' THEN 'dispatch' ELSE ? END
         WHERE id = ?
-      `).run(retryAt, resourceId);
+      `).run(evidence, proposedRetryAt, evidence, resourceId);
       if (scope === "capacity_group") {
         const siblings = this.#db.prepare(`
-          UPDATE resources SET state = 'unknown', cooldown_until = MAX(cooldown_until, ?)
+          UPDATE resources
+          SET state = 'unknown', cooldown_until = CASE WHEN state = 'unknown' AND ? = 'catalog'
+                THEN cooldown_until ELSE MAX(cooldown_until, ?) END,
+              unhealthy_evidence = CASE WHEN unhealthy_evidence = 'dispatch' THEN 'dispatch' ELSE ? END
           WHERE capacity_group = ? AND id != ?
-        `).run(retryAt, resource.capacity_group, resourceId);
+        `).run(evidence, proposedRetryAt, evidence, resource.capacity_group, resourceId);
         this.#record(now, "CapacityGroupUnknown", {
-          resourceId, capacityGroup: resource.capacity_group, reason,
+          resourceId, capacityGroup: resource.capacity_group, reason, evidence,
           alsoAffected: siblings.changes, retryAt,
         });
         return {
           status: "unknown", resourceId, capacityGroup: resource.capacity_group,
-          alsoAffected: siblings.changes, retryAt,
+          alsoAffected: siblings.changes, retryAt, evidence,
         };
       }
-      this.#record(now, "ResourceUnknown", { resourceId, reason, retryAt });
+      this.#record(now, "ResourceUnknown", { resourceId, reason, retryAt, evidence });
       // Return an explicit receipt: a void result is indistinguishable from "no reply" to a
       // controller waiting on the IPC response.
-      return { status: "unknown", resourceId, retryAt };
+      return { status: "unknown", resourceId, retryAt, evidence };
     });
   }
 
@@ -865,10 +913,13 @@ export class SqliteLeaseBroker {
       this.#assertNondecreasingTime(now);
       const resource = this.#db.prepare("SELECT capacity_group FROM resources WHERE id = ?").get(resourceId);
       if (!resource) throw new Error(`Unknown resource ${resourceId}`);
-      this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0 WHERE id = ?").run(resourceId);
+      // A route condemned while dispatching real inference is deliberately left alone: listing the
+      // catalog proves the endpoint answers `/models`, not that it can serve a completion. Clearing
+      // it here is what let a dead route be re-leased ~14s after every failure.
+      this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0, unhealthy_evidence = NULL WHERE id = ? AND unhealthy_evidence IS NOT 'dispatch'").run(resourceId);
       let alsoAffected = 0;
       if (scope === "capacity_group") {
-        const siblings = this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0 WHERE capacity_group = ? AND id != ?")
+        const siblings = this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0, unhealthy_evidence = NULL WHERE capacity_group = ? AND id != ? AND unhealthy_evidence IS NOT 'dispatch'")
           .run(resource.capacity_group, resourceId);
         alsoAffected = siblings.changes;
       }
@@ -885,7 +936,8 @@ export class SqliteLeaseBroker {
         .get(leaseId, fencingToken, now);
       if (!lease) return { status: "denied_lease" };
       const group = this.#db.prepare("SELECT breaker_state, probe_lease_id FROM capacity_groups WHERE id = ?").get(lease.capacity_group);
-      this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0 WHERE id = ?").run(lease.resource_id);
+      // A real leased completion is the only evidence that clears a dispatch-scoped quarantine.
+      this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0, unhealthy_evidence = NULL WHERE id = ?").run(lease.resource_id);
       if (group.breaker_state === "cooling_down" && (lease.is_probe !== 1 || group.probe_lease_id !== lease.lease_id)) {
         this.#record(now, "ProviderSuccessObserved", { leaseId, capacityGroup: lease.capacity_group, breakerClosed: false });
         return { status: "observed", capacityGroup: lease.capacity_group, breakerClosed: false };
@@ -904,7 +956,7 @@ export class SqliteLeaseBroker {
     return this.#transaction(() => {
       const resource = this.#db.prepare("SELECT capacity_group FROM resources WHERE id = ?").get(resourceId);
       if (!resource) throw new Error(`Unknown resource ${resourceId}`);
-      this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0 WHERE id = ?").run(resourceId);
+      this.#db.prepare("UPDATE resources SET state = 'healthy', cooldown_until = 0, unhealthy_evidence = NULL WHERE id = ?").run(resourceId);
       this.#db.prepare(`
         UPDATE capacity_groups SET breaker_state = 'healthy', cooldown_until = 0, probe_lease_id = NULL
         WHERE id = ?
@@ -1024,6 +1076,7 @@ export class SqliteLeaseBroker {
         cooldown_until INTEGER NOT NULL DEFAULT 0,
         inventory_confidence TEXT NOT NULL DEFAULT 'assumed' CHECK (inventory_confidence IN ('measured', 'observed', 'assumed')),
         enforcement TEXT NOT NULL,
+        unhealthy_evidence TEXT CHECK (unhealthy_evidence IN ('catalog', 'dispatch')),
         retiring INTEGER NOT NULL DEFAULT 0 CHECK (retiring IN (0, 1))
       );
       CREATE TABLE IF NOT EXISTS leases (
@@ -1112,6 +1165,7 @@ export class SqliteLeaseBroker {
     // its last lease ends. Carried as its own column rather than a new `state` value so an
     // existing database migrates additively instead of rebuilding a CHECK constraint.
     if (!resourceColumns.includes("retiring")) this.#db.exec("ALTER TABLE resources ADD COLUMN retiring INTEGER NOT NULL DEFAULT 0");
+    if (!resourceColumns.includes("unhealthy_evidence")) this.#db.exec("ALTER TABLE resources ADD COLUMN unhealthy_evidence TEXT");
   }
 
   #validateRegistry(registry) {
@@ -1233,7 +1287,7 @@ export class SqliteLeaseBroker {
       // are carried across the replacement. Dropping them resurrects every dead account on every
       // reload, and the next task rediscovers them one wasted attempt at a time.
       const groupHealth = this.#db.prepare("SELECT id, cooldown_until, breaker_state FROM capacity_groups").all();
-      const resourceHealth = this.#db.prepare("SELECT id, state, cooldown_until FROM resources").all();
+      const resourceHealth = this.#db.prepare("SELECT id, state, cooldown_until, unhealthy_evidence FROM resources").all();
       this.#db.prepare("DELETE FROM resources").run();
       this.#db.prepare("DELETE FROM capacity_groups").run();
       this.#db.prepare("DELETE FROM profiles").run();
@@ -1251,8 +1305,8 @@ export class SqliteLeaseBroker {
       for (const resource of resourceHealth) {
         if (!Object.hasOwn(newRegistry.resources, resource.id)) continue;
         if (resource.state === "healthy" && resource.cooldown_until <= 0) continue;
-        this.#db.prepare("UPDATE resources SET state = ?, cooldown_until = ? WHERE id = ?")
-          .run(resource.state, resource.cooldown_until, resource.id);
+        this.#db.prepare("UPDATE resources SET state = ?, cooldown_until = ?, unhealthy_evidence = ? WHERE id = ?")
+          .run(resource.state, resource.cooldown_until, resource.unhealthy_evidence, resource.id);
         carried += 1;
       }
       this.#record(now, "RegistryReloaded", {

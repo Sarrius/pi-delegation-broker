@@ -92,3 +92,39 @@ test("policy generation is deterministic and changes with user pools", () => {
     schemaVersion: 1, tiers: { frontier: [{ model: "grok-4.6", via: ["openrouter"] }], standard: [], cheap: [] },
   }));
 });
+
+test("removed Code Assist aliases and API-key Google do not inherit subscription admission", () => {
+  for(const provider of ["google-code-assist", "google-code-assist-account-2", "google"]){
+    assert.equal(providerClassFor(provider), "unknown");
+    assert.equal(evaluateRouteEligibility({identity:{provider,modelId:"gemini-synthetic"},requestedTier:"standard",meetsQuality:true,
+      currencyFact:{listed:true,generation:0}}).eligible,false);
+  }
+});
+
+test("Antigravity is a mixed subscription with distinct model scopes, not Google API billing", () => {
+  const identity = { provider: "google-antigravity-account-2", modelId: "gemini-4-argon-high" };
+  const p = deriveModelProvenance(identity);
+  assert.equal(p.providerClass, "mixed_subscription"); assert.equal(p.nativeToRoute, true);
+  assert.notEqual(p.quotaObservationScope, deriveModelProvenance({ ...identity, modelId: "gemini-3.8-flash-high" }).quotaObservationScope);
+  assert.equal(evaluateRouteEligibility({ identity, requestedTier: "standard", meetsQuality: true }).eligible, false);
+  assert.equal(evaluateRouteEligibility({ identity, requestedTier: "standard", meetsQuality: true,
+    currencyFact: { listed: true, legacy: false, generation: 0 } }).eligible, true);
+  assert.equal(deriveModelProvenance({ ...identity, modelId: "claude-opus-4-6-thinking" }).nativeToRoute, false);
+});
+
+test("Antigravity included subscription admits current hosted models without falsifying developer provenance", () => {
+  for (const modelId of ["gemini-3.8-flash-high", "claude-sonnet-5-5-low", "gpt-oss-120b-medium"]) {
+    const identity = { provider: "google-antigravity-account-2", modelId };
+    const p = deriveModelProvenance(identity);
+    assert.equal(p.billingPool, "included_subscription");
+    assert.equal(p.nativeToRoute, modelId.startsWith("gemini-"));
+    assert.equal(evaluateRouteEligibility({identity, requestedTier:"standard", meetsQuality:true,
+      currencyFact:{listed:true,generation:0}}).eligible,true);
+    assert.equal(evaluateRouteEligibility({identity, requestedTier:"standard", meetsQuality:false,
+      currencyFact:{listed:true,generation:0}}).eligible,false);
+    assert.equal(evaluateRouteEligibility({identity, requestedTier:"standard", meetsQuality:true,
+      currencyFact:{listed:true,generation:1}}).eligible,false);
+  }
+  assert.equal(evaluateRouteEligibility({identity:{provider:"cursor",modelId:"claude-sonnet-5-5"},
+    currencyFact:{listed:true,generation:0},requestedTier:"standard",meetsQuality:true}).eligible,false);
+});

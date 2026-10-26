@@ -51,6 +51,9 @@ export function parseModelVersion(modelId) {
   // current Sol/Terra/Luna routes stale and force ordinary work into premium capacity.
   const apex = /^gpt-(\d+(?:\.\d+)*)-astra(?:-|$)/.exec(normalized);
   if (apex) return { family: "gpt-astra", version: apex[1].split(".").map(Number) };
+  // Gemini product lines coexist: a new Argon is not a replacement for Flash.
+  const gemini = /^gemini-(\d+(?:\.\d+)*)-(flash-lite|flash|pro|argon)(?:-|$)/.exec(normalized);
+  if (gemini) return { family: `gemini-${gemini[2]}`, version: gemini[1].split(".").map(Number) };
   const match = VERSION_PATTERN.exec(normalized);
   if (!match) return { family: normalized.split(/[-_.:/]/)[0] || normalized, version: null };
   const family = match[1];
