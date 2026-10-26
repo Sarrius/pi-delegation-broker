@@ -123,6 +123,7 @@ test("fresh Pi: visual failover preserves the image and one busy-parent wake con
       )), 90_000);
       attachJsonl(child.stdout, (event) => {
         sequence += 1;
+        if (event.type === "response" && event.success === false) { clearTimeout(timer); reject(new Error(`Pi RPC rejected fixture command: ${event.error ?? JSON.stringify(event)}`)); }
         if (event.type === "extension_error") extensionError = event.error ?? event.message ?? JSON.stringify(event);
         if (event.type === "message_start" && event.message?.role === "custom" && event.message?.customType === "delegation-broker-wake") {
           wakeCount += 1;

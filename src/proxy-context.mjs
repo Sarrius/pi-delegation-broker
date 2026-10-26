@@ -14,8 +14,8 @@ import { TOOL_CALL_ID, TOOL_NAME } from "./tool-identity.mjs";
 const NAMESPACE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const LOCAL_SCHEMA_METADATA = new Set(["~kind", "~optional", "~readonly"]);
 const USER_METADATA = ["role", "content", "timestamp"];
-const ASSISTANT_METADATA = ["role", "content", "api", "provider", "model", "responseModel", "responseId", "diagnostics", "usage", "stopReason", "deferred", "errorMessage", "rawStopReason", "endTurn", "timestamp"];
-const TOOL_RESULT_METADATA = ["role", "toolCallId", "toolName", "content", "details", "usage", "addedToolNames", "isError", "timestamp"];
+const ASSISTANT_METADATA = ["role", "content", "api", "provider", "model", "responseModel", "responseId", "diagnostics", "usage", "stopReason", "deferred", "errorMessage", "rawStopReason", "endTurn", "timestamp", "durationMs", "thinkingLevel", "providerThinkingLevel"];
+const TOOL_RESULT_METADATA = ["role", "toolCallId", "toolName", "content", "details", "usage", "addedToolNames", "isError", "timestamp", "durationMs", "nestedCalls"];
 const NON_PRINTABLE_TEXT = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 const MAX_PROVIDER_TEXT = 256 * 1024;
 const IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
@@ -186,20 +186,51 @@ function canonicalTool(tool, index) {
   };
 }
 
-/** Convert a Pi Context into a detached, closed provider context. */
+function canonicalSystemMessage(message, index) {
+  const label = `proxy context messages[${index}]`;
+  exactKeys(message, ["role", "content", "timestamp", "sections", "toolsAdded", "toolsRemoved"], label);
+  const content = canonicalInputContent(message.content, `${label}.content`);
+  if (typeof content !== "string") throw new Error(`${label}.content must be system text`);
+  const result = { role: "system", content };
+  if (message.sections !== undefined) result.sections = schemaProjection(message.sections, `${label}.sections`);
+  if (message.toolsAdded !== undefined) {
+    if (!Array.isArray(message.toolsAdded)) throw new Error(`${label}.toolsAdded must be an array`);
+    result.toolsAdded = message.toolsAdded.map(canonicalTool);
+  }
+  if (message.toolsRemoved !== undefined) {
+    if (!Array.isArray(message.toolsRemoved)) throw new Error(`${label}.toolsRemoved must be an array`);
+    result.toolsRemoved = message.toolsRemoved.map((tool) => {
+      if (!tool || typeof tool !== "object" || Array.isArray(tool)) throw new Error(`${label}.toolsRemoved must contain tool identities`);
+      exactKeys(tool, ["name"], label);
+      return { name: tool.name };
+    });
+  }
+  return result;
+}
+
+/** Convert legacy Pi Context or native1.x TranscriptContext without dropping
+ * chronological system/tool deltas or forwarding executable declarations. */
 export function proxyCanonicalContext(context) {
   if (!context || typeof context !== "object" || Array.isArray(context)) throw new Error("proxy context is required");
   exactKeys(context, ["systemPrompt", "messages", "tools"], "proxy context");
   if (!Array.isArray(context.messages)) throw new Error("proxy context messages are required");
   if (context.systemPrompt !== undefined && typeof context.systemPrompt !== "string") throw new Error("proxy system prompt must be text");
   if (context.tools !== undefined && !Array.isArray(context.tools)) throw new Error("proxy context tools must be an array");
-  const tools = (context.tools ?? []).map(canonicalTool);
-  const messages = context.messages.map(canonicalMessage);
-  return captureProviderContext({
-    systemPrompt: context.systemPrompt ?? "",
-    messages,
-    tools,
-  }, { maxBytes: MAX_PROVIDER_CONTEXT_BYTES }).value;
+  const transcript = context.messages.some((message) => message?.role === "system");
+  if (transcript && (context.systemPrompt !== undefined || context.tools !== undefined)) {
+    throw new Error("proxy context mixes legacy prompt/tools with transcript system messages");
+  }
+  const messages = context.messages.map((message, index) => message?.role === "system"
+    ? canonicalSystemMessage(message, index) : canonicalMessage(message, index));
+  const currentTools = new Map();
+  if (transcript) for (const message of messages) {
+    if (message.role !== "system") continue;
+    for (const tool of message.toolsRemoved ?? []) currentTools.delete(tool.name);
+    for (const tool of message.toolsAdded ?? []) currentTools.set(tool.name, tool);
+  }
+  const tools = transcript ? [...currentTools.values()] : (context.tools ?? []).map(canonicalTool);
+  return captureProviderContext({ systemPrompt: context.systemPrompt ?? "", messages, tools },
+    { maxBytes: MAX_PROVIDER_CONTEXT_BYTES }).value;
 }
 
 /** Map closed provider terminal outcomes to Pi stop/error semantics without leaking raw bodies. */

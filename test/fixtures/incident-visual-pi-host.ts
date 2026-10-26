@@ -125,8 +125,8 @@ export default function incidentVisualPiHost(pi: ExtensionAPI) {
     (ctx as any).controllerProvider = {
       providerTransport,
       routePreflight: async ({ resourceId }: { resourceId: string }) => {
-        if (!unavailableResource) {
-          unavailableResource = resourceId;
+        if (!unavailableResource) unavailableResource = resourceId;
+        if (unavailableResource === resourceId) {
           return { status: "unavailable", reason: "fixture_first_route_unavailable", scope: "resource" };
         }
         return { status: "ready" };
@@ -190,7 +190,9 @@ export default function incidentVisualPiHost(pi: ExtensionAPI) {
       queueMicrotask(async () => {
         try {
           const messages = context.messages ?? [];
-          const allText = messages.map((message: any) => textOf(message.content)).join("\n");
+          // Native transcripts include policy text mentioning the wake marker.
+          // Only conversation messages can be evidence of an actual wake.
+          const allText = messages.filter((message: any) => message.role !== "system").map((message: any) => textOf(message.content)).join("\n");
           const lastTool = [...messages].reverse().find((message: any) => message.role === "toolResult");
           parentObservations.push({
             roles: messages.map((message: any) => message.role),
