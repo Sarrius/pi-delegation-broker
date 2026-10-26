@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import * as piAI from "@earendil-works/pi-ai";
 
 /**
  * Parent-owned controller provider adapter.
@@ -255,6 +256,16 @@ function ensureSupportedContext(context: any, model: any): void {
 }
 
 function nativeMessage(message: any): any {
+	if (message.role === "system") {
+		return {
+			role: "system", content: message.content, timestamp: 0,
+			...(message.sections === undefined ? {} : { sections: message.sections }),
+			...(message.toolsAdded === undefined ? {} : { toolsAdded: message.toolsAdded.map((tool: any) => ({
+				name: tool.name, description: tool.description, parameters: tool.inputSchema,
+			})) }),
+			...(message.toolsRemoved === undefined ? {} : { toolsRemoved: message.toolsRemoved }),
+		};
+	}
 	if (message.role === "assistant" && Array.isArray(message.content)) {
 		return {
 			role: "assistant",
@@ -286,7 +297,15 @@ function nativeMessage(message: any): any {
 }
 
 function nativeContext(context: any): any {
-	return {
+	// Host aliases bind this namespace to the running AI module. Old native
+	// providers need Context; new ones require TranscriptContext. Never flatten
+	// chronological updates or send legacy prompt/tools to a native1.x provider.
+	const normalize = (piAI as unknown as { normalizeContext?: (value: any) => any }).normalizeContext;
+	if (context.messages.some((message: any) => message.role === "system")) {
+		if (typeof normalize !== "function") throw new Error("native transcript context is unsupported by this host");
+		return { messages: context.messages.map(nativeMessage) };
+	}
+	const legacyContext = {
 		...(typeof context.systemPrompt === "string" ? { systemPrompt: context.systemPrompt } : {}),
 		messages: context.messages.map(nativeMessage),
 		tools: (Array.isArray(context.tools) ? context.tools : []).map((tool: any) => ({
@@ -295,6 +314,7 @@ function nativeContext(context: any): any {
 			parameters: tool.inputSchema,
 		})),
 	};
+	return typeof normalize === "function" ? normalize(legacyContext) : legacyContext;
 }
 
 function blockTypeFor(eventType: string): "text" | "reasoning" | undefined {

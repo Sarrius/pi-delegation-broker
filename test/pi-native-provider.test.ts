@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as nativeAI from "@earendil-works/pi-ai";
 import {
 	CONTROLLER_PROVIDER_ADAPTER_ID,
 	createControllerProvider,
@@ -32,7 +33,14 @@ function makeRegistry(models: any[], options: { events?: any[]; response?: false
 			streamSimple: (model: any, context: any, request: any) => {
 				const payload = { model: model.id, messages: [{ role: "user", content: "hello" }], stream: true };
 				const preparedPayload = request.onPayload?.(payload, model) ?? payload;
-				calls.push({ model, context, request, payload: preparedPayload });
+				// These fixtures assert effective legacy messages/tools; retain the exact
+				// native transcript too. Chronological deltas have dedicated regression tests.
+				const observation = context.messages.some((m: any) => m.role === "system") ? {
+					systemPrompt: nativeAI.getCurrentSystemPrompt(context.messages),
+					messages: context.messages.filter((m: any) => m.role !== "system"),
+					tools: nativeAI.getCurrentTools(context.messages),
+				} : context;
+				calls.push({ model, context: observation, nativeContext: context, request, payload: preparedPayload });
 				if (options.response !== false) {
 					request.onResponse?.(options.response ?? { status: 200, headers: { "request-id": "req-1" } });
 				}

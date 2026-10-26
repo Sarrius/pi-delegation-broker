@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.0-alpha.3 — 2026-10-26
+
+- Integrate account-discovered Antigravity subscription routes from pi-multi-account 1.27.0 browser login, without manual application configuration or controller-held user tokens.
+- Admit included Google/Anthropic/OpenAI subscription models without falsifying developer provenance; retain current-generation, quality and lease gates.
+- Separate Gemini Argon/Pro/Flash/Flash-Lite generations. Model quota refusals no longer cool every model on an account; account concurrency remains shared.
+- Preserve dispatch evidence across catalog observations and exact evidence-based legacy cooldown migration. Missing evidence never authorizes a blanket health reset.
+- Bind extension/child dependencies to the physical Pi host through host-provided peers. Validate modern chronological system/tool transcript deltas without forwarding executable tools or private reasoning; preserve legacy contexts.
+- Update clean development-host fixtures to Pi 1.3 and patched undici/brace-expansion versions. Native visual/tool/wake regressions run against the modern host; this does not replace the user's running Pi.
+- Release only reviewed main; unrelated local readiness/Jev/metered-provider/workflow WIP is not part of this alpha.
+
 ## 0.1.0-alpha.2 — 2026-09-05
 
 ### Delegation usefulness and evidence

@@ -1,6 +1,6 @@
 # Antigravity subscription routes
 
-Use the opt-in native Antigravity provider in pi-multi-account, with privately configured OAuth application credentials. Never include application secrets, account tokens, project identifiers or local diagnostic journals in this repository. Account credentials stay in the parent Pi process.
+Install pi-multi-account 1.27.0+ on a compatible Pi host and use `/login google-antigravity`; complete browser authorization and return to Pi. No manual OAuth application configuration is required. The Multi Account adapter carries a source-reviewed shared installed-client identity, distinct from private user credentials. Never include private application secrets, account tokens, project identifiers or local diagnostic journals in this repository. Account credentials stay in the parent Pi process.
 
 This change admits account-discovered Antigravity Google/Anthropic/OpenAI models as included subscription routes. Serving host and model developer remain separate facts: Google hosting Claude does not make Claude a Google-developed model. Existing current-generation, quality, account capacity and launch gates still apply. The provider disables credit opt-in and does not use an API-key fallback; this is not a guarantee of server billing or Google's approval of third-party access.
 

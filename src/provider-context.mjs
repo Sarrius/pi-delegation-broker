@@ -5,7 +5,7 @@ import { TOOL_CALL_ID, TOOL_NAME } from "./tool-identity.mjs";
  * project this value only after the controller has validated its replay state. */
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const MESSAGE_ROLES = new Set(["user", "assistant", "toolResult"]);
+const MESSAGE_ROLES = new Set(["system", "user", "assistant", "toolResult"]);
 const IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 export const MAX_PROVIDER_IMAGE_DATA_CHARS = 6 * 1024 * 1024;
@@ -105,13 +105,45 @@ function validateAssistantContent(content, label, toolNames, pending) {
   }
 }
 
-function validateMessages(messages, toolNames) {
+function validateMessages(messages, toolNames, tools) {
   if (!Array.isArray(messages) || messages.length > 1_000) throw new Error("messages must be a bounded array");
+  const transcript = messages.some((message) => message?.role === "system");
+  const replayTools = new Map(transcript ? [] : tools.map((tool) => [tool.name, tool]));
+  const replayNames = new Set(replayTools.keys());
   const pending = new Map();
   for (const [index, message] of messages.entries()) {
     const label = `messages[${index}]`;
     if (!isPlainObject(message)) throw new Error(`${label} must be a plain object`);
     if (!MESSAGE_ROLES.has(message.role)) throw new Error(`${label}.role is unsupported`);
+    if (message.role === "system") {
+      exactKeys(message, ["role", "content", "sections", "toolsAdded", "toolsRemoved"], label);
+      boundedText(message.content, `${label}.content`, 256 * 1024);
+      if (pending.size > 0) throw new Error(`${label} interrupts unresolved tool calls`);
+      if (message.sections !== undefined) {
+        if (!isPlainObject(message.sections) || Object.keys(message.sections).length > 128) throw new Error(`${label}.sections must be a bounded map`);
+        for (const [name, text] of Object.entries(message.sections)) {
+          boundedText(name, `${label}.section name`, 128);
+          if (text !== null) boundedText(text, `${label}.sections.${name}`, 256 * 1024);
+        }
+      }
+      if (message.toolsRemoved !== undefined) {
+        if (!Array.isArray(message.toolsRemoved) || message.toolsRemoved.length > 128) throw new Error(`${label}.toolsRemoved must be bounded`);
+        const removed = new Set();
+        for (const tool of message.toolsRemoved) {
+          if (!isPlainObject(tool)) throw new Error(`${label}.toolsRemoved must contain tool identities`);
+          exactKeys(tool, ["name"], label);
+          boundedId(tool.name, `${label}.removed tool`, TOOL_NAME);
+          if (removed.has(tool.name) || !replayNames.has(tool.name)) throw new Error(`${label} removes an unknown or duplicate tool`);
+          removed.add(tool.name); replayTools.delete(tool.name); replayNames.delete(tool.name);
+        }
+      }
+      if (message.toolsAdded !== undefined) {
+        validateTools(message.toolsAdded);
+        for (const tool of message.toolsAdded) { replayTools.set(tool.name, tool); replayNames.add(tool.name); }
+      }
+      if (replayNames.size > 128) throw new Error(`${label} declares too many tools`);
+      continue;
+    }
     if (message.role === "user") {
       exactKeys(message, ["role", "content"], label);
       validateInputContent(message.content, `${label}.content`);
@@ -119,7 +151,7 @@ function validateMessages(messages, toolNames) {
     }
     if (message.role === "assistant") {
       exactKeys(message, ["role", "content"], label);
-      validateAssistantContent(message.content, `${label}.content`, toolNames, pending);
+      validateAssistantContent(message.content, `${label}.content`, replayNames, pending);
       continue;
     }
     exactKeys(message, ["role", "toolCallId", "toolName", "content", "isError"], label);
@@ -132,6 +164,10 @@ function validateMessages(messages, toolNames) {
     pending.delete(message.toolCallId);
   }
   if (pending.size > 0) throw new Error("messages end with unresolved tool calls");
+  if (transcript && (replayNames.size !== toolNames.size || tools.some((tool) =>
+    JSON.stringify(replayTools.get(tool.name)) !== JSON.stringify(tool)))) {
+    throw new Error("transcript final tools do not match the effective provider tools");
+  }
 }
 
 function validateTools(tools) {
@@ -161,6 +197,9 @@ export function captureProviderContext(context, { maxBytes = MAX_PROVIDER_CONTEX
   exactKeys(value, ["systemPrompt", "messages", "tools"], "context");
   boundedText(value.systemPrompt, "systemPrompt", 256 * 1024);
   const toolNames = validateTools(value.tools);
-  validateMessages(value.messages, toolNames);
+  if (value.messages.some((message) => message?.role === "system") && value.systemPrompt !== "") {
+    throw new Error("context mixes legacy system prompt with transcript system messages");
+  }
+  validateMessages(value.messages, toolNames, value.tools);
   return captured;
 }
