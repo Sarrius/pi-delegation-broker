@@ -60,9 +60,118 @@ async function issueBoundCapability(server, taskId) {
   return { capability, lease, childAuthorization: issued.capability };
 }
 
+test("real child enforcement retains the controller no-progress cause rather than a bare AbortError", async () => {
+  const {directory,server}=createServer();
+  const hooks=new Map();
+  const saved={};
+  try {
+    await server.start();
+    const {lease,childAuthorization}=await issueBoundCapability(server,"guard-origin");
+    for(const [key,value] of Object.entries({PI_BROKER_SOCKET:server.socketPath,PI_BROKER_CAPABILITY:childAuthorization,PI_BROKER_LEASE_ID:lease.leaseId,PI_BROKER_FENCING_TOKEN:String(lease.fencingToken)})) {
+      saved[key]=process.env[key];process.env[key]=value;
+    }
+    const {default:extension}=await import("../extensions/pi-behavioral-enforcement.ts");
+    let active=["read"],aborts=0,result;
+    extension({registerTool(){},on(name,fn){hooks.set(name,fn);},getActiveTools(){return active;},setActiveTools(names){active=names;}});
+    await hooks.get("session_start")({},{});
+    await new Promise(resolve=>setTimeout(resolve,10)); // settle the initial heartbeat before comparing state digests
+    for(let i=0;i<3;i++){
+      const call={toolName:"read",toolCallId:`read-${i}`,input:{path:"same-file"}};
+      assert.equal(await hooks.get("tool_call")(call),undefined);
+      result=await hooks.get("tool_result")({...call,content:[{type:"text",text:"same content"}],details:{preserved:true},isError:false},{abort(){aborts++;}});
+    }
+    assert.equal(aborts,1);
+    assert.equal(result.details.brokerGuardTerminal.status,"no_progress");
+    assert.equal(result.details.preserved,true);
+  } finally {
+    await hooks.get("session_shutdown")?.();
+    for(const [key,value] of Object.entries(saved)){if(value===undefined)delete process.env[key];else process.env[key]=value;}
+    await server.stop();rmSync(directory,{recursive:true,force:true});
+  }
+});
+
 async function childRequest(server, authorization, method, params = {}) {
   return requestBrokerIpc({ socketPath: server.socketPath, authorization, method, params });
 }
+
+test("child host turn boundaries prevent parallel read results from exhausting no-progress allowance", async () => {
+  const { directory, server } = createServer();
+  const hooks = new Map();
+  const saved = {};
+  try {
+    await server.start();
+    const { lease, childAuthorization } = await issueBoundCapability(server, "parallel-read-progress");
+    for (const [key, value] of Object.entries({ PI_BROKER_SOCKET: server.socketPath,
+      PI_BROKER_CAPABILITY: childAuthorization, PI_BROKER_LEASE_ID: lease.leaseId,
+      PI_BROKER_FENCING_TOKEN: String(lease.fencingToken) })) {
+      saved[key] = process.env[key]; process.env[key] = value;
+    }
+    const { default: extension } = await import("../extensions/pi-behavioral-enforcement.ts");
+    let active = ["read"], aborts = 0;
+    extension({ registerTool() {}, on(name, fn) { hooks.set(name, fn); },
+      getActiveTools() { return active; }, setActiveTools(names) { active = names; } });
+    await hooks.get("session_start")({}, {});
+    const invoke = async (id) => {
+      const call = { toolName: "read", toolCallId: id, input: { path: "same-file" } };
+      assert.equal(await hooks.get("tool_call")(call), undefined);
+      return hooks.get("tool_result")({ ...call, content: [{ type: "text", text: "same content" }], isError: false },
+        { abort() { aborts++; } });
+    };
+    hooks.get("turn_start")({ turnIndex: 0 });
+    await invoke("first");
+    hooks.get("turn_start")({ turnIndex: 1 });
+    for (let i = 0; i < 3; i++) assert.equal(await invoke(`batch-${i}`), undefined,
+      "one model response cannot become three failed progress decisions");
+    assert.equal(aborts, 0);
+    hooks.get("turn_start")({ turnIndex: 2 });
+    const terminal = await invoke("third-turn");
+    assert.equal(aborts, 1);
+    assert.equal(terminal.details.brokerGuardTerminal.status, "no_progress");
+  } finally {
+    await hooks.get("session_shutdown")?.();
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    await server.stop(); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("lease heartbeats do not disguise repeated identical child outcomes as progress", async () => {
+  const { directory, broker, server } = createServer();
+  await server.start();
+  try {
+    const { lease, childAuthorization } = await issueBoundCapability(server, "heartbeat-not-progress");
+    const before = broker.behavioralStateDigestForLease(lease.leaseId, lease.fencingToken, Date.now());
+    assert.equal(before.status, "observed");
+    assert.equal((await childRequest(server, childAuthorization, "heartbeat", { ttlMs: 60_000 })).status, "leased");
+    const after = broker.behavioralStateDigestForLease(lease.leaseId, lease.fencingToken, Date.now());
+    assert.equal(after.status, "observed");
+    assert.equal(after.stateDigest, before.stateDigest, "keepalive expiry is not task progress");
+
+    for (let index = 1; index <= 3; index++) {
+      const args = { path: "README.md" };
+      const stepId = `heartbeat-repeat-${index}`;
+      assert.equal((await childRequest(server, childAuthorization, "declareBehavioralAction", { stepId, toolName: "read", args })).status, "declared");
+      assert.equal((await childRequest(server, childAuthorization, "authorizeBehavioralAction", { stepId, toolName: "read", args })).status, "allowed");
+      const observed = await childRequest(server, childAuthorization, "observeBehavioralResult", {
+        toolName: "read", args, result: { text: "same content" }, isError: false,
+      });
+      assert.equal(observed.status, index < 3 ? "progress_observed" : "no_progress");
+      if (index < 3) {
+        assert.equal((await childRequest(server, childAuthorization, "heartbeat", { ttlMs: 60_000 })).status, "leased");
+      }
+    }
+    await requestBrokerIpc({
+      socketPath: server.socketPath, authorization: server.controllerToken, method: "release",
+      params: { leaseId: lease.leaseId, fencingToken: lease.fencingToken },
+    });
+    assert.equal(broker.behavioralStateDigestForLease(lease.leaseId, lease.fencingToken, Date.now()).status, "denied_lease",
+      "excluding a moving expiry from the digest must not authorize a released lease");
+  } finally {
+    await server.stop();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("controller binds the only capability a child can retrieve, then centrally gates and observes tools", async () => {
   const { directory, broker, server } = createServer();

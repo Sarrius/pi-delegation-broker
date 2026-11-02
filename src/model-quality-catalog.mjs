@@ -22,6 +22,12 @@ const RULES = Object.freeze([
   { provider: /^(openai|openai-codex(?:-account-\d+)?)$/, model: /^gpt-6-astra(?:-|$)/, quality: "apex" },
   { provider: /^anthropic(-account-\d+)?$/, model: /^claude-fable-5(?:[-.]1)?(?:-|$)/, quality: "apex" },
   { provider: /^openrouter$/, model: /^(openai\/gpt-6-astra|anthropic\/claude-fable-5(?:[-.]1)?)(?::batch)?$/, quality: "apex" },
+  // OpenAI recommends Sol for complex coding/agentic work, Luna for focused repeatable
+  // tasks (https://learn.chatgpt.com/docs/models, captured 2026-09-25). A new generation
+  // does not make its efficient model frontier by default. This is an eligibility floor,
+  // NOT a measured success rate; provider/account policy still governs spending.
+  { provider: /^(openai|openai-codex(?:-account-\d+)?)$/, model: /^gpt-6-sol(?:-|$)/, quality: "frontier" },
+  { provider: /^(openai|openai-codex(?:-account-\d+)?)$/, model: /^gpt-6-luna(?:-|$)/, quality: "cheap" },
   { provider: /^openai-codex/, model: /^gpt-5\.6-sol/, quality: "frontier" },
   { provider: /^openai-codex/, model: /^gpt-5\.6-terra/, quality: "standard" },
   { provider: /^openai-codex/, model: /^gpt-5\.6-luna/, quality: "cheap" },
@@ -54,6 +60,12 @@ export function qualityForModel({ provider, modelId, generation } = {}) {
   // Freshness is not permission to reinterpret a premium alias as ordinary capacity.
   if (/astra|fable/i.test(modelId)) return undefined;
   const providerClass = providerClassFor(provider);
+  // A vendor's own metered API serves that vendor's current lineup, so every model it
+  // advertises is admitted at `standard` without a per-model table. Promotion to
+  // `frontier`/`apex` still requires a researched rule above; a metered model is never
+  // auto-promoted, and a metered `frontier` request stays explicit-only at the eligibility
+  // layer. This is what makes "all of this provider's models" work without a hardcoded list.
+  if (providerClass === "metered_native") return "standard";
   if (providerClass !== "first_party_subscription" && providerClass !== "mixed_subscription") return undefined;
   if (generation === 0) return "frontier";
   if (generation === 1) return "standard";

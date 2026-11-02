@@ -182,7 +182,7 @@ export class ControllerQueuedTaskVerifier {
     this.#onFinalized = onFinalized;
   }
 
-  async verifyAndFinalize({ taskId, leaseId, fencingToken, routingObservation } = {}) {
+  async verifyAndFinalize({ taskId, leaseId, fencingToken, routingObservation, observedText } = {}) {
     if (typeof taskId !== "string" || !ID.test(taskId) || typeof leaseId !== "string" || !ID.test(leaseId)
       || !Number.isSafeInteger(fencingToken) || fencingToken < 1) {
       throw new Error("controller queued verifier task identity is invalid");
@@ -190,7 +190,11 @@ export class ControllerQueuedTaskVerifier {
     if (this.#running.has(leaseId)) throw new Error("controller_queued_verifier_busy");
     this.#running.add(leaseId);
     try {
-      const verifier = await this.#createVerifier(Object.freeze({ taskId, leaseId, fencingToken }));
+      // The completed child's output is untrusted evidence, never a verdict or executable check.
+      // Bound it before handing it to the controller's fixed result-dependent verifier.
+      const boundedText = typeof observedText === "string" && Buffer.byteLength(observedText, "utf8") <= 4_096
+        ? observedText : undefined;
+      const verifier = await this.#createVerifier(Object.freeze({ taskId, leaseId, fencingToken, observedText: boundedText }));
       if (!verifier || typeof verifier.verify !== "function") throw new Error("controller verifier factory returned invalid verifier");
       const verification = await verifier.verify();
       const binding = Object.freeze({ taskId, leaseId, fencingToken });

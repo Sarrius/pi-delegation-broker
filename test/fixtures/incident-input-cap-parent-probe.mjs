@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import {qualificationResponse,qualificationNormalizedEvents} from './qualification-response.mjs';
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -79,6 +80,7 @@ function snapshotLease() {
 
 const providerTransport = {
   async *stream(_snapshot, context, { onSendStarted }) {
+    if(qualificationResponse(context)){onSendStarted();yield* qualificationNormalizedEvents(context);return;}
     dispatches += 1;
     if (!leaseSnapshot) leaseSnapshot = snapshotLease();
     onSendStarted();
@@ -171,8 +173,8 @@ const text = result.content?.[0]?.text?.trim() ?? "";
 assert.equal(text, MARKER, text);
 assert.equal(dispatches, 2, "observe default must send the seeded turn and the oversized follow-up");
 assert.ok(leaseSnapshot?.lease, "lease must be visible while the fixture stream runs");
-assert.deepEqual(JSON.parse(leaseSnapshot.lease.enforcement), { input: "metered_best_effort", output: "hard" });
-assert.equal(leaseSnapshot.lease.max_input_tokens, CAP);
+assert.deepEqual(JSON.parse(leaseSnapshot.lease.enforcement), { input: "metered_best_effort", output: "unavailable" });
+assert.equal(leaseSnapshot.lease.max_input_tokens, null, "new ordinary work must not invent the historical 1M cumulative cap; explicit-cap incident coverage remains in broker/IPC/child tests");
 assert.equal(JSON.parse(leaseSnapshot.resource.enforcement).input, "hard");
 
 await hooks.get("session_shutdown")?.();

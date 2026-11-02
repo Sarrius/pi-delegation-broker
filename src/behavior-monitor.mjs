@@ -62,6 +62,7 @@ export class BehavioralRunMonitor {
   #mismatchLimit;
   #plans = new Map();
   #lastObservation;
+  #lastObservationTurnId;
   #repeatCount = 0;
   #terminal;
   #metrics = {
@@ -156,14 +157,24 @@ export class BehavioralRunMonitor {
    * action, semantic result, error state, and controller state digest all stay
    * unchanged; a still-running tool is never passed here.
    */
-  observeActionResult({ toolName, args, result, isError = false, stateDigest }) {
+  observeActionResult({ toolName, args, result, isError = false, stateDigest, modelTurnId }) {
     if (this.#terminal) return this.#terminal;
+    if (modelTurnId !== undefined && (!Number.isSafeInteger(modelTurnId) || modelTurnId < 1)) {
+      throw new Error("behavior result requires a positive modelTurnId when supplied");
+    }
     if (!TOOL_NAME.test(toolName ?? "") || typeof isError !== "boolean" || typeof stateDigest !== "string" || !/^[a-f0-9]{64}$/.test(stateDigest)) {
       throw new Error("behavior result requires toolName, boolean isError, and controller stateDigest");
     }
     const captured = captureLosslessJson({ toolName, args, result, isError, stateDigest });
     const observation = digestCanonical(captured.canonical);
+    // Pi can emit several identical tool calls in one assistant response. Their
+    // results are not separate attempts at progress: the model has not seen any
+    // of them yet. Count one observation per host turn, retaining the old strict
+    // behavior for clients that cannot supply an authenticated turn boundary.
     if (observation === this.#lastObservation) {
+      if (modelTurnId !== undefined && modelTurnId === this.#lastObservationTurnId) {
+        return Object.freeze({ status: "progress_observed", repeated: this.#repeatCount, batchedDuplicate: true });
+      }
       this.#repeatCount += 1;
       this.#metrics.repeatedNoProgress += 1;
     } else {
@@ -171,6 +182,7 @@ export class BehavioralRunMonitor {
       this.#repeatCount = 1;
       this.#metrics.progressTransitions += 1;
     }
+    this.#lastObservationTurnId = modelTurnId;
     if (this.#repeatCount < this.#repeatLimit) {
       return Object.freeze({ status: "progress_observed", repeated: this.#repeatCount });
     }

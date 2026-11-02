@@ -1,19 +1,74 @@
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { spawnBrokeredChild } from "./child-launcher.mjs";
 import { Semaphore } from "./semaphore.mjs";
 import { effectiveThinkingLevel } from "./model-thinking-policy.mjs";
+import { THINKING_LEVELS } from "./child-contract.mjs";
 import { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionError } from "./worktree.mjs";
 
 const SETTLE_GRACE_MS = 15_000;
-const DEFAULT_NO_PROGRESS_TIMEOUT_MS = 180_000;
+
+/** Bounded preview of partial work. Longest useful tail, never an unbounded transcript. */
+const PARTIAL_TEXT_LIMIT = 8_000;
+
+/**
+ * Recover the public streaming text a child had already produced. The journal is written by
+ * `child-launcher` with an fsync per text delta, so it survives a kill or a crash that leaves no
+ * final message. It holds ONLY text deltas — no reasoning, no credentials, no provider payloads —
+ * which is what makes it safe to surface to the parent as unverified partial work.
+ *
+ * Reading it changes no outcome: callers attach it only to results that already failed.
+ */
+/**
+ * Attempt directories that can hold this run's journals: the first attempt uses the plain child id,
+ * every retry appends `-rN`. Mirrors how `retained-work` discovers attempts.
+ */
+function attemptSessionDirs(sessionsRoot, childId) {
+  let names;
+  try { names = readdirSync(sessionsRoot); } catch { return []; }
+  return names
+    .filter((name) => name === childId || (name.startsWith(`${childId}-r`) && /^[0-9]+$/.test(name.slice(childId.length + 2))))
+    .sort()
+    .map((name) => join(sessionsRoot, name, "sessions"));
+}
+
+function recoverPartialText(sessionsRoot, childId) {
+  let text = "";
+  for (const sessionsDir of attemptSessionDirs(sessionsRoot, childId)) {
+    let names;
+    try { names = readdirSync(sessionsDir); } catch { continue; }
+    for (const name of names.filter((entry) => entry.startsWith("partial-") && entry.endsWith(".jsonl")).sort()) {
+      let raw;
+      try { raw = readFileSync(join(sessionsDir, name), "utf8"); } catch { continue; }
+      for (const line of raw.split("\n")) {
+        if (!line) continue;
+        let entry;
+        try { entry = JSON.parse(line); } catch { continue; }
+        if (entry?.type === "text_delta" && typeof entry.text === "string") text += entry.text;
+      }
+    }
+  }
+  return text;
+}
+
+function boundedPartialText(text) {
+  if (typeof text !== "string" || text.length === 0) return "";
+  if (text.length <= PARTIAL_TEXT_LIMIT) return text;
+  return `[…earlier partial output omitted…]\n${text.slice(-PARTIAL_TEXT_LIMIT)}`;
+}
+// Provider-side reasoning may emit no Pi event for several minutes even while the subscription
+// proxy records successful traffic and rising usage. Three minutes killed a live high-thinking
+// Epic 59 review at 46% account usage; keep the shorter value available to explicit tests, while
+// production relies on a ten-minute liveness window plus the independent absolute attempt cap.
+const DEFAULT_NO_PROGRESS_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_ATTEMPT_MAX_RUN_MS = 15 * 60_000;
 const DEFAULT_CAPACITY_WAIT_MS = 15 * 60_000;
 const DEFAULT_CAPACITY_RETRY_MS = 500;
 const MAX_ROUTE_ATTEMPTS = 32;
 const CHILD_ID = /^[A-Za-z0-9_-]{1,160}$/;
 const ROOT_ATTEMPT_BUDGET_CODE = "controller_root_physical_attempt_budget";
+const PARENT_HANDOFF_FAILED_CODE = "controller_parent_handoff_failed";
 
 /**
  * Terminal child failures split by who owns them. A provider that throttled or died is a
@@ -25,10 +80,10 @@ const FAILURE_SIGNATURES = Object.freeze([
   Object.freeze({ kind: "incomplete", pattern: /child stopped with an unresolved tool request|child output ended before completion/i }),
   Object.freeze({ kind: "rate_limited", pattern: /\b(rate[ _-]?limit(?:ed)?|too many requests|429|quota exceeded|overloaded|capacity)\b/i }),
   Object.freeze({ kind: "auth_fatal", pattern: /\b(401|403|auth_fatal|unauthorized|forbidden|invalid[ _-]?api[ _-]?key|invalid_grant|refresh token not found|authentication|expired token|revoked|no api key found)\b/i }),
-  Object.freeze({ kind: "context_exhausted", pattern: /\b(context[ _-]?(window|length|limit)|prompt is too long|maximum context|token limit)\b/i }),
+  Object.freeze({ kind: "context_exhausted", pattern: /\b(context[ _-]?(window|length|limit)|context_window_exceeded|prompt is too long|maximum context|token limit)\b/i }),
   // Capability/organization policy rejection is route-specific: the same task can run on
   // another account/model, so quarantine this resource and let controller failover continue.
-  Object.freeze({ kind: "unavailable", pattern: /\b(unsupported_value|reasoning summaries|organization must be verified|model is not supported)\b/i }),
+  Object.freeze({ kind: "unavailable", pattern: /\b(model_unavailable|unsupported_value|reasoning summaries|organization must be verified|model is not supported)\b/i }),
   // A hard controller input/output cap is a task-budget terminal, not provider health evidence.
   // Retrying the same transcript on another route would spend another lease without repairing
   // the exhausted task budget; the caller needs an explicit bounded failure instead.
@@ -46,21 +101,39 @@ const FAILURE_SIGNATURES = Object.freeze([
   // Reasoning-mode refusals are route-specific policy, not a dead task: another route accepts it.
   Object.freeze({ kind: "unavailable", pattern: /reasoning is mandatory|cannot be disabled|always engages in thinking/i }),
   // Exhausted credit/balance is this account's problem, not the task's: cool it and move on.
-  Object.freeze({ kind: "account_exhausted", pattern: /\b402\b|extra_usage|requires more credits|insufficient (credits|balance)|purchase credits|upgrade to a paid account|third-party apps now draw from your extra usage|claude\.ai\/settings\/usage/i }),
+  Object.freeze({ kind: "account_exhausted", pattern: /\b402\b|\bquota_(fatal|exhausted)\b|extra_usage|requires more credits|insufficient (credits|balance)|purchase credits|upgrade to a paid account|third-party apps now draw from your extra usage|claude\.ai\/settings\/usage/i }),
   Object.freeze({ kind: "account_exhausted", pattern: /usage limit (has been )?reached|plan usage limit|usage limit exceeded/i }),
   Object.freeze({ kind: "unavailable", pattern: /\b(50[0234]|transport_before_headers|service unavailable|bad gateway|upstream|connection (error|refused|reset)|econnrefused|etimedout|network)\b/i }),
-  // A child that settles with no answer (expired lease IPC, empty final text) is a dead route.
-  Object.freeze({ kind: "unavailable", pattern: /child completed without a result|controller lease heartbeat failed|broker behavioral monitor is unavailable/i }),
-  // A provider abort (Cursor/Pi "This operation was aborted", stopReason aborted) is a dead
-  // route, not a dead task. Operator abort() still sets status "aborted" / abortedEarly and
-  // that path stays fatal so a cancelled run cannot hop onto another account.
-  Object.freeze({ kind: "unavailable", pattern: /\bthis operation was aborted\b|\boperation was aborted\b|child was aborted(?: before completion)?|\baborterror\b/i }),
+  // Empty final text can be route-specific; controller/guard failures are separated below.
+  Object.freeze({ kind: "unavailable", pattern: /child completed without a result/i }),
 ]);
 
-export function classifyChildFailure(text) {
+export function classifyChildFailure(text, { readOnly = false } = {}) {
   if (typeof text !== "string" || !text) return "fatal";
+  if (/^controller behavioral terminal:|controller lease heartbeat failed|broker behavioral monitor is unavailable|controller behavioral result observation was unavailable/i.test(text)) return "controller_failure";
+  // Unattributed aborts may be local guard stops, not provider failures. Never poison health
+  // or replay a terminal monitor decision merely because Pi rendered it as an AbortError.
+  if (/\boperation was aborted\b|child was aborted|\baborterror\b/i.test(text)) return "fatal";
+  // A truncated provider stream is not safe to replay for effects or unknown authority.
+  // Only a controller-bound observe policy permits ordinary bounded alternate-route recovery.
+  if (/^controller provider terminal:\s*stream_truncated\b/i.test(text)) return readOnly ? "unavailable" : "fatal";
   for (const signature of FAILURE_SIGNATURES) if (signature.pattern.test(text)) return signature.kind;
   return "fatal";
+}
+
+/**
+ * Is there explicit connection-failure evidence, rather than merely no observed response?
+ *
+ * Native SDK failures without status/headers also become transport_before_headers. That terminal
+ * alone cannot prove all sibling models are unreachable (e.g. one Antigravity Claude failure
+ * must not exclude an untried Gemini). Keep it resource-scoped. Explicit connection failures
+ * retain endpoint-wide handling so a dead loopback bridge cannot consume every retry on aliases.
+ * Preflight's typed route_endpoint_unreachable path independently retains its group scope.
+ */
+const ENDPOINT_UNREACHABLE = /\bconnection (error|refused|reset)\b|\b(econnrefused|econnreset|enotfound|eai_again|epipe|etimedout)\b|\bsocket hang up\b/i;
+
+export function isEndpointUnreachable(text) {
+  return typeof text === "string" && text.length > 0 && ENDPOINT_UNREACHABLE.test(text);
 }
 
 const SUBAGENT_FRAMING =
@@ -163,6 +236,13 @@ export class BrokeredChildRunner {
   get semaphore() { return this.#semaphore; }
   get noProgressTimeoutMs() { return this.#noProgressTimeoutMs; }
 
+  hasLiveWork() {
+    return this.#activeRuns.size > 0
+      || this.#inflightSpawns.size > 0
+      || this.#handles.size > 0
+      || this.#admissions.size > 0;
+  }
+
   activeAttempts() {
     return [...this.#attempts.values()].map((attempt) => {
       const handle = this.#handles.get(attempt.attemptId);
@@ -238,12 +318,13 @@ export class BrokeredChildRunner {
    *
    * Returns the terminal child result, plus a `route` trail of every attempt made.
    */
-  async run({ childId, maxAttempts = MAX_ROUTE_ATTEMPTS, trackForVerification = false, fleet, attemptBudget, ...spec }) {
+  async run({ childId, maxAttempts = MAX_ROUTE_ATTEMPTS, trackForVerification = false, fleet, attemptBudget, onAttemptStarted, ...spec }) {
     if (this.#disposed) throw new Error("BrokeredChildRunner is disposed");
     if (!CHILD_ID.test(childId ?? "")) throw new Error("BrokeredChildRunner requires a valid childId");
     if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) throw new Error("maxAttempts must be a positive safe integer");
     if (typeof trackForVerification !== "boolean") throw new Error("trackForVerification must be boolean");
     if (attemptBudget !== undefined && (!attemptBudget || typeof attemptBudget.acquire !== "function")) throw new Error("attemptBudget must provide a controller-owned acquire function");
+    if (onAttemptStarted !== undefined && typeof onAttemptStarted !== "function") throw new Error("onAttemptStarted must be a controller-owned callback");
     if (fleet !== undefined && (fleet === null || typeof fleet !== "object" || Array.isArray(fleet))) {
       throw new Error("BrokeredChildRunner fleet metadata must be an object");
     }
@@ -271,14 +352,15 @@ export class BrokeredChildRunner {
     const budgetExceeded = () => {
       const inputUsed = cumulativeUsage.input + cumulativeUsage.cacheRead + cumulativeUsage.cacheWrite;
       if (effectiveBudget.enforcement?.input === "hard" && Number.isSafeInteger(effectiveBudget.maxInputTokens) && inputUsed > effectiveBudget.maxInputTokens) {
-        return `controller cumulative input budget exceeded (${inputUsed} > ${effectiveBudget.maxInputTokens})`;
+        return `controller cumulative input budget exceeded (${inputUsed} > ${effectiveBudget.maxInputTokens}); raise the task's maxInputTokens budget to continue it`;
       }
       if (effectiveBudget.enforcement?.output === "hard" && Number.isSafeInteger(effectiveBudget.maxOutputTokens) && cumulativeUsage.output > effectiveBudget.maxOutputTokens) {
-        return `controller cumulative output budget exceeded (${cumulativeUsage.output} > ${effectiveBudget.maxOutputTokens})`;
+        return `controller cumulative output budget exceeded (${cumulativeUsage.output} > ${effectiveBudget.maxOutputTokens}); raise the task's maxOutputTokens budget to continue it`;
       }
       return undefined;
     };
     const route = [];
+    let childHandoffs = 0; // Count only actual post-admission Pi session handoffs, not denied route hops.
     const unavailableByCapacityGroup = new Map();
     let requiredCapabilities = spec.capabilityRequest?.requiredCapabilities;
     let capacityWaitDeadline;
@@ -292,10 +374,20 @@ export class BrokeredChildRunner {
       // Carry the requested contract next to the result so the controller can persist what was
       // asked for beside what the provider actually accepted. Without the pair, a silently
       // downgraded effort level is indistinguishable from one that was never requested.
+      // A terminal result must never hide work that already exists. Several failure branches build a
+      // fresh `{ text: "" }` object — that is how three killed audits reported an empty result while
+      // their children had already streamed findings. Recovering here covers every branch at once.
+      // It still never promotes partial work: a completed result keeps its own text untouched, and
+      // what is attached is marked unverified downstream.
+      const recovered = value.status === "completed" || value.text
+        ? ""
+        : boundedPartialText(recoverPartialText(this.#sessionsRoot, childId));
       return Object.freeze({
         ...value,
+        ...(recovered ? { text: recovered } : {}),
         ...(usageObserved ? { usage: Object.freeze({ ...cumulativeUsage }) } : {}),
         requestedThinking: spec.thinkingLevel ?? "off",
+        childHandoffs,
         ...(typeof fleetMeta.role === "string" ? { role: fleetMeta.role } : {}),
       });
     };
@@ -347,6 +439,7 @@ export class BrokeredChildRunner {
       // Checkpoints are keyed to the controller lease task id. The child may declare lineage
       // metadata, but it cannot choose which other root's accepted artifacts enter its prompt.
       const checkpointPrompt = this.#acceptedCheckpointPrompt(childId);
+      if (checkpointPrompt) capabilityRequest.routingActiveBriefComplete = false;
       const attemptPrompt = checkpointPrompt
         ? `${spec.prompt ?? ""}\n\n${checkpointPrompt}`
         : spec.prompt;
@@ -358,8 +451,17 @@ export class BrokeredChildRunner {
         handle = await this.spawn({
           ...spec, childId: attemptId, prompt: attemptPrompt, promptDigest: attemptPromptDigest,
           capabilityRequest, attempts: attempt, attemptBudget, deferClosePolicy: true,
+          onAttemptStarted: async (event) => {
+            await onAttemptStarted?.(event); // Keep the original durable gate before counting a handoff.
+            childHandoffs++;
+          },
         });
       } catch (error) {
+        if (error?.code === PARENT_HANDOFF_FAILED_CODE) {
+          const message = "controller could not durably record parent-to-child admission";
+          route.push({ attempt, childId: attemptId, outcome: "controller_handoff_failed", error: message });
+          return finish(Object.freeze({ id: childId, status: "failed", text: "", error: message, route: Object.freeze(route) }));
+        }
         if (error?.code === ROOT_ATTEMPT_BUDGET_CODE) {
           const message = "controller root physical-attempt budget exceeded";
           route.push({ attempt, childId: attemptId, outcome: "root_budget_exceeded", error: message });
@@ -442,6 +544,17 @@ export class BrokeredChildRunner {
       }
       lastResult = await handle.result;
       addUsage(lastResult.usage);
+      // A killed attempt never produces a final message, so without this the terminal report is an
+      // empty "failed" and every token the child spent is invisible to the parent. The child's
+      // fd-synced journal holds the public text it had already streamed; recover it as UNVERIFIED
+      // partial work. Classification deliberately still runs on the ORIGINAL failure evidence: a
+      // child's own prose mentioning "429" or "quota" must not turn a budget kill into a provider
+      // rate-limit verdict against an innocent account.
+      const failureEvidenceText = lastResult.error ?? lastResult.text;
+      if (lastResult.status !== "completed" && !lastResult.text) {
+      const partial = boundedPartialText(recoverPartialText(this.#sessionsRoot, childId));
+        if (partial) lastResult = { ...lastResult, text: partial };
+      }
       const exceeded = budgetExceeded();
       this.#updateAttempt(attemptId, {
         state: exceeded ? "failed" : "verifying",
@@ -474,7 +587,10 @@ export class BrokeredChildRunner {
 
       const kind = lastResult.status === "aborted" || abortedEarly()
         ? "fatal"
-        : classifyChildFailure(lastResult.error ?? lastResult.text);
+        : classifyChildFailure(failureEvidenceText, {
+          readOnly: handle.policy?.authorizationPolicy?.operationClass === "observe"
+            && handle.policy.authorizationPolicy.effectCapable === false,
+        });
       this.#updateAttempt(attemptId, { state: "failed", failureKind: kind, lastEventAt: this.#now(), lastEventType: "attempt_failed" });
       route.push({ attempt, childId: attemptId, resourceId, outcome: kind, error: lastResult.error });
 
@@ -483,7 +599,13 @@ export class BrokeredChildRunner {
       // it only when a retry follows means the route that fails last is never cooled, and the
       // next task selects that same exhausted account first and burns an attempt re-proving it.
       if (resourceId !== undefined && kind !== "fatal" && kind !== "incomplete" && kind !== "controller_failure") {
-        if (kind === "rate_limited" || kind === "account_exhausted") await this.#reportRateLimited(resourceId, lastResult.retryAfterMs);
+        if (kind === "rate_limited" || (kind === "account_exhausted" && Number.isSafeInteger(lastResult.retryAfterMs) && lastResult.retryAfterMs > 0)) {
+          await this.#reportRateLimited(resourceId, lastResult.retryAfterMs);
+        } else if (kind === "account_exhausted") {
+          // Replenishable credit without a provider reset hint is not a known multi-hour quota
+          // window. Use the existing bounded half-open interval, not the default 6-hour 429 delay.
+          await this.#reportUnavailable(resourceId, "provider quota_exhausted", "capacity_group");
+        }
         // A revoked/expired credential belongs to the account, not the model: condemning only
         // this resource makes the next hop retry a sibling model on the same dead credential.
         else if (kind === "auth_fatal") await this.#reportUnavailable(resourceId, "provider auth_fatal", "capacity_group");
@@ -494,7 +616,14 @@ export class BrokeredChildRunner {
           // One model can be stale while its account remains healthy. Two independent route
           // failures on the same account are account-level evidence: quarantine the group so a
           // catalog with many aliases cannot consume every bounded attempt before failover.
-          await this.#reportUnavailable(resourceId, "provider unavailable", failures >= 2 ? "capacity_group" : "resource");
+          // A route that never reached the provider needs no second sample: the unreachable
+          // endpoint is shared by the account, so escalate on the first observation.
+          const unreachable = isEndpointUnreachable(lastResult.error ?? lastResult.text);
+          await this.#reportUnavailable(
+            resourceId,
+            unreachable ? "provider endpoint unreachable" : "provider unavailable",
+            unreachable || failures >= 2 ? "capacity_group" : "resource",
+          );
         }
         // A context overflow leaves the provider healthy — only this route is wrong.
         if (kind !== "context_exhausted" && kind !== "budget_exhausted") excludeResources.push(resourceId);
@@ -548,8 +677,15 @@ export class BrokeredChildRunner {
     // the task so a later route can claim the same logical work.
     return handle.policy.onChildSessionClosed?.({
       status: result.status,
+      // Preserve only the exact bounded completed answer for controller-owned result checks.
+      // The child's text is evidence to compare, never authority to accept itself; incomplete,
+      // failed and oversized output cannot accidentally satisfy answer-equals.
+      ...(result.status === "completed" && typeof result.text === "string"
+        && Buffer.byteLength(result.text, "utf8") <= 4_096 ? { text: result.text } : {}),
       ...(result.error ? { error: result.error } : {}),
       ...(result.usage ? { usage: result.usage } : {}),
+      ...(THINKING_LEVELS.includes(handle.resolved?.thinkingLevel)
+        ? { effectiveThinking: handle.resolved.thinkingLevel } : {}),
       attempts: handle.attempts,
     });
   }
@@ -570,7 +706,7 @@ export class BrokeredChildRunner {
     finally { this.#inflightSpawns.delete(promise); }
   }
 
-  async #spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, recursion, attempts = 1, attemptBudget, deferClosePolicy = false, roleFraming, skills }) {
+  async #spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, recursion, attempts = 1, attemptBudget, deferClosePolicy = false, roleFraming, skills, onAttemptStarted }) {
     if (this.#disposed) throw new Error("BrokeredChildRunner is disposed");
     if (this.#handles.has(childId)) throw new Error(`Duplicate child id: ${childId}`);
     if (!Number.isSafeInteger(attempts) || attempts < 1) throw new Error("brokered child attempt count must be a positive safe integer");
@@ -585,8 +721,14 @@ export class BrokeredChildRunner {
 
     try {
       if (this.#disposed) throw new Error("BrokeredChildRunner disposed before launch");
-      const decision = await this.#resolver.resolve({
+      // Keep cancellation reachable during optional pre-lease advice. A task cancelled while
+      // Jev is waiting must not reserve a resource when that answer finally arrives.
+      const selecting = new AbortController();
+      this.#admissions.set(selecting, this.#attempts.get(childId)?.baseChildId ?? childId);
+      let decision;
+      try { decision = await this.#resolver.resolve({
         childId,
+        signal: selecting.signal,
         promptDigest,
         requestedCwd: cwd,
         isolation,
@@ -599,11 +741,26 @@ export class BrokeredChildRunner {
         ...(recursion ? { recursion } : {}),
         ...(tools ? { requestedTools: tools } : {}),
         ...(excludeTools ? { excludedTools: excludeTools } : {}),
-      });
+      }); } finally { this.#admissions.delete(selecting); }
 
       if (decision.action === "deny") throw new Error(`Broker denied launch: ${decision.reason}`);
 
       const policy = decision.policy;
+      const cancellationOwner = this.#attempts.get(childId)?.baseChildId ?? childId;
+      const cancelledBeforePrompt = () => selecting.signal.aborted || this.#disposed || this.#abortedRuns.has(cancellationOwner);
+      const abandonCancelledLease = async () => {
+        if (!cancelledBeforePrompt()) return;
+        await Promise.resolve(policy.onBeforeChildAbandoned?.("cancelled_before_handoff")).catch(() => undefined);
+        throw new Error("brokered child launch cancelled before handoff");
+      };
+      await abandonCancelledLease();
+      if (decision.selectedThinking !== undefined
+        && (decision.selectedThinking !== "low" || thinkingLevel !== "off"
+          || capabilityRequest?.routingThinkingMode !== "auto" || capabilityRequest?.routingRouteMode !== "auto"
+          || decision.selection?.jevActive?.applied !== true)) {
+        await Promise.resolve(policy.onBeforeChildAbandoned?.("invalid_active_thinking_override")).catch(() => undefined);
+        throw new Error("Broker rejected an active thinking override outside the caller auto contract");
+      }
       // A proposed effect is only safe in a disposable Git worktree. Letting an otherwise
       // correctly attested patch tool run against the caller's cwd would turn verification into
       // after-the-fact damage control, so reject before a child process exists.
@@ -627,6 +784,7 @@ export class BrokeredChildRunner {
           throw error;
         }
       }
+      await abandonCancelledLease();
       // The lease decides the model, not the request: the contract pins a capability class and
       // the broker picks a live resource inside it, which may not be the one predicted.
       const launchModel = decision.childModel ?? decision.resolvedModel ?? model;
@@ -637,7 +795,7 @@ export class BrokeredChildRunner {
       let childSpec = {
         model: `${launchModel.provider}/${launchModel.modelId}`,
         // The leased model, not the caller, decides whether "off" is even a legal mode.
-        thinkingLevel: effectiveThinkingLevel(launchModel, thinkingLevel ?? "off"),
+        thinkingLevel: effectiveThinkingLevel(launchModel, decision.selectedThinking ?? thinkingLevel ?? "off"),
         cwd,
         prompt,
         ...(tools ? { tools } : {}),
@@ -654,6 +812,10 @@ export class BrokeredChildRunner {
         const tree = await createWorktree(sourceCwd, join(this.#sessionsRoot, childId, "worktree"));
         worktree = { sourceCwd, tree };
         childSpec = { ...childSpec, cwd: tree.cwd };
+      }
+      if (cancelledBeforePrompt()) {
+        if (worktree) await cleanupWorktree(worktree.sourceCwd, worktree.tree.path).catch(() => undefined);
+        await abandonCancelledLease();
       }
 
       let child;
@@ -672,8 +834,50 @@ export class BrokeredChildRunner {
         throw error;
       }
 
-      await policy.onChildSessionOpened?.();
+      const closeCancelledChild = async (handed) => {
+        if (!cancelledBeforePrompt()) return;
+        await Promise.resolve(child.session?.abort?.()).catch(() => undefined);
+        await Promise.resolve(child.session?.dispose?.()).catch(() => undefined);
+        if (handed) await Promise.resolve(policy.onChildSessionClosed?.({ status: "aborted", attempts })).catch(() => undefined);
+        else await Promise.resolve(policy.onBeforeChildAbandoned?.("cancelled_before_handoff")).catch(() => undefined);
+        if (worktree) await cleanupWorktree(worktree.sourceCwd, worktree.tree.path).catch(() => undefined);
+        throw new Error("brokered child launch cancelled before prompt");
+      };
+      await closeCancelledChild(false);
+      try {
+        const handoff = await policy.onChildSessionOpened?.();
+        // A controller may revoke the active choice after child construction but before
+        // handoff. Its refusal is not advisory: no provider prompt may follow it.
+        if (handoff !== undefined && handoff?.status !== "handed") {
+          throw new Error(`broker denied child handoff: ${handoff?.status ?? "unknown"}`);
+        }
+      } catch (error) {
+        await Promise.resolve(child.session?.abort?.()).catch(() => undefined);
+        await Promise.resolve(child.session?.dispose?.()).catch(() => undefined);
+        await Promise.resolve(policy.onBeforeChildAbandoned?.("handoff_rejected")).catch(() => undefined);
+        if (worktree) await cleanupWorktree(worktree.sourceCwd, worktree.tree.path).catch(() => undefined);
+        throw error;
+      }
+      await closeCancelledChild(true);
 
+      // This is the last controller-owned gate before the first provider request. Opening a
+      // Pi session does not send the task prompt; only #runAndClose does that. Persist the
+      // parent-to-child handoff here, never after the prompt has already begun.
+      if (onAttemptStarted) {
+        try {
+          await onAttemptStarted(Object.freeze({ childId, resourceId: decision.resource?.id, attempt: attempts }));
+        } catch {
+          await Promise.resolve(child.session?.abort?.()).catch(() => undefined);
+          await Promise.resolve(child.session?.dispose?.()).catch(() => undefined);
+          await Promise.resolve(policy.onChildSessionClosed?.({ status: "failed", attempts })).catch(() => undefined);
+          if (worktree) await cleanupWorktree(worktree.sourceCwd, worktree.tree.path).catch(() => undefined);
+          const error = new Error("controller could not durably record parent-to-child admission");
+          error.code = PARENT_HANDOFF_FAILED_CODE;
+          throw error;
+        }
+      }
+
+      await closeCancelledChild(true);
       const handle = {
         id: childId,
         session: child.session,

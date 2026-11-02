@@ -14,6 +14,7 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "OPENAI_CHAT_COMPLETIONS_DIALECT",
     "OpenAIChatCompletionsTransport",
     "OpenAIChatCompletionsTransportError",
+    "POOL_STATE_MAX_AGE_MS",
     "FAMILY_STALENESS_MS",
     "AttemptSettlement",
     "BehavioralRunMonitor",
@@ -89,12 +90,14 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "createResourceModelResolver",
     "createSelectContract",
     "createWorktree",
+    "cursorPoolFactsFromUsageState",
     "defectFingerprint",
     "deriveAllowedTools",
     "deriveModelProvenance",
     "deriveModelSupports",
     "deriveTaskRequirement",
     "disposeBrokeredChildProcesses",
+    "parentSettlementShouldReapBrokeredChildren",
     "effectiveThinkingLevel",
     "evaluateRouteEligibility",
     "evaluateTeamJoin",
@@ -129,6 +132,7 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "parseModelVersion",
     "parseResourceModel",
     "probeProviderModels",
+    "probeServedModel",
     "providerClassFor",
     "proxyCanonicalContext",
     "proxyTerminalError",
@@ -136,6 +140,7 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "provisionBrokeredAgentDir",
     "readCurrencyCache",
     "readJob",
+    "readPoolFacts",
     "readProviderRegistry",
     "RepairController",
     "RepairStore",
@@ -170,7 +175,8 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "writeJob",
     "writeModelPreferences",
     "writeScopedChildAuth",
-    "listingsFromCache"
+    "listingsFromCache",
+    "servedModelsFromCache"
   ].sort());
   assert.equal("ScriptedFakeProvider" in api, false);
   assert.equal(typeof testing.ScriptedFakeProvider, "function");

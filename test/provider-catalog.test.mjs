@@ -179,3 +179,34 @@ test("catalog respects controller overrides for capacity and confidence", () => 
   assert.equal(group.cooldown.defaultMs, 60_000);
   assert.equal(group.cooldown.probeIntervalMs, 10_000);
 });
+test("Cursor's independently-billed pools become pool-scoped capacity groups", () => {
+  // Live fact (2026-09-12): one Cursor subscription meters included models (composer/vega/
+  // grok-4.5) and third-party models (grok-4.6, claude, gpt, …) as separate pools. A single
+  // group for the whole account let one pool's exhaustion bench the other; the group now
+  // follows the billing pool and the resource carries the pool id for the live pressure guard.
+  const registry = catalogToBrokerRegistry([{
+    provider: "cursor",
+    baseUrl: "https://api2.cursor.sh",
+    api: "openai-completions",
+    models: [
+      { id: "composer-2.5", name: "Composer 2.5", contextWindow: 200_000, maxTokens: 32_000, reasoning: true, input: ["text"] },
+      { id: "grok-4.5-high", name: "Grok 4.5 High", contextWindow: 200_000, maxTokens: 32_000, reasoning: true, input: ["text"] },
+      { id: "grok-4.6", name: "Grok 4.6", contextWindow: 256_000, maxTokens: 64_000, reasoning: true, input: ["text"] },
+      { id: "claude-opus-5", name: "Claude Opus 5", contextWindow: 200_000, maxTokens: 32_000, reasoning: true, input: ["text"] },
+    ],
+  }], { confidence: "observed" });
+
+  assert.ok(registry.capacityGroups["G-cursor.models"], "the included-models pool is its own group");
+  assert.ok(registry.capacityGroups["G-cursor.other"], "the third-party pool is its own group");
+  assert.deepEqual(registry.resources["cursor/composer-2.5"].pool, "cursor.models");
+  assert.equal(registry.resources["cursor/composer-2.5"].capacityGroup, "G-cursor.models");
+  assert.equal(registry.resources["cursor/grok-4.5-high"].pool, "cursor.models");
+  assert.equal(registry.resources["cursor/grok-4.6"].pool, "cursor.other");
+  assert.equal(registry.resources["cursor/grok-4.6"].capacityGroup, "G-cursor.other");
+  assert.equal(registry.resources["cursor/claude-opus-5"].capacityGroup, "G-cursor.other");
+
+  // Every other provider keeps one account-level group and carries no pool id.
+  const anthropic = catalogToBrokerRegistry(fixtureCatalog());
+  assert.equal(anthropic.resources["fake-anthropic/claude-fake-1"].pool, undefined);
+  assert.ok(anthropic.capacityGroups["G-fake-anthropic"]);
+});

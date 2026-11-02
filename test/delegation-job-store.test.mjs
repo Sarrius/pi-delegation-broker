@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
-  isTerminalJobStatus, listJobs, readJob, recoverJobs, requestJobCancellation, submitJob, updateJob,
+  isTerminalJobStatus, listJobs, markTaskAdmitted, readJob, recoverJobs, requestJobCancellation, submitJob, updateJob,
 } from "../src/delegation-job-store.mjs";
 
 function store() {
@@ -41,6 +41,19 @@ function workflow(jobId = "workflow-a", overrides = {}) {
     ...overrides,
   };
 }
+
+test("the output-budget policy generation persists and invalid values fail closed", () => {
+  const s = store();
+  try {
+    submitJob(s.root, task("budget-old"));
+    submitJob(s.root, task("budget-new", { outputBudgetPolicy: "metered_default_v2" }));
+    submitJob(s.root, workflow("workflow-new", { outputBudgetPolicy: "metered_default_v2" }));
+    assert.equal(readJob(s.root, "budget-old").outputBudgetPolicy, undefined);
+    assert.equal(readJob(s.root, "budget-new").outputBudgetPolicy, "metered_default_v2");
+    assert.equal(readJob(s.root, "workflow-new").outputBudgetPolicy, "metered_default_v2");
+    assert.throws(() => submitJob(s.root, task("budget-invalid", { outputBudgetPolicy: "unknown" })), /outputBudgetPolicy is invalid/);
+  } finally { s.done(); }
+});
 
 test("session recovery cannot requeue another live owner's work or ownerless legacy jobs", () => {
   const s = store();
@@ -81,6 +94,25 @@ test("submission is durable and an idempotency key returns the original job", ()
   } finally { s.done(); }
 });
 
+test("admission transfers a submitted task once, permits failover, and never revives cancellation", () => {
+  const s = store();
+  try {
+    submitJob(s.root, task("handoff"));
+    const admitted = markTaskAdmitted(s.root, "handoff", 200);
+    assert.equal(admitted.status, "running");
+    assert.equal(admitted.admittedAt, 200);
+    assert.equal(markTaskAdmitted(s.root, "handoff", 210).admittedAt, 200,
+      "another route after a 429 must not fail or overwrite the first handoff");
+    assert.equal(requestJobCancellation(s.root, "handoff", 220).status, "cancellation_requested");
+    assert.throws(() => markTaskAdmitted(s.root, "handoff", 230), /cannot be admitted from cancellation_requested/);
+
+    submitJob(s.root, task("never-started"));
+    requestJobCancellation(s.root, "never-started", 230);
+    assert.throws(() => markTaskAdmitted(s.root, "never-started", 240), /cannot be admitted from cancellation_requested/);
+    assert.equal(readJob(s.root, "never-started").status, "cancellation_requested");
+  } finally { s.done(); }
+});
+
 test("updates preserve immutable identity and terminal timestamps", () => {
   const s = store();
   try {
@@ -104,11 +136,12 @@ test("cancellation is requested durably and recovery settles it", () => {
   } finally { s.done(); }
 });
 
-test("restart recovery requeues read-only work and resets running nodes", () => {
+test("restart recovery requeues metered uncapped read-only work and resets running nodes", () => {
   const s = store();
   try {
     submitJob(s.root, workflow("workflow-a", {
       status: "running",
+      outputBudgetPolicy: "metered_default_v2", inputBudgetPolicy: "metered_default_v1",
       startedAt: 120,
       nodes: [
         { id: "a", task: "inspect", dependsOn: [], inputs: [], state: "running" },

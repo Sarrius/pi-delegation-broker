@@ -13,10 +13,12 @@ import {
   isControllerProbeUrl,
   parseModelVersion,
   probeProviderModels,
+  probeServedModel,
   retryAfterMs,
   readCurrencyCache,
   writeCurrencyCache,
   listingsFromCache,
+  servedModelsFromCache,
 } from "../src/provider-probe.mjs";
 
 function model(id, provider, { reasoning = false } = {}) {
@@ -248,4 +250,54 @@ test("createSelectContract passes the live currency feed into automatic selectio
   const select = createSelectContract({ registry: () => registry, currency: () => currency });
   const result = select({ childId: "currency-contract", promptDigest: "a".repeat(64), capabilityRequest: { taskDescription: "read file" } });
   assert.equal(result.expectedModel.modelId, "glm-5.3");
+});
+
+test("the served-model probe reads the canonical id without leaking the credential", async () => {
+  const ok = await probeServedModel({
+    baseUrl: "https://api.deepseek.com", apiKey: "sk-secret", modelId: "deepseek-v4-flash",
+    fetchImpl: async (url, init) => {
+      assert.equal(url, "https://api.deepseek.com/chat/completions");
+      assert.equal(init.method, "POST");
+      assert.equal(JSON.parse(init.body).model, "deepseek-v4-flash");
+      return { ok: true, json: async () => ({ model: "deepseek-flash" }) };
+    },
+  });
+  assert.deepEqual(ok, { status: "ok", servedModel: "deepseek-flash" });
+
+  const httpError = await probeServedModel({ baseUrl: "https://x.example", modelId: "m", apiKey: "sk-secret", fetchImpl: async () => ({ ok: false, status: 429 }) });
+  assert.deepEqual(httpError, { status: "http_error", code: 429 });
+  const unreachable = await probeServedModel({ baseUrl: "https://x.example", modelId: "m", fetchImpl: async () => { throw new Error("boom"); } });
+  assert.equal(unreachable.status, "unreachable");
+  assert.ok(!JSON.stringify(unreachable).includes("sk-secret"));
+});
+
+test("a served id different from the requested id is recorded as an alias", () => {
+  const currency = buildCurrencyMap({
+    resources: [
+      { provider: "deepseek", modelId: "deepseek-flash" },
+      { provider: "deepseek", modelId: "deepseek-v4-flash" },
+    ],
+    liveListings: new Map([["deepseek", new Map([["deepseek-flash", undefined], ["deepseek-v4-flash", undefined]])]]),
+    servedModels: new Map([["deepseek", new Map([["deepseek-v4-flash", "deepseek-flash"]])]]),
+  });
+  assert.equal(currency["deepseek/deepseek-v4-flash"].aliasOf, "deepseek-flash");
+  assert.equal(currency["deepseek/deepseek-flash"].aliasOf, undefined);
+});
+
+test("currency cache persists alias facts alongside listings without credentials", () => {
+  const dir = mkdtempSync(join(tmpdir(), "probe-cache-"));
+  const path = join(dir, "currency-cache.json");
+  try {
+    writeCurrencyCache(
+      path,
+      new Map([["deepseek", new Map([["deepseek-flash", undefined], ["deepseek-v4-pro", undefined]])]]),
+      new Map([["deepseek", new Map([["deepseek-v4-flash", "deepseek-flash"]])]]),
+    );
+    const cache = readCurrencyCache(path);
+    assert.deepEqual([...listingsFromCache(cache).get("deepseek").keys()].sort(), ["deepseek-flash", "deepseek-v4-pro"]);
+    assert.equal(servedModelsFromCache(cache).get("deepseek").get("deepseek-v4-flash"), "deepseek-flash");
+    assert.ok(!JSON.stringify(cache).includes("Bearer"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

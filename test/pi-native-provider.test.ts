@@ -1,12 +1,45 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as nativeAI from "@earendil-works/pi-ai";
+import { AttemptSettlement, outcomeProperties } from "../src/provider-protocol.mjs";
 import {
 	CONTROLLER_PROVIDER_ADAPTER_ID,
 	createControllerProvider,
+	isLoopbackRoute,
+	requiresSseTransport,
 } from "../src/pi-native-provider.ts";
 
+/**
+ * Incident `workflow-mtopmw94-8`: `anthropic-account-2/claude-sonnet-5` died as
+ * `transport_before_headers` with zero tokens in ~2s. Its published route is the local slot proxy
+ * `http://127.0.0.1:41977/anthropic-account-2`, a plain HTTP shim; Pi's default transport attempts
+ * a WebSocket upgrade first and the controller dispatches with `maxRetries: 0`, so the usual
+ * WS→SSE fallback never ran. Only Cursor was previously forced onto SSE.
+ */
+test("every loopback slot-proxy route is dispatched over SSE, not just Cursor", () => {
+	assert.equal(requiresSseTransport("cursor", "https://api.cursor.sh/v1"), true);
+	assert.equal(requiresSseTransport("cursor-account-2", undefined), true);
+
+	assert.equal(requiresSseTransport("anthropic-account-2", "http://127.0.0.1:41977/anthropic-account-2"), true);
+	assert.equal(requiresSseTransport("openai-codex-account-5", "http://localhost:51985/openai-codex-account-5"), true);
+	assert.equal(requiresSseTransport("anthropic", "http://[::1]:41977/anthropic"), true);
+
+	// A real upstream keeps Pi's negotiated default transport.
+	assert.equal(requiresSseTransport("anthropic", "https://api.anthropic.com"), false);
+	assert.equal(requiresSseTransport("openai-codex", "https://chatgpt.com/backend-api"), false);
+	assert.equal(requiresSseTransport("kimi-coding", undefined), false);
+
+	assert.equal(isLoopbackRoute("not a url"), false);
+	assert.equal(isLoopbackRoute("ws://127.0.0.1:41977/x"), false);
+	assert.equal(isLoopbackRoute(undefined), false);
+});
+
 const SECRET = "oauth-access-secret-that-must-stay-in-the-parent";
+function assertReady(value: any, message?: string) {
+ assert.equal(value.status,"ready",message);
+ assert.match(value.routeFingerprint,/^[a-f0-9]{64}$/);
+ assert.doesNotMatch(JSON.stringify(value),new RegExp(SECRET));
+}
 
 function makeRegistry(models: any[], options: { events?: any[]; response?: false | { status: number; headers?: Record<string, string> } } = {}) {
 	const calls: any[] = [];
@@ -45,7 +78,10 @@ function makeRegistry(models: any[], options: { events?: any[]; response?: false
 					request.onResponse?.(options.response ?? { status: 200, headers: { "request-id": "req-1" } });
 				}
 				return (async function* () {
-					for (const event of events) yield event;
+					for (const event of events) {
+						if (event.type === "fixture_throw") throw event.error;
+						yield event;
+					}
 				})();
 			},
 		}),
@@ -107,6 +143,77 @@ function snapshot(route: any, sourceLease: any) {
 	};
 }
 
+test("controller pre-delegation inference probe verifies an exact native route without exposing response or credentials", async () => {
+  const { registry, calls } = makeRegistry([model("cursor", "composer-2.5", "openai-completions")]);
+  const pair = createControllerProvider({ modelRegistry: registry });
+  const result = await pair.inferenceProbe({ resourceId: "cursor/composer-2.5" });
+  assert.equal(result.status, "verified");
+  assert.equal(result.checkedAt > 0, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].request.maxRetries, 0);
+  assert.equal(calls[0].request.transport, "sse");
+  assert.equal(calls[0].request.maxTokens, 32);
+  assert.equal(calls[0].context.tools.length, 0);
+  assert.match(calls[0].context.messages[0].content[0].text, /OK/);
+  assert.doesNotMatch(JSON.stringify(result), /hello|oauth-access-secret|parent-only/);
+});
+
+test("pre-delegation inference probe reports 429 and cancellation as not verified", async () => {
+  const { registry, calls } = makeRegistry([model("openai-codex-account-8", "gpt-6-sol", "openai-codex-responses")], {
+    response: { status: 429, headers: { "retry-after": "3" } },
+    events: [{ type: "error", error: new Error("rate limit from provider; private body") }],
+  });
+  const pair = createControllerProvider({ modelRegistry: registry });
+  const denied = await pair.inferenceProbe({ resourceId: "openai-codex-account-8/gpt-6-sol" });
+  assert.equal(denied.status, "failed");
+  assert.equal(denied.reason, "rate_limited");
+  assert.equal(denied.retryAfterMs, 3_000);
+  assert.equal(denied.scope, "capacity_group");
+  assert.doesNotMatch(JSON.stringify(denied), /private body/);
+  const signal = AbortSignal.abort();
+  const cancelled = await pair.inferenceProbe({ resourceId: "openai-codex-account-8/gpt-6-sol", signal });
+  assert.equal(cancelled.status, "unknown");
+  assert.equal(calls.length, 1, "a cancelled probe never dispatches another provider request");
+});
+
+test("native pre-delegation transport failure before headers is not treated as a working route", async () => {
+  const { registry } = makeRegistry([model("cursor", "composer-2.5", "openai-completions")], {
+    response: false, events: [{ type: "error", error: new Error("private connection refusal") }],
+  });
+  const result = await createControllerProvider({ modelRegistry: registry }).inferenceProbe({resourceId:"cursor/composer-2.5"});
+  assert.equal(result.status,"failed");
+  assert.equal(result.reason,"transport_before_headers");
+  assert.doesNotMatch(JSON.stringify(result),/private connection refusal/);
+});
+
+test("pre-delegation check cannot hang on Pi credential resolution before dispatch", async () => {
+  const { registry } = makeRegistry([model("cursor", "composer-2.5", "openai-completions")]);
+  registry.getApiKeyAndHeaders = async () => new Promise(() => {});
+  const pair = createControllerProvider({ modelRegistry: registry });
+  const result = await Promise.race([
+    pair.inferenceProbe({ resourceId: "cursor/composer-2.5", timeoutMs: 1_000 }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("preflight stranded caller")), 1_700)),
+  ]);
+  assert.equal(result.status, "unknown");
+  assert.equal(result.reason, "probe_timeout");
+});
+
+test("a hung native inference probe returns unknown within its hard deadline even if the SDK ignores abort", async () => {
+  const { registry } = makeRegistry([model("cursor", "composer-2.5", "openai-completions")]);
+  registry.getProvider = () => ({ streamSimple: () => ({
+    [Symbol.asyncIterator]() { return { next: () => new Promise(() => {}), return: async () => ({ done: true }) }; },
+  }) });
+  const pair = createControllerProvider({ modelRegistry: registry });
+  const start = Date.now();
+  const result = await Promise.race([
+    pair.inferenceProbe({ resourceId: "cursor/composer-2.5", timeoutMs: 1_000 }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("probe stranded caller")), 1_700)),
+  ]);
+  assert.equal(result.status, "unknown");
+  assert.equal(result.reason, "probe_timeout");
+  assert.ok(Date.now() - start < 1_650);
+});
+
 test("routeResolver covers the current native provider pool without returning credentials", async () => {
 	const models = [
 		model("openai", "gpt-6-astra", "openai-responses", ["text", "image"]),
@@ -139,6 +246,70 @@ test("routeResolver covers the current native provider pool without returning cr
 	);
 });
 
+test("Cursor models that explicitly lack effort support cannot silently accept low reasoning", async () => {
+	const cursor = { ...model("cursor", "composer-2.5", "openai-completions"), reasoning: true,
+		compat: { supportsReasoningEffort: false } };
+	const supported = { ...model("cursor-account-2", "composer-2.5-low", "openai-completions"), reasoning: true,
+		compat: { supportsReasoningEffort: true, reasoningEffortMap: { low: "low" } } };
+	const codex = { ...model("openai-codex-account-8", "gpt-6-sol", "openai-codex-responses"), reasoning: true,
+		compat: { supportsReasoningEffort: false }, thinkingLevelMap: { low: "low" } };
+	const unknown = { ...model("cursor-account-3", "composer-2.5", "openai-completions"), reasoning: true };
+	const alternateFormat = { ...model("cursor-account-4", "alt-thinking", "openai-completions"), reasoning: true,
+		compat: { supportsReasoningEffort: false, thinkingFormat: "string-thinking" } };
+	const { registry } = makeRegistry([cursor, supported, codex, unknown, alternateFormat]);
+	const pair = createControllerProvider({ modelRegistry: registry });
+	assert.deepEqual(await pair.routePreflight({ resourceId: "cursor/composer-2.5", requestedThinking: "low" }),
+		{ status: "unavailable", reason: "reasoning_effort_unsupported", scope: "resource" });
+	assert.deepEqual(await pair.routePreflight({ resourceId: "cursor-account-3/composer-2.5", requestedThinking: "low" }),
+		{ status: "unavailable", reason: "reasoning_effort_unsupported", scope: "resource" }, "missing effort metadata is not positive evidence of support");
+	assertReady(await pair.routePreflight({ resourceId: "cursor/composer-2.5", requestedThinking: "off" }));
+	assertReady(await pair.routePreflight({ resourceId: "cursor-account-3/composer-2.5", requestedThinking: "off" }));
+	assertReady(await pair.routePreflight({ resourceId: "cursor-account-2/composer-2.5-low", requestedThinking: "low" }));
+	assertReady(await pair.routePreflight({ resourceId: "cursor-account-4/alt-thinking", requestedThinking: "low" }));
+	assertReady(await pair.routePreflight({ resourceId: "openai-codex-account-8/gpt-6-sol", requestedThinking: "low" }));
+	await assert.rejects(pair.routeResolver(lease("lease-cursor-low", cursor.provider, cursor.id), { reasoningEffort: "low" }),
+		/controller reasoning effort is unsupported by the selected model/);
+	await assert.rejects(pair.routeResolver(lease("lease-cursor-unknown-low", unknown.provider, unknown.id), { reasoningEffort: "low" }),
+		/controller reasoning effort is unsupported by the selected model/);
+	assert.equal((await pair.routeResolver(lease("lease-cursor-off", cursor.provider, cursor.id), { reasoningEffort: "off" })).reasoningEffort, "off");
+	assert.equal((await pair.routeResolver(lease("lease-cursor-unknown-off", unknown.provider, unknown.id), { reasoningEffort: "off" })).reasoningEffort, "off");
+	assert.equal((await pair.routeResolver(lease("lease-supported-low", supported.provider, supported.id), { reasoningEffort: "low" })).reasoningEffort, "low");
+	assert.equal((await pair.routeResolver(lease("lease-alternate-low", alternateFormat.provider, alternateFormat.id), { reasoningEffort: "low" })).reasoningEffort, "low");
+	assert.equal((await pair.routeResolver(lease("lease-codex-low", codex.provider, codex.id), { reasoningEffort: "low" })).reasoningEffort, "low");
+});
+
+test("active low effort needs positively attested Codex Responses support even after the lease", async () => {
+	const supported = { ...model("openai-codex-account-2", "gpt-6-sol", "openai-codex-responses"),
+		reasoning: true, thinkingLevelMap: { low: "low" } };
+	const remapped = { ...model("openai-codex-account-3", "gpt-6-remapped", "openai-codex-responses"),
+		reasoning: true, thinkingLevelMap: { low: "medium" } };
+	const unknown = { ...model("openai-codex-account-4", "gpt-6-unknown", "openai-codex-responses"),
+		reasoning: true };
+	const cursor = { ...model("cursor", "composer-2.5", "openai-completions"),
+		reasoning: true, compat: { supportsReasoningEffort: true } };
+	const wrongDialect = { ...model("openai-codex-account-5", "gpt-6-other", "openai-completions"),
+		reasoning: true, compat: { supportsReasoningEffort: false }, thinkingLevelMap: { low: "low" } };
+	const { registry } = makeRegistry([supported, remapped, unknown, cursor, wrongDialect]);
+	const pair = createControllerProvider({ modelRegistry: registry });
+	assertReady(await pair.routePreflight({resourceId:"openai-codex-account-2/gpt-6-sol",requestedThinking:"low",requireExactEffortSupport:true}));
+	for (const resourceId of ["openai-codex-account-3/gpt-6-remapped", "openai-codex-account-4/gpt-6-unknown", "openai-codex-account-5/gpt-6-other", "cursor/composer-2.5"]) {
+		assert.deepEqual(await pair.routePreflight({resourceId,requestedThinking:"low",requireExactEffortSupport:true}),
+			{status:"unavailable",reason:"reasoning_effort_unsupported",scope:"resource"});
+	}
+	assertReady(await pair.routePreflight({resourceId:"openai-codex-account-4/gpt-6-unknown",requestedThinking:"off"}));
+	assert.deepEqual(await pair.routePreflight({resourceId:"openai-codex-account-4/gpt-6-unknown",requestedThinking:"low"}),
+		{status:"unavailable",reason:"reasoning_effort_unsupported",scope:"resource"},
+		"even an explicit low request needs a route that can transmit its requested level");
+	await assert.rejects(pair.routeResolver(lease("codex-unknown",unknown.provider,unknown.id),{reasoningEffort:"low"}),
+		/controller reasoning effort is unsupported/);
+	assert.equal((await pair.routeResolver(lease("codex-unknown-off",unknown.provider,unknown.id),{reasoningEffort:"off"})).reasoningEffort,"off");
+	await assert.rejects(pair.routeResolver(lease("codex-remapped",remapped.provider,remapped.id),{reasoningEffort:"low"}),
+		/controller reasoning effort is unsupported/);
+	await assert.rejects(pair.routeResolver(lease("codex-dialect-drift",wrongDialect.provider,wrongDialect.id),{reasoningEffort:"low"}),
+		/controller reasoning effort is unsupported/);
+	assert.equal((await pair.routeResolver(lease("codex-supported",supported.provider,supported.id),{reasoningEffort:"low"})).reasoningEffort,"low");
+});
+
 test("routePreflight rejects stale or unresolvable routes without exposing credentials", async () => {
 	const currentModel = model("zai", "glm-5.3", "openai-completions");
 	const { registry } = makeRegistry([currentModel]);
@@ -146,12 +317,61 @@ test("routePreflight rejects stale or unresolvable routes without exposing crede
 	assert.deepEqual(await pair.routePreflight({ resourceId: "zai/removed-model" }), {
 		status: "unavailable", reason: "model_not_registered", scope: "resource",
 	});
-	assert.deepEqual(await pair.routePreflight({ resourceId: currentModel.provider + "/" + currentModel.id }), { status: "ready" });
+	assertReady(await pair.routePreflight({ resourceId: currentModel.provider + "/" + currentModel.id }));
 	registry.getApiKeyAndHeaders = async () => ({ ok: false });
 	const unavailablePair = createControllerProvider({ modelRegistry: registry });
 	const unavailable = await unavailablePair.routePreflight({ resourceId: currentModel.provider + "/" + currentModel.id });
 	assert.deepEqual(unavailable, { status: "unavailable", reason: "credential_unavailable", scope: "resource" });
 	assert.doesNotMatch(JSON.stringify(unavailable), new RegExp(SECRET));
+});
+
+/**
+ * Incident `workflow-mtoplh4l-7`: the Cursor bridge on `127.0.0.1:49524` had exited, but
+ * `models.json` still advertised 211 models behind it, so `delegate_inventory` reported
+ * `cursor/composer-2.5` as available frontier capacity and the workflow leased a corpse. A route
+ * whose local bridge refuses connections must fail preflight before any lease is issued.
+ */
+test("routePreflight refuses a loopback route whose local bridge is no longer listening", async (t) => {
+	const { createServer } = await import("node:net");
+	const live = createServer();
+	await new Promise<void>((resolve) => live.listen(0, "127.0.0.1", resolve));
+	t.after(() => new Promise<void>((resolve) => live.close(() => resolve())));
+	const livePort = (live.address() as { port: number }).port;
+
+	// A port that accepted a connection and then closed is exactly the dead-bridge case.
+	const dead = createServer();
+	await new Promise<void>((resolve) => dead.listen(0, "127.0.0.1", resolve));
+	const deadPort = (dead.address() as { port: number }).port;
+	await new Promise<void>((resolve) => dead.close(() => resolve()));
+
+	const reachable = model("cursor", "composer-2.5", "openai-completions");
+	reachable.baseUrl = `http://127.0.0.1:${livePort}/v1`;
+	const unreachable = model("cursor-account-2", "composer-2.5", "openai-completions");
+	unreachable.baseUrl = `http://127.0.0.1:${deadPort}/v1`;
+
+	const { registry } = makeRegistry([reachable, unreachable]);
+	// Slot-proxy routes resolve their credential against the published local endpoint, and the
+	// transport honours `auth.baseUrl` first, so preflight must judge that same effective URL.
+	registry.getApiKeyAndHeaders = async (target: any) => ({ ok: true, apiKey: SECRET, baseUrl: target.baseUrl });
+	const pair = createControllerProvider({ modelRegistry: registry });
+
+	assertReady(
+		await pair.routePreflight({ resourceId: "cursor/composer-2.5" }),
+		"a bridge that is still listening stays leasable",
+	);
+	assert.deepEqual(
+		await pair.routePreflight({ resourceId: "cursor-account-2/composer-2.5" }),
+		{ status: "unavailable", reason: "route_endpoint_unreachable", scope: "capacity_group" },
+		"a dead bridge condemns the whole account, since every sibling model shares the port",
+	);
+});
+
+test("a real upstream route is never probed for local reachability", async () => {
+	const upstream = model("anthropic", "claude-fable-5-1", "anthropic-messages");
+	upstream.baseUrl = "https://api.anthropic.com";
+	const { registry } = makeRegistry([upstream]);
+	const pair = createControllerProvider({ modelRegistry: registry });
+	assertReady(await pair.routePreflight({ resourceId: "anthropic/claude-fable-5-1" }));
 });
 
 test("native transport maps Pi events and consumes one exact lease binding", async () => {
@@ -369,6 +589,8 @@ test("native transport forwards tool schemas and Codex compound tool-call ids wi
 		events: [
 			{ type: "start", partial: {} },
 			{ type: "toolcall_start", contentIndex: 0, partial: {} },
+			// Native OpenAI-compatible SDKs emit an id/name-only first chunk.
+			{ type: "toolcall_delta", contentIndex: 0, delta: "", partial: {} },
 			{ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"greeting.txt"}', partial: {} },
 			{ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call_1|fc_1", name: "write", arguments: { path: "greeting.txt" } }, partial: {} },
 			{ type: "done", reason: "toolUse", message: { content: [{ type: "toolCall", id: "call_1|fc_1", name: "write", arguments: { path: "greeting.txt" } }], usage: { input: 4, output: 3 } } },
@@ -439,6 +661,116 @@ test("Cursor Grok forwards its LF-joined compound tool-call id", async () => {
 	const finalEvent = output.at(-1);
 	assert.equal(finalEvent?.type, "terminal");
 	if (finalEvent?.type === "terminal") assert.equal(finalEvent.outcome, "succeeded_terminal");
+});
+
+test("native dispatch preserves Retry-After and missing-model cause, not only readiness probes", async () => {
+ for (const [status, message, expected, delay] of [[429,"rate limited","rate_limited",3000],[404,"model not found","model_unavailable",undefined]] as const) {
+  const currentModel=model("deepseek","deepseek-v4-pro","openai-completions");
+  const {registry}=makeRegistry([currentModel],{response:{status,headers:status===429?{"retry-after":"3"}:{}},events:[{type:"error",error:new Error(message)}]});
+  const pair=createControllerProvider({modelRegistry:registry});const currentLease=lease("lease-errors",currentModel.provider,currentModel.id);
+  const route=await pair.routeResolver(currentLease);const out=[];
+  for await(const e of pair.providerTransport.stream(snapshot(route,currentLease),{messages:[{role:"user",content:"x"}]}))out.push(e);
+  assert.equal(out.at(-1)?.payload.providerReason,expected);assert.equal(out.at(-1)?.payload.retryAfterMs,delay);
+ }
+});
+
+test("orphan empty tool deltas remain malformed and route fingerprints track credential changes", async () => {
+ const currentModel=model("deepseek","deepseek-v4-pro","openai-completions");
+ const {registry}=makeRegistry([currentModel],{events:[{type:"toolcall_delta",contentIndex:0,delta:""}]});
+ let secret="one";registry.getApiKeyAndHeaders=async()=>({ok:true,apiKey:secret});
+ const pair=createControllerProvider({modelRegistry:registry});const id="deepseek/deepseek-v4-pro";
+ const first=await pair.routePreflight({resourceId:id});secret="two";const second=await pair.routePreflight({resourceId:id});
+ assert.notEqual(first.routeFingerprint,second.routeFingerprint);
+ const currentLease=lease("lease-orphan",currentModel.provider,currentModel.id);const route=await pair.routeResolver(currentLease);const out=[];
+ for await(const e of pair.providerTransport.stream(snapshot(route,currentLease),{messages:[{role:"user",content:"x"}]}))out.push(e);
+ assert.equal(out.at(-1)?.outcome,"malformed_provider_frame");
+});
+
+test("Codex readiness uses positively attested low on cold metadata and warm inference, without changing high work", async () => {
+ const currentModel={...model('openai-codex-account-6','gpt-6.1-sol','openai-codex-responses'),reasoning:true,thinkingLevelMap:{low:'low',high:'high'}};
+ const {registry,calls}=makeRegistry([currentModel]);const pair=createControllerProvider({modelRegistry:registry});const id=currentModel.provider+'/'+currentModel.id;
+ const preflight=await pair.routePreflight({resourceId:id,requestedThinking:'off'});assertReady(preflight);assert.equal(preflight.minimumReadinessThinking,'low');
+ assert.equal((await pair.inferenceProbe({resourceId:id})).status,'verified');assert.equal(calls[0].request.reasoning,'low');
+ const currentLease=lease('lease-high-not-lowered',currentModel.provider,currentModel.id);const route=await pair.routeResolver(currentLease,{reasoningEffort:'high'});
+ for await(const _event of pair.providerTransport.stream(snapshot(route,currentLease),{messages:[{role:'user',content:'hello'}]})){}
+ assert.equal(calls[1].request.reasoning,'high');assert.equal(route.reasoningEffort,'high');
+});
+test("warm Codex readiness explicitly requests attested low rather than the SDK1.1 none default", async () => {
+ const currentModel={...model('openai-codex-account-6','gpt-6.1-sol','openai-codex-responses'),reasoning:true,thinkingLevelMap:{low:'low'}};
+ const {registry,calls}=makeRegistry([currentModel]);const pair=createControllerProvider({modelRegistry:registry});
+ assert.equal((await pair.inferenceProbe({resourceId:currentModel.provider+'/'+currentModel.id})).status,'verified');assert.equal(calls[0].request.reasoning,'low');
+});
+test("unattested or non-Codex routes never acquire an invented readiness minimum", async () => {
+ for(const currentModel of [model('openai-codex-account-6','unknown','openai-codex-responses'),{...model('anthropic','other','anthropic-messages'),reasoning:true,thinkingLevelMap:{low:'low'}},{...model('openai-codex-account-6','wrong-api','openai-completions'),reasoning:true,thinkingLevelMap:{low:'low'}},{...model('openai-codex-account-6','no-reasoning','openai-codex-responses'),reasoning:false,thinkingLevelMap:{low:'low'}},{...model('openai-codex-account-6','no-low-map','openai-codex-responses'),reasoning:true,thinkingLevelMap:{high:'high'}}]){
+  const {registry,calls}=makeRegistry([currentModel]);const pair=createControllerProvider({modelRegistry:registry});const id=currentModel.provider+'/'+currentModel.id;
+  assert.equal((await pair.routePreflight({resourceId:id})).minimumReadinessThinking,undefined);
+  assert.equal((await pair.inferenceProbe({resourceId:id})).status,'verified');assert.equal(calls[0].request.reasoning,undefined);
+ }
+});
+test("semantic unsupported request fields after HTTP200 are not provider truncation; transport and quota remain distinct", async () => {
+ for(const [status,message,expected,responseSeen] of [[200,"Unsupported value: 'none'. (param: reasoning.effort)",'rejected_before_send',true],[200,'Unsupported parameter: temperature','rejected_before_send',true],[200,'connection reset','stream_truncated',true],[503,'Unsupported parameter: temperature','stream_truncated',true],[429,"Unsupported value: 'none'",'rate_limited',true],[200,'Unsupported parameter: temperature','transport_before_headers',false]] as const){
+  const currentModel=model('openai-codex-account-6','gpt-6.1-sol','openai-codex-responses');const {registry}=makeRegistry([currentModel],{response:responseSeen?{status}:false,events:[{type:'error',error:new Error(message)}]});
+  const pair=createControllerProvider({modelRegistry:registry});const currentLease=lease('lease-semantic',currentModel.provider,currentModel.id);const route=await pair.routeResolver(currentLease);const out=[];
+  for await(const event of pair.providerTransport.stream(snapshot(route,currentLease),{messages:[{role:'user',content:'hello'}]}))out.push(event);
+  assert.equal(out.at(-1)?.outcome,expected);
+  if(expected==='rejected_before_send')assert.equal(out.at(-1)?.payload.providerReason,'invalid_request');
+ }
+});
+
+test("warm semantic HTTP200 request rejection preserves its invalid-request category", async () => {
+ const currentModel=model('openai-codex-account-6','gpt-6.1-sol','openai-codex-responses');
+ const {registry}=makeRegistry([currentModel],{events:[{type:'error',error:new Error('Unsupported parameter: temperature')}],response:{status:200}});
+ const result=await createControllerProvider({modelRegistry:registry}).inferenceProbe({resourceId:currentModel.provider+'/'+currentModel.id});
+ assert.equal(result.status,'failed');assert.equal(result.reason,'model_request_rejected');assert.equal(result.scope,'resource');
+});
+
+test("semantic2xx rejection requires a direct unsupported error, not redirects or quoted transport history", async () => {
+ const actual=[];const expectedOutcomes=[];
+ for(const [status,message,expected] of [[302,'Unsupported parameter: temperature','stream_truncated'],[101,'Unsupported value: none','stream_truncated'],[200,'connection reset; previous error: Unsupported parameter: temperature','stream_truncated'],[200,'Unsupported parameter: temperature; subsequent connection reset','stream_truncated'],[200,JSON.stringify({message:'Unsupported parameter: temperature',error:{code:'ETIMEDOUT'}}),'stream_truncated'],[200,JSON.stringify({detail:'Unsupported parameter: temperature',error:{type:'transport_error'}}),'stream_truncated'],[200,JSON.stringify({error:{message:'Unsupported parameter: temperature',type:'invalid_request_error',code:'unsupported_parameter'}}),'rejected_before_send'],[200,JSON.stringify({detail:"Unsupported value: 'none'. (param: reasoning.effort)"}),'rejected_before_send'],[200,'200: '+JSON.stringify({error:{message:'Unsupported parameter: temperature'}}),'rejected_before_send']] as const){
+  const m=model('openai-codex-account-6','gpt-6.1-sol','openai-codex-responses');const {registry}=makeRegistry([m],{response:{status},events:[{type:'error',error:new Error(message)}]});const pair=createControllerProvider({modelRegistry:registry});const l=lease('lease-direct-semantic',m.provider,m.id);const r=await pair.routeResolver(l);const out=[];
+  for await(const e of pair.providerTransport.stream(snapshot(r,l),{messages:[{role:'user',content:'hello'}]}))out.push(e);
+  actual.push(out.at(-1)?.outcome);expectedOutcomes.push(expected);
+ }
+ assert.deepEqual(actual,expectedOutcomes);
+});
+test("partial native text, reasoning or tool output never becomes a safe before-send rejection", async () => {
+ const prefixes=[
+  [{type:'text_start',contentIndex:0},{type:'text_delta',contentIndex:0,delta:'partial'}],
+  [{type:'text_start',contentIndex:0},{type:'text_end',contentIndex:0,content:''}],
+  [{type:'thinking_start',contentIndex:0},{type:'thinking_delta',contentIndex:0,delta:'partial'},{type:'thinking_end',contentIndex:0,content:'partial'}],
+  [{type:'toolcall_start',contentIndex:0},{type:'toolcall_delta',contentIndex:0,delta:'{'}],
+  [{type:'toolcall_start',contentIndex:0},{type:'toolcall_end',contentIndex:0,toolCall:{type:'toolCall',id:'tool-1',name:'read',arguments:{path:'fixture.txt'}}}],
+ ];
+ const outcomes=[];
+ for(const prefix of prefixes){
+  const m=model('openai-codex-account-6','gpt-6.1-sol','openai-codex-responses');const {registry}=makeRegistry([m],{response:{status:200},events:[...prefix,{type:'error',error:new Error('Unsupported parameter: temperature')}]});const pair=createControllerProvider({modelRegistry:registry});const l=lease('lease-partial',m.provider,m.id);const r=await pair.routeResolver(l);const out=[];
+  for await(const e of pair.providerTransport.stream(snapshot(r,l),{messages:[{role:'user',content:'hello'}],tools:[{name:'read',description:'fixture',inputSchema:{type:'object'}}]}))out.push(e);
+  const outcome=out.at(-1)?.outcome;outcomes.push(outcome);
+  assert.equal(outcome,'stream_truncated');assert.equal(outcomeProperties(outcome).effectAmbiguous,true);assert.equal(outcomeProperties(outcome).automaticRetryCandidate,false);
+  // Fake-only protocol phase exercise, not a signed route/lease acceptance receipt.
+  const settlement=new AttemptSettlement({snapshotFingerprint:'f'.repeat(64)});settlement.transition('admitted');settlement.transition('provider_send_started');settlement.transition('headers_seen');if(out.some(e=>e.type==='block_start'))settlement.transition('streaming_tentative');assert.doesNotThrow(()=>settlement.canSettleTerminal(outcome,{observedAt:1}));
+ }
+ assert.deepEqual(outcomes,prefixes.map(()=> 'stream_truncated'));
+});
+test("warm unsupported error after partial native output remains inconclusive", async () => {
+ const prefixes=[[{type:'text_start',contentIndex:0},{type:'text_delta',contentIndex:0,delta:'partial'}],[{type:'text_start',contentIndex:0},{type:'text_end',contentIndex:0,content:''}],[{type:'thinking_start',contentIndex:0}],[{type:'toolcall_start',contentIndex:0}]];
+ for(const prefix of prefixes)for(const type of ['error','fixture_throw']){
+  const m=model('openai-codex-account-6','gpt-6.1-sol','openai-codex-responses');const {registry}=makeRegistry([m],{response:{status:200},events:[...prefix,{type,error:new Error('Unsupported parameter: temperature')}]});const result=await createControllerProvider({modelRegistry:registry}).inferenceProbe({resourceId:m.provider+'/'+m.id});assert.equal(result.status,'unknown');assert.equal(result.reason,'inference_incomplete');
+ }
+});
+test("native iterator errors retain the same before-content versus partial-content distinction", async () => {
+ const prefixes=[[],[{type:'text_start',contentIndex:0}],[{type:'thinking_start',contentIndex:0}],[{type:'toolcall_start',contentIndex:0}]];
+ for(const prefix of prefixes){const m=model('openai-codex-account-6','gpt-6.1-sol','openai-codex-responses');const {registry}=makeRegistry([m],{response:{status:200},events:[...prefix,{type:'fixture_throw',error:new Error('Unsupported parameter: temperature')}]});const pair=createControllerProvider({modelRegistry:registry});const l=lease('lease-iterator',m.provider,m.id);const r=await pair.routeResolver(l);const out=[];for await(const e of pair.providerTransport.stream(snapshot(r,l),{messages:[{role:'user',content:'hello'}]}))out.push(e);assert.equal(out.at(-1)?.outcome,prefix.length?'stream_truncated':'rejected_before_send');}
+});
+test("done error frames cannot turn final or open content into a definite unsupported request", async () => {
+ for(const [prefix,content,expected] of [[[],[],'rejected_before_send'],[[{type:'text_start',contentIndex:0}],[],'stream_truncated'],[[],[{type:'text',text:'partial'}],'stream_truncated']] as const){const m=model('openai-codex-account-6','gpt-6.1-sol','openai-codex-responses');const {registry}=makeRegistry([m],{response:{status:200},events:[...prefix,{type:'done',reason:'error',message:{content,errorMessage:'Unsupported parameter: temperature'}}]});const pair=createControllerProvider({modelRegistry:registry});const l=lease('lease-done-error',m.provider,m.id);const r=await pair.routeResolver(l);const out=[];for await(const e of pair.providerTransport.stream(snapshot(r,l),{messages:[{role:'user',content:'hello'}]}))out.push(e);assert.equal(out.at(-1)?.outcome,expected);}
+});
+test("unsupported-message parsing observes the explicit8192-character boundary conservatively", async () => {
+ const base=JSON.stringify({detail:'Unsupported parameter: temperature',padding:''});
+ for(const [length,expected] of [[8192,'rejected_before_send'],[8193,'stream_truncated']] as const){const message=JSON.stringify({detail:'Unsupported parameter: temperature',padding:'x'.repeat(length-base.length)});assert.equal(message.length,length);const m=model('openai-codex-account-6','gpt-6.1-sol','openai-codex-responses');const {registry}=makeRegistry([m],{response:{status:200},events:[{type:'error',error:new Error(message)}]});const pair=createControllerProvider({modelRegistry:registry});const l=lease('lease-bounded-message',m.provider,m.id);const r=await pair.routeResolver(l);const out=[];for await(const e of pair.providerTransport.stream(snapshot(r,l),{messages:[{role:'user',content:'hello'}]}))out.push(e);assert.equal(out.at(-1)?.outcome,expected);}
+});
+test("internal readiness never leaks its low minimum into an explicit off work request", async () => {
+ const m={...model('openai-codex-account-6','gpt-6.1-sol','openai-codex-responses'),reasoning:true,thinkingLevelMap:{low:'low'}};const {registry,calls}=makeRegistry([m]);const pair=createControllerProvider({modelRegistry:registry});await pair.inferenceProbe({resourceId:m.provider+'/'+m.id});assert.equal(calls[0].request.reasoning,'low');const l=lease('lease-off-preserved',m.provider,m.id);const r=await pair.routeResolver(l,{reasoningEffort:'off'});for await(const _e of pair.providerTransport.stream(snapshot(r,l),{messages:[{role:'user',content:'hello'}]})){}assert.equal(r.reasoningEffort,'off');assert.equal(calls[1].request.reasoning,undefined);
 });
 
 test("routeResolver fails closed when Pi cannot resolve an exact model credential", async () => {

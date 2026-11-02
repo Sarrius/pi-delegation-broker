@@ -8,6 +8,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 const MAX_CHECKS = 20;
 const MAX_PATH_LENGTH = 1_024;
 const MAX_CONTENT_BYTES = 1 * 1024 * 1024;
+const MAX_ANSWER_BYTES = 4_096;
 const MAX_OUTPUT_CHARS = 32_000;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 120_000;
@@ -35,6 +36,7 @@ const FIXED_DEFINITIONS = Object.freeze({
 export const controllerAcceptanceCheckIds = Object.freeze([
   ...Object.keys(FIXED_DEFINITIONS),
   "file-equals",
+  "answer-equals",
 ]);
 
 function fail(message) {
@@ -74,10 +76,9 @@ function normalizeSpec(spec) {
     fail("check id is invalid");
   }
   if (!controllerAcceptanceCheckIds.includes(spec.id)) fail(`unsupported fixed check id: ${spec.id}`);
-  const keys = spec.id === "file-equals"
-    ? ["id", "path", "content", "timeoutMs"]
-    : ["id", "timeoutMs"];
-  exactKeys(spec, keys, spec.id === "file-equals" ? ["id", "path", "content"] : ["id"], `check ${spec.id}`);
+  const keys = spec.id === "file-equals" ? ["id", "path", "content", "timeoutMs"]
+    : spec.id === "answer-equals" ? ["id", "content", "timeoutMs"] : ["id", "timeoutMs"];
+  exactKeys(spec, keys, ["file-equals", "answer-equals"].includes(spec.id) ? ["id", ...(spec.id === "file-equals" ? ["path"] : []), "content"] : ["id"], `check ${spec.id}`);
   const timeoutMs = boundedTimeout(spec.timeoutMs);
   if (spec.id === "file-equals") {
     const path = safeRelativePath(spec.path);
@@ -85,6 +86,11 @@ function normalizeSpec(spec) {
       fail("file-equals content must be bounded UTF-8 text without NUL bytes");
     }
     return Object.freeze({ id: spec.id, path, content: spec.content, timeoutMs });
+  }
+  if (spec.id === "answer-equals") {
+    if (typeof spec.content !== "string" || !spec.content || spec.content.includes("\0")
+      || Buffer.byteLength(spec.content, "utf8") > MAX_ANSWER_BYTES) fail("answer-equals content must be bounded nonempty UTF-8 text");
+    return Object.freeze({ id: spec.id, content: spec.content, timeoutMs });
   }
   return Object.freeze({ id: spec.id, timeoutMs });
 }
@@ -228,20 +234,29 @@ async function runFileEquals(spec, cwd) {
  * Build a fixed controller-owned plan for a particular verification cwd. The returned closure
  * rejects tampered check descriptors and has no path to execute caller-provided argv.
  */
-export function createControllerAcceptancePlan(specs, { cwd } = {}) {
+export function createControllerAcceptancePlan(specs, { cwd, taskMode = "effect" } = {}) {
   const normalized = normalizeControllerAcceptanceSpecs(specs);
+  if (!["effect", "observe"].includes(taskMode)) fail("taskMode must be observe or effect");
+  // For read-only work, cwd checks pass whether the child answers correctly or not.
+  // Never promote those unrelated checks to a verifier-backed model-quality label.
+  if (taskMode === "observe" && normalized.some(spec => spec.id !== "answer-equals"))
+    fail("read-only acceptance must verify the child result with answer-equals");
+  if (taskMode === "effect" && normalized.some(spec => spec.id === "answer-equals"))
+    fail("answer-equals is a read-only result check, not an effect-patch verifier");
   const root = validateCwd(cwd);
   const checks = normalized.map((spec) => {
     const definition = FIXED_DEFINITIONS[spec.id];
     return Object.freeze({
       id: spec.id,
-      claim: definition?.claim ?? `file-equals ${spec.path}`,
+      claim: definition?.claim ?? (spec.id === "answer-equals"
+        ? `answer-equals sha256=${createHash("sha256").update(spec.content).digest("hex")}`
+        : `file-equals ${spec.path}`),
       kind: "command",
       timeoutMs: spec.timeoutMs,
     });
   });
   const byId = new Map(normalized.map((spec) => [spec.id, spec]));
-  const runCheck = async (check, { signal } = {}) => {
+  const runCheck = async (check, { signal, observedText } = {}) => {
     const spec = byId.get(check?.id);
     if (!spec) throw new Error("controller acceptance check is not in the fixed plan");
     const expected = checks.find((entry) => entry.id === spec.id);
@@ -249,6 +264,17 @@ export function createControllerAcceptancePlan(specs, { cwd } = {}) {
       throw new Error("controller acceptance check descriptor was mutated");
     }
     if (spec.id === "file-equals") return runFileEquals(spec, root);
+    if (spec.id === "answer-equals") {
+      // The trusted resolver supplies ONLY the Pi child's finalized text after session close.
+      // Neither child text nor expected content is emitted into public logs or evidence.
+      const actual = typeof observedText === "string" ? Buffer.from(observedText, "utf8") : null;
+      const expected = Buffer.from(spec.content, "utf8");
+      const matches = actual !== null && actual.length <= MAX_ANSWER_BYTES
+        && actual.length === expected.length && actual.equals(expected);
+      return Object.freeze({ exitCode: matches ? 0 : 1,
+        stdout: `answer: ${actual?.length ?? 0} bytes sha256=${createHash("sha256").update(actual ?? Buffer.alloc(0)).digest("hex")}`,
+        stderr: matches ? "" : "final answer mismatch" });
+    }
     return spawnFixedCommand({ argv: FIXED_DEFINITIONS[spec.id].argv, cwd: root, timeoutMs: spec.timeoutMs, signal });
   };
   return Object.freeze({

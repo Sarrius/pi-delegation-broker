@@ -244,7 +244,7 @@ export class BrokerIpcServer {
       if (method === "issueLeaseCapability") return this.#broker.issueLeaseCapability(params.leaseId, params.fencingToken, now);
       if (method === "bindEffectiveChildCapability") return this.#broker.bindEffectiveChildCapability(params.leaseId, params.fencingToken, params.capability, now);
       if (method === "markRateLimited") return this.#broker.markRateLimited(params.resourceId, params.retryAfterMs, now);
-      if (method === "markUnknown") return this.#broker.markUnknown(params.resourceId, now, params.reason, params.scope, params.retryAfterMs);
+      if (method === "markUnknown") return this.#broker.markUnknown(params.resourceId, now, params.reason, params.scope, params.retryAfterMs, params.evidence);
       if (method === "markAvailabilityObserved") return this.#broker.markAvailabilityObserved(params.resourceId, now, params.scope);
       if (method === "markHealthy") return this.#broker.markHealthy(params.resourceId, now);
       if (method === "markProviderSucceeded") return this.#broker.markProviderSucceeded(params.leaseId, params.fencingToken, now);
@@ -320,6 +320,7 @@ export class BrokerIpcServer {
       result: captured.value,
       isError: params?.isError,
       stateDigest: state.stateDigest,
+      modelTurnId: params?.modelTurnId,
     });
     const resultDigest = createHash("sha256").update(captured.canonical).digest("hex");
     const recorded = this.#broker.recordBehavioralEvent(lease.leaseId, lease.fencingToken, {
@@ -482,7 +483,7 @@ export class BrokerIpcServer {
       settlement.settleTerminal("rate_limited", { facts: { retryAfterMs: event.retryAfterMs, capacityGroup: cooldown.capacityGroup }, observedAt });
     } else if (event.type === "auth_fatal") {
       settlement.transition("headers_seen");
-      this.#broker.markUnknown(lease.resourceId, observedAt, "provider auth fatal", "capacity_group");
+      this.#broker.markUnknown(lease.resourceId, observedAt, "provider auth fatal", "capacity_group", undefined, "dispatch");
       this.#broker.release(lease.leaseId, lease.fencingToken, "provider auth fatal", observedAt);
       emit("terminal", { outcome: "auth_fatal" });
       settlement.settleTerminal("auth_fatal", { observedAt });
@@ -546,7 +547,9 @@ export class BrokerIpcServer {
       this.#broker.release(lease.leaseId, lease.fencingToken, reason, Date.now());
       throw new Error(reason);
     }
-    const remainingOutputTokens = outputCap === undefined ? 8_000 : Math.max(1, outputCap - outputUsed);
+    // A read-only lease without a caller-declared cumulative cap still bounds each provider
+    // response. Do not turn this per-request hint into another cumulative task failure.
+    const remainingOutputTokens = outputCap === undefined ? 16_000 : Math.max(1, outputCap - outputUsed);
 
     // Resolve a controller-owned route before admitting the stream. Route
     // selection failure is a controller admission failure, never an ambient
@@ -705,7 +708,7 @@ export class BrokerIpcServer {
         this.#broker.markRateLimited(lease.resourceId, payload.retryAfterMs, observedAt);
         this.#broker.release(lease.leaseId, lease.fencingToken, "provider rate limited", observedAt);
       } else if (outcome === "auth_fatal" || outcome === "quota_fatal") {
-        this.#broker.markUnknown(lease.resourceId, observedAt, `provider ${outcome}`, "capacity_group");
+        this.#broker.markUnknown(lease.resourceId, observedAt, `provider ${outcome}`, "capacity_group", payload.retryAfterMs, "dispatch");
         this.#broker.release(lease.leaseId, lease.fencingToken, `provider ${outcome}`, observedAt);
       } else if (outcome !== "succeeded_terminal") {
         this.#broker.release(lease.leaseId, lease.fencingToken, `provider terminal ${outcome}`, observedAt);
@@ -790,7 +793,7 @@ export class BrokerIpcServer {
       return { status: "rate_limited", retryAfterMs: event.retryAfterMs, capacityGroup: cooldown.capacityGroup, retryAt: cooldown.until };
     }
     if (event.type === "auth_fatal") {
-      this.#broker.markUnknown(lease.resourceId, observedAt, "provider auth fatal", "capacity_group");
+      this.#broker.markUnknown(lease.resourceId, observedAt, "provider auth fatal", "capacity_group", undefined, "dispatch");
       this.#broker.release(lease.leaseId, lease.fencingToken, "provider auth fatal", observedAt);
       return { status: "auth_fatal" };
     }

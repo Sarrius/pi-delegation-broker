@@ -230,6 +230,29 @@ test("streaming failed_before_effect maps to transport_before_headers", async ()
   }
 });
 
+test("native quota failure preserves Retry-After for automatic recovery instead of probing early", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "broker-402-"));
+  const broker = new SqliteLeaseBroker({ path: join(directory, "broker.sqlite"), registry: fixtureRegistry() });
+  const retryAfterMs = 900_000;
+  const providerTransport = { async *stream(_snapshot, _context, options) {
+    options.onSendStarted();
+    yield { type: "headers", payload: { httpStatus: 402 } };
+    yield { type: "terminal", outcome: "quota_fatal", payload: { httpStatus: 402, retryAfterMs, providerReason: "quota_exhausted" } };
+  } };
+  const server = new BrokerIpcServer({ broker, socketPath: join(directory, "broker.sock"), providerTransport, routeResolver: async () => realRoute() });
+  await server.start();
+  try {
+    const capability = await reserveCapability(server, "quota-recovery-header");
+    const before = Date.now();
+    const { terminal } = await streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: realContext() });
+    assert.equal(terminal.payload.outcome, "quota_fatal");
+    assert.equal(terminal.payload.retryAfterMs, retryAfterMs);
+    const resource = broker.inventory(Date.now()).find(row => row.resourceId === "R1");
+    assert.equal(resource.state, "unknown");
+    assert.ok(resource.cooldownUntil >= before + retryAfterMs, "do not replace the provider's longer delay with a default probe interval");
+  } finally { await server.stop(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("an illegal provider terminal preserves a bounded controller failure code", async () => {
   const directory = mkdtempSync(join(tmpdir(), "delegation-broker-controller-failure-"));
   const broker = new SqliteLeaseBroker({ path: join(directory, "broker.sqlite"), registry: fixtureRegistry() });
@@ -285,6 +308,27 @@ test("streaming budget exceeded when output exceeds hard cap", async () => {
     await server.stop();
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("read-only lease without a caller output cap records more than 16k across two provider turns", async () => {
+  const { directory, server } = createServer();
+  await server.start();
+  try {
+    const taskId = "stream-observe-no-output-cap";
+    const capability = await reserveCapability(server, taskId, undefined, {
+      budget: { maxInputTokens: 1_000_000, enforcement: { input: "metered_best_effort", output: "unavailable" } },
+    });
+    await requestBrokerIpc({ socketPath: server.socketPath, authorization: server.controllerToken,
+      method: "configureFakeProvider", params: { taskId, events: [
+        { type: "succeeded", resultRef: "first", usage: { input: 1000, output: 13000 } },
+        { type: "succeeded", resultRef: "second", usage: { input: 1000, output: 9000 } },
+      ] } });
+    const first = await streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: fakeContext() });
+    const second = await streamProviderIpc({ socketPath: server.socketPath, authorization: capability, context: fakeContext() });
+    assert.equal(first.terminal.payload.outcome, "succeeded_terminal");
+    assert.equal(second.terminal.payload.outcome, "succeeded_terminal");
+    assert.equal(first.terminal.payload.usage.output + second.terminal.payload.usage.output, 22000);
+  } finally { await server.stop(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("streaming rejects malformed context without a real provider transport", async () => {

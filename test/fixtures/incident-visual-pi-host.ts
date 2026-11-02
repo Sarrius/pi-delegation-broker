@@ -1,4 +1,5 @@
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import {qualificationResponse,qualificationNormalizedEvents} from './qualification-response.mjs';
 import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -93,6 +94,7 @@ export default function incidentVisualPiHost(pi: ExtensionAPI) {
 
   const providerTransport = {
     async *stream(snapshot: any, context: any, options: { onSendStarted: () => void }) {
+      if(qualificationResponse(context)){options.onSendStarted();yield* qualificationNormalizedEvents(context);return;}
       actualResource = snapshot.resourceId;
       if (actualResource === unavailableResource) throw new Error("preflight-unavailable route was dispatched");
       childDispatches += 1;

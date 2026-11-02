@@ -32,6 +32,7 @@ type PendingAction = {
   stepId: string;
   toolName: string;
   args: unknown;
+  modelTurnId?: number;
 };
 
 type Runtime = {
@@ -39,6 +40,7 @@ type Runtime = {
   pending?: PendingAction;
   executing: Map<string, PendingAction>;
   step: number;
+  turnSerial: number;
   undeclaredBlocks: number;
   failed: string | null;
   heartbeat?: ReturnType<typeof setInterval>;
@@ -159,7 +161,7 @@ export default function (pi: ExtensionAPI) {
       || typeof loaded.capability.leaseTtlMs !== "number" || !Number.isSafeInteger(loaded.capability.leaseTtlMs)) {
       throw new Error("controller effective child capability is unavailable or malformed");
     }
-    runtime = { capability: loaded.capability, executing: new Map(), step: 0, undeclaredBlocks: 0, failed: null };
+    runtime = { capability: loaded.capability, executing: new Map(), step: 0, turnSerial: 0, undeclaredBlocks: 0, failed: null };
     // Align the model-visible surface with controller policy. The blocking hook
     // remains authoritative if a later trusted extension changes active tools.
     const allowed = new Set(loaded.capability.allowedTools);
@@ -178,6 +180,10 @@ export default function (pi: ExtensionAPI) {
     runtime.heartbeat.unref?.();
     (globalThis as any).__PI_BROKER_REPORT_TOOLS_READY?.();
   });
+
+  // The host emits this once per model response, before its tool calls. Assign
+  // one serial to the whole response; never infer progress from parallel results.
+  pi.on("turn_start", () => { if (runtime) runtime.turnSerial++; });
 
   pi.on("tool_call", async (event) => {
     if (event.toolName === DECLARATION_TOOL || event.toolName === CHECKPOINT_TOOL || RECURSIVE_TOOLS.has(event.toolName)) return undefined;
@@ -199,7 +205,8 @@ export default function (pi: ExtensionAPI) {
         });
         if (decision.status === "allowed" && decision.block !== true) {
           runtime.undeclaredBlocks = 0;
-          runtime.executing.set(event.toolCallId, { stepId, toolName: canonicalToolName, args: actual });
+          runtime.executing.set(event.toolCallId, { stepId, toolName: canonicalToolName, args: actual,
+            ...(runtime.turnSerial > 0 ? { modelTurnId: runtime.turnSerial } : {}) });
           return undefined;
         }
         return {
@@ -232,7 +239,8 @@ export default function (pi: ExtensionAPI) {
       });
       if (decision.status === "allowed" && decision.block !== true) {
         runtime.pending = undefined;
-        runtime.executing.set(event.toolCallId, { ...pending, args: actual });
+        runtime.executing.set(event.toolCallId, { ...pending, args: actual,
+          ...(runtime.turnSerial > 0 ? { modelTurnId: runtime.turnSerial } : {}) });
         return undefined;
       }
       if (decision.terminate === true) runtime.pending = undefined;
@@ -251,24 +259,28 @@ export default function (pi: ExtensionAPI) {
     const action = runtime.executing.get(event.toolCallId);
     if (!action) return undefined;
     runtime.executing.delete(event.toolCallId);
+    let terminalStatus: string | undefined;
     try {
       const decision = await controller<{ status?: string; terminate?: boolean }>("observeBehavioralResult", {
         toolName: action.toolName,
         args: action.args,
         result: resultProjection(event),
         isError: event.isError === true,
+        ...(action.modelTurnId === undefined ? {} : { modelTurnId: action.modelTurnId }),
       });
-      if (decision.terminate === true) {
-        runtime.failed = `broker behavioral monitor terminated run: ${safeReason(decision.status, "terminal")}`;
-        // This is after the tool finished. Abort prevents another model turn
-        // from using a terminal monitor state to issue further actions.
-        ctx.abort();
-      }
+      if (decision.terminate === true) terminalStatus = safeReason(decision.status, "terminated");
     } catch {
-      runtime.failed = "controller behavioral result observation was unavailable";
-      ctx.abort();
+      terminalStatus = "observation_unavailable";
     }
-    return undefined;
+    if (!terminalStatus) return undefined;
+    runtime.failed = `controller behavioral terminal: ${terminalStatus}`;
+    // Stop before another model turn, but retain a typed failure on the tool result.
+    // Otherwise Pi's generic AbortError falsely looks like a dead provider to the parent.
+    ctx.abort();
+    return { details: {
+      ...(event.details && typeof event.details === "object" && !Array.isArray(event.details) ? event.details : {}),
+      brokerGuardTerminal: { status: terminalStatus },
+    } };
   });
 
   pi.on("session_shutdown", async () => {

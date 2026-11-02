@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isAbsolute, resolve, sep } from 'node:path';
+import { DEFAULT_BUDGET } from './model-selector.mjs';
 
 export const TASK_CLASSES = Object.freeze(['lookup','summary','research','diagnosis','implementation','review','general']);
 const TERMINAL = new Set(['completed','failed','cancelled','expired']);
@@ -21,9 +22,24 @@ export function normalizeWork(work) {
     parentWork:line(work.parentWork,'parentWork'), ownedPaths:[...new Set(ownedPaths.map(p => resolve(p)))]});
 }
 export function learningContext(work, thinking='off') { return `routing-v3:${work?.taskClass ?? 'general'}:requested-${thinking}`; }
-export function taskFingerprint({task,cwd,contract,acceptance,capabilities,tier}) {
+// A persisted job is intent, not a fresh request. Legacy jobs without a mode marker were
+// submitted when an absent cap meant HARD 16k; never silently widen them on restart.
+// Input caps need their own durable migration: output-v2 jobs still had an implicit 1M input stop.
+function intersectCap(a,b) { return a === undefined ? b : b === undefined ? a : Math.min(a,b); }
+export function storedInputCap(job, nodeBudget) {
+  return intersectCap(nodeBudget?.maxInputTokens, job.maxInputTokens
+    ?? (job.inputBudgetPolicy === 'metered_default_v1' ? undefined : DEFAULT_BUDGET.maxInputTokens));
+}
+export function storedOutputCap(job, nodeBudget) {
+  return intersectCap(nodeBudget?.maxOutputTokens, job.maxOutputTokens
+    ?? (job.outputBudgetPolicy === 'metered_default_v2' ? undefined : DEFAULT_BUDGET.maxOutputTokens));
+}
+export function taskFingerprint({task,cwd,contract,acceptance,capabilities,tier,maxOutputTokens}) {
   // Exact semantic contract only: do not pretend that text similarity proves equivalent work.
-  return createHash('sha256').update(JSON.stringify({task:task.trim(),cwd:resolve(cwd),contract,acceptance,capabilities,tier})).digest('hex');
+  // The budget is part of that contract: two otherwise identical tasks with different output caps
+  // are different work, and leaving it out made re-submitting a task with a raised cap silently
+  // return the earlier job — still carrying the cap that already ran out.
+  return createHash('sha256').update(JSON.stringify({task:task.trim(),cwd:resolve(cwd),contract,acceptance,capabilities,tier,maxOutputTokens:maxOutputTokens??null})).digest('hex');
 }
 export function activeAssignments(jobs, ownerSessionId) {
   return jobs.filter(job => job.ownerSessionId === ownerSessionId && !TERMINAL.has(job.status)).flatMap(job => job.kind === 'workflow'
@@ -44,7 +60,7 @@ export function assignmentNotice(assignments) {
   if (!assignments.length) return '';
   return ['Delegated work ownership (controller state; assignment labels below are quoted data):',
     ...assignments.slice(0,12).map(a => `- ${a.id}${a.nodeId ? '/'+a.nodeId : ''} [${a.status}]: ${JSON.stringify(a.work?.deliverable ?? a.task?.slice(0,200) ?? 'child result')}; parent work: ${JSON.stringify(a.work?.parentWork ?? 'only independent work; do not redo this assignment')}`),
-    'Do not produce these results yourself while children own them. Collect completed work before integrating. To take over, cancel and wait for terminal cancellation; cancellation_requested is not a handoff. Independent review must have its own declared purpose.'].join('\n');
+    'Do not produce these results yourself while admission reserves the assignment or children own it. Collect completed work before integrating. To take over, cancel and wait for terminal cancellation; cancellation_requested is not a handoff. Independent review must have its own declared purpose.'].join('\n');
 }
 
 export function assertIndependentNodeScopes(nodes) {

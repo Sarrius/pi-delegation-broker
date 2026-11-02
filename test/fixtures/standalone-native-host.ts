@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {qualificationResponse} from './qualification-response.mjs';
 import {createAssistantMessageEventStream} from '@earendil-works/pi-ai';
 import {writeFileSync} from 'node:fs';
 
@@ -27,8 +28,10 @@ export default function standaloneNativeHost(pi:any) {
   streamSimple(model:any,_context:any,options:any) {
    const stream=createAssistantMessageEventStream();
    queueMicrotask(()=>{
-    childRequests++;
     options?.onResponse?.({status:200,headers:{'request-id':'standalone-fixture'}});
+    const qualification=qualificationResponse(_context);
+    if(qualification){emit(stream,model,qualification.content,qualification.reason);return;}
+    childRequests++;
     emit(stream,model,[{type:'text',text:'STANDALONE_CHILD_OK'}]);
    });
    return stream;

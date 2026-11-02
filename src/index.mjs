@@ -23,6 +23,7 @@ export {
   outcomeProperties,
 } from "./provider-protocol.mjs";
 export { capabilityTierId, catalogToBrokerRegistry, deriveModelSupports, fixtureCatalog } from "./provider-catalog.mjs";
+export { POOL_STATE_MAX_AGE_MS, cursorPoolFactsFromUsageState, readPoolFacts } from "./pool-state.mjs";
 export {
   createResourceModelResolver,
   createSelectContract,
@@ -119,8 +120,10 @@ export {
   classifyProviderProbe,
   isControllerProbeUrl,
   probeProviderModels,
+  probeServedModel,
   readCurrencyCache,
   retryAfterMs,
+  servedModelsFromCache,
   writeCurrencyCache,
 } from "./provider-probe.mjs";
 export { compileEffectiveChildCapability, createEffectiveChildCapability, deriveAllowedTools, canonicalDeclaredToolName } from "./capability-compiler.mjs";
@@ -136,7 +139,7 @@ export { SingleHostBrokerSupervisor } from "./supervisor.mjs";
 export { BrokeredLaunchResolver } from "./trusted-launch-resolver.mjs";
 export { DynamicProviderWatcher, activeAuthorizedProviders, activeCredentialToken, modelRegistryToProviderCatalog, readProviderRegistry } from "./dynamic-provider-watcher.mjs";
 export { BrokeredChildRunner, classifyChildFailure } from "./brokered-runner.mjs";
-export { spawnBrokeredChild, disposeBrokeredChildProcesses } from "./child-launcher.mjs";
+export { spawnBrokeredChild, disposeBrokeredChildProcesses, parentSettlementShouldReapBrokeredChildren } from "./child-launcher.mjs";
 export { Semaphore } from "./semaphore.mjs";
 export { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionError } from "./worktree.mjs";
 export { RecursiveAdmissionStore, normalizeRecursivePolicy } from "./recursive-admission.mjs";

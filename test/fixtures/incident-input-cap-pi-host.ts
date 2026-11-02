@@ -4,6 +4,7 @@
  * streamSimple that calls `delegate` without spending provider quota.
  */
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import {qualificationResponse,qualificationNormalizedEvents} from './qualification-response.mjs';
 import { DatabaseSync } from "node:sqlite";
 import { lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -153,6 +154,7 @@ export default function incidentInputCapPiHost(pi: ExtensionAPI) {
 
   const providerTransport = {
     async *stream(snapshot: unknown, context: { messages?: Array<{ role?: string }> }, options: { onSendStarted: () => void }) {
+      if(qualificationResponse(context)){options.onSendStarted();yield* qualificationNormalizedEvents(context);return;}
       dispatches += 1;
       if (!leaseSnapshot) leaseSnapshot = snapshotLease(home);
       const replay = context.messages?.some((message) => message.role === "toolResult");

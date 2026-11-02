@@ -27,7 +27,7 @@ function runProbe(home) {
   });
 }
 
-test("fresh parent extension observe path: incident used=804330 requested=236663 cap=1000000 stays metered and completes", { timeout: 120_000 }, async () => {
+test("fresh parent extension observe path: historical 804330/236663 workload is metered without an implicit cumulative input cap", { timeout: 120_000 }, async () => {
   const home = mkdtempSync("/tmp/ic-");
   const nodeModules = join(ROOT, "node_modules");
   const globalModules = "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules";
@@ -50,9 +50,9 @@ test("fresh parent extension observe path: incident used=804330 requested=236663
     const result = JSON.parse(stdout.trim().split("\n").at(-1));
     assert.equal(result.marker, "INCIDENT_PARENT_OK");
     assert.equal(result.dispatches, 2);
-    assert.deepEqual(result.leaseEnforcement, { input: "metered_best_effort", output: "hard" });
+    assert.deepEqual(result.leaseEnforcement, { input: "metered_best_effort", output: "unavailable" });
     assert.equal(result.resourceEnforcement.input, "hard");
-    assert.equal(result.maxInputTokens, 1_000_000);
+    assert.equal(result.maxInputTokens, null);
   } finally {
     rmSync(home, { recursive: true, force: true });
     for (const link of createdLinks) rmSync(link, { force: true });

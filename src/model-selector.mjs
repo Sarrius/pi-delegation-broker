@@ -24,7 +24,7 @@
 import { preferenceMatches, taskModelTier } from "./model-preferences.mjs";
 import { meetsQualityFloor, qualityForModel, QUALITY_TIERS } from "./model-quality-catalog.mjs";
 import { apexAdmissionAllows, apexAdmissionKind } from "./apex-admission.mjs";
-import { evaluateRouteEligibility, modelPolicyGeneration } from "./model-provenance-policy.mjs";
+import { baseRouteProvider, evaluateRouteEligibility, modelPolicyGeneration } from "./model-provenance-policy.mjs";
 
 const CONFIDENCE_RANK = Object.freeze({ measured: 0, observed: 1, assumed: 2 });
 const OPERATION_CLASSES = Object.freeze(new Set(["observe", "propose_patch", "apply", "external_write"]));
@@ -43,8 +43,11 @@ const DEFAULT_LATENCY_BUDGET_MS = 120_000;
 // canonical UTF-8 bytes are the only safe pre-send upper bound, but routinely overstate English
 // JSON by 4-6x. Read-only work therefore defaults to metered_best_effort input: it may overshoot
 // by at most one controller-bounded request, then terminates. Effect-capable work keeps the strict
-// byte-safe hard reservation because false denial is preferable to unbounded effects.
-const DEFAULT_BUDGET = Object.freeze({ maxInputTokens: 1_000_000, maxOutputTokens: 16_000, maxAttempts: 8 });
+// byte-safe hard reservation because false denial is preferable to unbounded effects. A default
+// 16k cumulative *output* cap previously killed ordinary read-only audits after useful model
+// turns; leave output uncapped cumulatively unless the caller actually declares a hard cap.
+// The 16k value remains the bounded per-request hint and the effect-capable default safety cap.
+export const DEFAULT_BUDGET = Object.freeze({ maxInputTokens: 1_000_000, maxOutputTokens: 16_000, maxAttempts: 8 });
 
 /**
  * Keyword evidence for each capability beyond plain text generation. Matching is intentionally
@@ -62,7 +65,10 @@ const CAPABILITY_EVIDENCE = Object.freeze([
   }),
   Object.freeze({
     capability: "vision_input",
-    pattern: /\b(image|screenshot|screen shot|photo|picture|diagram|chart|figure|visual|ocr|mockup|design)\b/i,
+    // Broad words such as "design", "diagram" or "chart" frequently describe text-only
+    // architecture work. Requiring vision for those words stranded healthy text-only routes.
+    // Callers with an actual image can always request vision_input explicitly.
+    pattern: /\b(image|screenshot|screen shot|photo|picture|ocr)\b/i,
   }),
 ]);
 
@@ -130,10 +136,9 @@ function availabilityIndex(availability) {
   return index;
 }
 
-function usable(resourceId, live, { now, requiresHardBudget, resourceConfidence, groupConfidence }) {
-  // Mirrors the broker's own admission checks so the selector does not propose a class the
-  // broker will immediately refuse.
-  if (requiresHardBudget && (resourceConfidence === "assumed" || groupConfidence === "assumed")) return false;
+function usable(resourceId, live, { now, requireObservedInventory, resourceConfidence, groupConfidence }) {
+  // Trustworthy route evidence is required regardless of whether the caller chose a token cap.
+  if (requireObservedInventory && (resourceConfidence === "assumed" || groupConfidence === "assumed")) return false;
   if (live === undefined) return true;
   if (live.retiring === true || live.retiring === 1) return false;
   if (live.state !== undefined && live.state !== "healthy" && live.state !== "unknown") return false;
@@ -154,9 +159,9 @@ function usable(resourceId, live, { now, requiresHardBudget, resourceConfidence,
  * measure the controller does own — tokens, latency and attempts — and once verified receipts
  * exist the learned ranker overrides this ordering anyway.
  */
-function qualityFit(resource, id, modelTier) {
+function qualityFit(resource, id, modelTier, generation) {
   const identity = resource?.model ?? parseResourceModel(id);
-  const quality = identity && qualityForModel(identity);
+  const quality = identity && qualityForModel({ ...identity, generation });
   if (quality === undefined) return Number.POSITIVE_INFINITY;
   return Math.abs(QUALITY_TIERS[quality] - (QUALITY_TIERS[modelTier] ?? QUALITY_TIERS.standard));
 }
@@ -179,6 +184,35 @@ function currencyIndex(currency) {
   return index;
 }
 
+/**
+ * Live pool pressure for providers that meter several independent pools under one account.
+ *
+ * The facts come from pi-multi-account's usage snapshots (see pool-state.mjs). This is a
+ * capacity rule, not a quota forecast: a subscription pool is prepaid, so a lease started at the
+ * very top of a pool buys a likely 429 and — worse — a capacity-group cooldown that would bench
+ * everything else drawing on the same account. The threshold is deliberately high; a missing
+ * fact means "no evidence" and changes nothing.
+ */
+export const POOL_PRESSURE_PERCENT = 98;
+
+function poolIndex(pools) {
+  const index = new Map();
+  if (pools === undefined || pools === null) return index;
+  for (const [id, fact] of Object.entries(pools)) {
+    if (fact && typeof fact === "object") index.set(id, fact);
+  }
+  return index;
+}
+
+/** A pool at/over the pressure line with its reset still ahead must not take new work. */
+export function poolBlocksWork(fact, now = Date.now()) {
+  if (!fact || typeof fact !== "object") return false;
+  const usedPercent = Number(fact.usedPercent);
+  const resetAt = Number(fact.resetAt);
+  return Number.isFinite(usedPercent) && usedPercent >= POOL_PRESSURE_PERCENT
+    && Number.isFinite(resetAt) && resetAt > now;
+}
+
 function rankResources(entries, learnedRanker, capabilities, modelTier, rankingOptions) {
   const baseline = [...entries].sort((left, right) => {
     const confidence = (CONFIDENCE_RANK[left.resource.confidence] ?? 3) - (CONFIDENCE_RANK[right.resource.confidence] ?? 3);
@@ -187,8 +221,9 @@ function rankResources(entries, learnedRanker, capabilities, modelTier, rankingO
     // routing all entries are current already, so this is a no-op.
     const generation = (left.generation ?? 0) - (right.generation ?? 0);
     if (generation !== 0) return generation;
-    const fit = qualityFit(left.resource, left.id, modelTier) - qualityFit(right.resource, right.id, modelTier);
-    if (fit !== 0) return fit;
+    const leftFit = qualityFit(left.resource, left.id, modelTier, left.generation);
+    const rightFit = qualityFit(right.resource, right.id, modelTier, right.generation);
+    if (leftFit !== rightFit) return leftFit - rightFit;
     return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
   });
   if (typeof learnedRanker !== "function") return baseline;
@@ -218,9 +253,17 @@ function candidateProfiles(registry, required) {
 }
 
 function buildBudget(constraints, { effectCapable = false } = {}) {
-  const budget = { ...DEFAULT_BUDGET, ...(constraints.budget ?? {}) };
-  // Token consumption is enforceable: the controller caps input and clamps the child's output
-  // request. Money is not — no provider exposes a synchronous spend ledger, and subscription
+  const requested = constraints.budget ?? {};
+  for (const field of ["maxInputTokens", "maxOutputTokens"]) {
+    if (requested[field] !== undefined && (!Number.isSafeInteger(requested[field]) || requested[field] < 1)) {
+      throw new Error(`${field} must be a positive safe integer`);
+    }
+  }
+  const budget = { ...DEFAULT_BUDGET, ...requested };
+  const explicitInputCap = Object.hasOwn(requested, "maxInputTokens");
+  const explicitOutputCap = Object.hasOwn(requested, "maxOutputTokens");
+  // Declared token caps and effect safety defaults are enforced; ordinary read-only work meters
+  // usage without invented cumulative input/output stops. Money is not — no provider exposes a synchronous spend ledger, and subscription
   // accounts have no per-request price at all. The prior money cap asked resources for a
   // guarantee none could honestly declare, which left the effect path unroutable on the real
   // fleet. What protects an effect is the blocking behavioral monitor, pinned extension
@@ -232,20 +275,18 @@ function buildBudget(constraints, { effectCapable = false } = {}) {
   if (Object.hasOwn(budget, "maxCostMicros") || Object.hasOwn(constraints.budget?.enforcement ?? {}, "cost")) {
     throw new Error("money budgets are not supported; constrain input/output tokens and learn efficiency from verified outcomes");
   }
-  const enforcement = constraints.budget?.enforcement ?? {
+  const enforcement = requested.enforcement ?? {
     input: effectCapable ? "hard" : "metered_best_effort",
-    output: "hard",
+    output: effectCapable || explicitOutputCap ? "hard" : "unavailable",
   };
   return Object.freeze({
-    ...(Number.isSafeInteger(budget.maxInputTokens) ? { maxInputTokens: budget.maxInputTokens } : {}),
-    ...(Number.isSafeInteger(budget.maxOutputTokens) ? { maxOutputTokens: budget.maxOutputTokens } : {}),
+    ...((effectCapable || explicitInputCap || enforcement.input === "hard") && Number.isSafeInteger(budget.maxInputTokens)
+      ? { maxInputTokens: budget.maxInputTokens } : {}),
+    ...((effectCapable || explicitOutputCap || enforcement.output === "hard") && Number.isSafeInteger(budget.maxOutputTokens)
+      ? { maxOutputTokens: budget.maxOutputTokens } : {}),
     maxAttempts: budget.maxAttempts,
     enforcement: Object.freeze({ ...enforcement }),
   });
-}
-
-function requiresHardBudget(budget) {
-  return Object.values(budget.enforcement ?? {}).includes("hard");
 }
 
 /**
@@ -255,7 +296,7 @@ function requiresHardBudget(budget) {
  * `{action:"deny", reason}`. `alternatives` lists the remaining ranked classes so a caller that
  * hits `denied_capacity` can retry one tier up without re-deriving the requirement.
  */
-export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, currency, preferences, learnedRanker, enforceQuality = false, enforceProvenance = false, now } = {}) {
+export function selectModelForTask({ taskDescription, registry, constraints = {}, availability, currency, pools, preferences, learnedRanker, enforceQuality = false, enforceProvenance = false, now } = {}) {
   if (!registry?.profiles || !registry?.resources) throw new Error("selectModelForTask requires a broker registry");
   if (constraints !== undefined && (typeof constraints !== "object" || constraints === null || Array.isArray(constraints))) {
     throw new Error("selectModelForTask constraints must be an object");
@@ -266,14 +307,19 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
   const budget = buildBudget(admissionMode === "rescue" ? {
     ...constraints, budget: { ...constraints.budget, maxAttempts: Math.min(constraints.budget?.maxAttempts ?? 2, 2) },
   } : constraints, { effectCapable: requirement.effectCapable });
-  const hardBudget = requiresHardBudget(budget);
+  // Route evidence is independent of output budgeting: removing an implicit hard cap must
+  // never admit an assumed account that the old default would have rejected.
+  const requireObservedInventory = true;
   const live = availabilityIndex(availability);
   const currencyLookup = currencyIndex(currency);
+  const poolLookup = poolIndex(pools);
+  const evaluationNow = Number.isFinite(now) ? now : Date.now();
   const excluded = new Set(Array.isArray(constraints.excludeResources) ? constraints.excludeResources : []);
-  // An exact identity request (route=inherit_model) narrows the candidate set and nothing else.
-  // It is applied beside every other gate, never instead of one: a model that is legacy,
-  // wrongly provenanced, unhealthy or below the quality floor stays rejected when named.
+  // An inherited identity pins the model and subscription family, not one account slot. Account
+  // aliases are interchangeable capacity for the same model; pinning account-7 here made a dead
+  // slot strand work even while account-2…6 were live. Every other gate still applies normally.
   const requiredIdentity = constraints.requireModelIdentity;
+  const allowSiblingAccounts = constraints.allowSiblingAccounts === true;
   if (requiredIdentity !== undefined
     && (typeof requiredIdentity?.provider !== "string" || typeof requiredIdentity?.modelId !== "string")) {
     throw new Error("constraints.requireModelIdentity must be {provider, modelId}");
@@ -289,6 +335,7 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
   const preferenceEntries = preferences?.tiers?.[modelTier] ?? [];
 
   let sawLegacy = false;
+  let poolExcluded = false;
   const buildTiers = (includeLegacy, userOnly = false) => {
     const tiers = [];
     for (const profile of profiles) {
@@ -302,7 +349,10 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         if (quality === "apex" && !apexAdmissionAllows(constraints.apexAdmission, identity, taskDescription)) continue;
         if (admissionMode && (quality !== "apex" || !apexAdmissionAllows(constraints.apexAdmission, identity, taskDescription))) continue;
         if (requiredIdentity
-          && (identity?.provider !== requiredIdentity.provider || identity?.modelId !== requiredIdentity.modelId)) continue;
+          && ((allowSiblingAccounts
+            ? baseRouteProvider(identity?.provider) !== baseRouteProvider(requiredIdentity.provider)
+            : identity?.provider !== requiredIdentity.provider)
+            || identity?.modelId !== requiredIdentity.modelId)) continue;
         const explicitlyAllowed = Boolean(admissionMode === "owner_primary"
           || (userOnly && identity && preferenceMatches(preferenceEntries, identity)));
         if (userOnly && !explicitlyAllowed) continue;
@@ -327,10 +377,16 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         const group = registry.capacityGroups?.[resource.capacityGroup];
         if (!usable(id, live.get(id), {
           now,
-          requiresHardBudget: hardBudget,
+          requireObservedInventory,
           resourceConfidence: resource.confidence,
           groupConfidence: group?.confidence,
         })) continue;
+        // A prepaid pool at the top of its allowance is not capacity; ending here is what keeps
+        // one pool's exhaustion from spending a sibling pool's cooldown on the same account.
+        if (resource.pool && poolBlocksWork(poolLookup.get(resource.pool), evaluationNow)) {
+          poolExcluded = true;
+          continue;
+        }
         entries.push({ id, resource, generation: fact?.generation, provenance });
       }
       if (entries.length === 0) continue;
@@ -342,6 +398,17 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
         capacityGroups: Object.freeze([...new Set(entries.map((entry) => entry.resource.capacityGroup))]),
         resources: Object.freeze(rankResources(entries, userOnly || admissionMode ? undefined : learnedRanker, requirement.capabilities, modelTier, {context: constraints.learningContext})
           .sort((left, right) => {
+            // inherit_model means “use what is demonstrably working for the parent”, then keep
+            // sibling subscription accounts as recovery capacity. Alphabetic slot ordering sent
+            // an account-5 parent to stale account-2/3 and spent both bounded attempts on 429s.
+            if (requiredIdentity && allowSiblingAccounts) {
+              const exactRank = (entry) => {
+                const model = entry.resource.model ?? parseResourceModel(entry.id);
+                return model?.provider === requiredIdentity.provider ? 0 : 1;
+              };
+              const inheritedOrder = exactRank(left) - exactRank(right);
+              if (inheritedOrder !== 0) return inheritedOrder;
+            }
             if (!admissionMode) return 0;
             const anchor = constraints.apexAnchor ?? { modelId: "gpt-6-astra" };
             const priority = (entry) => {
@@ -384,11 +451,10 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
   }
 
   if (tiers.length === 0) {
+    if (requiredIdentity) return deny("inherited model has no current eligible account route");
     if (enforceProvenance && preferenceEntries.length > 0) return deny("explicit model pool has no current eligible route");
     if (enforceProvenance) return deny("no current subscription native resource serves the required capabilities");
-    return deny(hardBudget
-      ? "no live resource with measured or observed inventory serves the required capabilities"
-      : "no live resource serves the required capabilities");
+    return deny("no live resource with measured or observed inventory serves the required capabilities");
   }
 
   let chosen = tiers[0];
@@ -448,6 +514,9 @@ export function selectModelForTask({ taskDescription, registry, constraints = {}
       // Inform the controller that at least one otherwise compatible route was deliberately
       // excluded for currency. This is diagnostic provenance, never a reason to revive it.
       ...(sawLegacy ? { legacyExcluded: true } : {}),
+      // Same visibility for pool pressure: the exclusion is a capacity fact, not a quality or
+      // provenance verdict, and the route becomes usable again at the pool's reset.
+      ...(poolExcluded ? { poolExcluded: true } : {}),
       ...(legacyFallback ? { legacyFallback: true } : {}),
     }),
     alternatives: Object.freeze(tiers.slice(1)),
@@ -535,11 +604,12 @@ function defaultDoneWhen(operationClass) {
  * The callback reads only `request.capabilityRequest`, never a prompt: the resolver contract is
  * that a launch request carries no raw task text.
  */
-export function createSelectContract({ registry, availability, currency, preferences, learnedRanker, enforceQuality = false, enforceProvenance = false, constraints = {}, now = () => Date.now() } = {}) {
+export function createSelectContract({ registry, availability, currency, pools, preferences, learnedRanker, enforceQuality = false, enforceProvenance = false, constraints = {}, now = () => Date.now() } = {}) {
   if (registry === undefined) throw new Error("createSelectContract requires a registry or a registry provider");
   const readRegistry = typeof registry === "function" ? registry : () => registry;
   const readAvailability = typeof availability === "function" ? availability : () => availability;
   const readCurrency = typeof currency === "function" ? currency : () => currency;
+  const readPools = typeof pools === "function" ? pools : () => pools;
   const readPreferences = typeof preferences === "function" ? preferences : () => preferences;
   if (learnedRanker !== undefined && typeof learnedRanker !== "function") throw new Error("createSelectContract learnedRanker must be a function");
 
@@ -556,6 +626,7 @@ export function createSelectContract({ registry, availability, currency, prefere
       registry: readRegistry(),
       availability: readAvailability(),
       currency: readCurrency(),
+      pools: readPools(),
       preferences: readPreferences(),
       learnedRanker,
       enforceQuality,

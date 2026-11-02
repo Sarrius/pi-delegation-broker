@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fixtureContract, fixtureRegistry } from "../src/broker.mjs";
 import { ControllerEvidenceStore } from "../src/evidence.mjs";
+import { createControllerAcceptancePlan } from "../src/acceptance-plan.mjs";
+import { ControllerAcceptanceVerifier } from "../src/acceptance-verifier.mjs";
 import { createSelectContract } from "../src/model-selector.mjs";
 import { catalogToBrokerRegistry } from "../src/provider-catalog.mjs";
 import { ControllerQueuedTaskVerifier, ControllerVerificationAuthority } from "../src/verification-authority.mjs";
@@ -19,7 +21,7 @@ const CONTROLLER_TOKEN = "r".repeat(48);
 const EXTENSION_PATH = new URL("./isolated-fake-provider.ts", import.meta.url).pathname;
 const BEHAVIORAL_EXTENSION_PATH = new URL("../extensions/pi-behavioral-enforcement.ts", import.meta.url).pathname;
 
-function signedSupervisor(root, registry = fixtureRegistry(), verificationReceiptVerifier) {
+function signedSupervisor(root, registry = fixtureRegistry(), verificationReceiptVerifier, sweepIntervalMs = 100) {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const now = Date.now();
   const payload = { registryVersion: "resolver-v1", issuedAt: now - 1_000, expiresAt: now + 60_000, ...registry };
@@ -29,7 +31,7 @@ function signedSupervisor(root, registry = fixtureRegistry(), verificationReceip
     signedRegistry: { ...unsigned, signature: sign(null, signedRegistryMessage(unsigned), privateKey).toString("base64url") },
     trustedRegistryKeys: { "resolver-key": publicKey.export({ type: "spki", format: "pem" }) },
     controllerToken: CONTROLLER_TOKEN,
-    sweepIntervalMs: 100,
+    sweepIntervalMs,
     ...(verificationReceiptVerifier === undefined ? {} : { verificationReceiptVerifier }),
   });
 }
@@ -59,6 +61,193 @@ function resolverFor(supervisor, root, selectContract, launcherAttestationConfig
     ...(refreshProviderState === undefined ? {} : { refreshProviderState }),
   });
 }
+
+function gate() { let open; const promise=new Promise(resolve=>{open=resolve;}); return {promise,open}; }
+
+test('cold qualification is enforced before the first real lease and cannot be bypassed by caller data',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'br-qualified-')),supervisor=signedSupervisor(root);let checks=0,ready=false;
+ try {
+  await supervisor.start();
+  const resolver=new BrokeredLaunchResolver({socketPath:supervisor.socketPath,controllerToken:supervisor.controllerToken,
+   agentRoot:join(root,'children'),extensionPaths:[EXTENSION_PATH],offline:true,
+   selectContract:input=>input.capabilityRequest?.excludeResources?.includes('R1')?{action:'deny',reason:'no qualified routes'}:
+     {expectedModel:MODEL,contract:fixtureContract({capability:{...fixtureContract().capability,allowedResources:['R1']}})},
+   routePreflight:async()=>({status:'ready'}),qualifyRoute:async input=>{
+    checks++;assert.equal(input.fresh,true);assert.equal(supervisor.auditSnapshot().leases.length,0);
+    return {status:ready?'verified':'failed'};
+   },
+  });
+  const preview=await resolver.preview(request('preview'));assert.equal(preview.status,'compatible_quota_unknown');assert.equal(checks,0);
+  assert.equal((await resolver.resolve({...request('cold'),capabilityRequest:{qualified:true,skipReadiness:true}})).action,'deny');
+  assert.equal(supervisor.auditSnapshot().leases.length,0);assert.equal(checks,1);
+  ready=true;const allowed=await resolver.resolve(request('warm'));assert.equal(allowed.action,'allow');assert.equal(checks,2);
+  await allowed.policy.onBeforeChildAbandoned();
+ } finally {await supervisor.stop();rmSync(root,{recursive:true,force:true});}
+});
+
+test("duplicate child IDs are excluded during selection/provisioning and stale callbacks cannot release a replacement", {timeout:5000}, async () => {
+  const root=mkdtempSync(join(tmpdir(),'br-id-race-')), supervisor=signedSupervisor(root);
+  const selecting=gate(), selectGate=gate(), provisioning=gate(), provisionGate=gate();
+  let count=0, first, resolver;
+  try {
+    await supervisor.start();
+    resolver=new BrokeredLaunchResolver({socketPath:supervisor.socketPath,controllerToken:supervisor.controllerToken,
+      agentRoot:join(root,'child-agents'),extensionPaths:[EXTENSION_PATH],offline:true,
+      selectContract:async input=>{const number=++count;if(number===1){selecting.open();await selectGate.promise;}
+        return {expectedModel:MODEL,contract:fixtureContract({taskId:`task-${input.childId}-${number}`})};},
+      provisionChildAuth:async ({contract})=>{if(contract.taskId.endsWith('-1')){provisioning.open();await provisionGate.promise;}},
+    });
+    const denied={action:'deny',reason:'duplicate child admission'};
+    const leases=()=>supervisor.auditSnapshot().leases.map(x=>x.leaseId);
+    first=resolver.resolve(request('same_id'));await selecting.promise;
+    assert.deepEqual(await resolver.resolve(request('same_id')),denied);assert.equal(count,1);assert.deepEqual(leases(),[]);
+    selectGate.open();await provisioning.promise;
+    assert.deepEqual(await resolver.resolve(request('same_id')),denied);assert.equal(count,1);assert.equal(leases().length,1);
+    provisionGate.open();const owner=await first;assert.equal(owner.action,'allow');
+    const oldLease=owner.policy.environment.PI_BROKER_LEASE_ID;
+    assert.deepEqual(leases(),[oldLease]);await owner.policy.onBeforeChildAbandoned();assert.deepEqual(leases(),[]);
+    const replacement=await resolver.resolve(request('same_id'));assert.equal(replacement.action,'allow');
+    const newLease=replacement.policy.environment.PI_BROKER_LEASE_ID;assert.notEqual(newLease,oldLease);
+    await owner.policy.onChildSessionOpened();await owner.policy.onBeforeChildAbandoned();await owner.policy.onChildSessionClosed({status:'completed'});
+    assert.deepEqual(leases(),[newLease]);assert.equal(resolver.admissions()[0].phase,'pending_handoff');
+    assert.equal(existsSync(replacement.policy.agentDir),true);
+    await replacement.policy.onBeforeChildAbandoned();assert.deepEqual(leases(),[]);
+  } finally {selectGate.open();provisionGate.open();await first?.catch(()=>{});await resolver?.releaseUnhanded('same_id').catch(()=>{});await supervisor.stop();rmSync(root,{recursive:true,force:true});}
+});
+
+for(const fault of ['deny','selector','provision']) test(`child ID is reusable after ${fault} failure`,async()=>{
+ const root=mkdtempSync(join(tmpdir(),'br-id-failure-')),supervisor=signedSupervisor(root);let calls=0;
+ try{
+  await supervisor.start();
+  const resolver=new BrokeredLaunchResolver({socketPath:supervisor.socketPath,controllerToken:supervisor.controllerToken,
+   agentRoot:join(root,'children'),extensionPaths:[EXTENSION_PATH],offline:true,
+   selectContract:()=>{calls++;if(calls===1&&fault==='deny')return {action:'deny',reason:'fixture'};
+    if(calls===1&&fault==='selector')throw new Error('selector fixture');return {expectedModel:MODEL,contract:fixtureContract()};},
+   provisionChildAuth:()=>{if(calls===1&&fault==='provision')throw new Error('provision fixture');},
+  });
+  if(fault==='deny')assert.equal((await resolver.resolve(request('retry'))).action,'deny');
+  else await assert.rejects(resolver.resolve(request('retry')),/fixture/);
+  assert.deepEqual(resolver.admissions(),[]);assert.equal(supervisor.auditSnapshot().leases.length,0);
+  const retry=await resolver.resolve(request('retry'));assert.equal(retry.action,'allow');
+  await retry.policy.onBeforeChildAbandoned();assert.equal(supervisor.auditSnapshot().leases.length,0);
+ }finally{await supervisor.stop();rmSync(root,{recursive:true,force:true});}
+});
+
+test("route preview checks the exact controller path without allocating a lease or child", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-preview-"));
+  const supervisor = signedSupervisor(root);
+  let refreshed = 0, checked = 0, routeAvailable = true;
+  try {
+    await supervisor.start();
+    const selectContract = (input) => ({
+      expectedModel: MODEL,
+      contract: fixtureContract({ taskId: `task-${input.childId}` }),
+    });
+    const ready = resolverFor(supervisor, root, selectContract, undefined, [EXTENSION_PATH], undefined,
+      async ({ resourceId }) => { checked++; assert.equal(resourceId, `${MODEL.provider}/${MODEL.modelId}`); return { status: routeAvailable ? "ready" : "unavailable", reason: "endpoint offline" }; },
+      async () => { refreshed++; });
+    const compatible = await ready.preview(request("preview-ready"));
+    assert.equal(compatible.status, "compatible_quota_unknown");
+    assert.deepEqual(compatible.resourceIds, [`${MODEL.provider}/${MODEL.modelId}`]);
+    assert.equal(compatible.budgetSufficiency, "unknown");
+    assert.equal(compatible.reserved, false);
+    assert.equal(refreshed, 1);
+    assert.equal(checked, 1);
+    assert.equal(supervisor.auditSnapshot().leases.length, 0);
+    assert.equal(ready.admissions().length, 0);
+    assert.equal(existsSync(join(root, "child-agents", "preview-ready")), false);
+    routeAvailable = false;
+    const changedRoute = await ready.resolve(request("preview-ready"));
+    assert.equal(changedRoute.action, "deny", "preview is not authorization; launch rechecks the route");
+    assert.equal(supervisor.auditSnapshot().leases.length, 0);
+    assert.equal(existsSync(join(root, "child-agents", "preview-ready")), false);
+
+    const dead = resolverFor(supervisor, root, selectContract, undefined, [EXTENSION_PATH], undefined,
+      async () => ({ status: "unavailable", reason: "endpoint offline" }));
+    const unavailable = await dead.preview(request("preview-dead"));
+    assert.equal(unavailable.status, "unavailable_now");
+    assert.equal(unavailable.reserved, false);
+    assert.equal(supervisor.auditSnapshot().leases.length, 0);
+    assert.equal(dead.admissions().length, 0);
+    assert.equal(existsSync(join(root, "child-agents", "preview-dead")), false);
+
+    const withoutExactRoute = resolverFor(supervisor, root, selectContract);
+    assert.equal((await withoutExactRoute.preview(request("preview-legacy"))).status, "indeterminate",
+      "a catalog-only route cannot be reported ready");
+    const preflightError = resolverFor(supervisor, root, selectContract, undefined, [EXTENSION_PATH], undefined,
+      async () => { throw new Error("controller route resolution failed"); });
+    assert.equal((await preflightError.preview(request("preview-error"))).status, "indeterminate");
+    const invalidModel = { ...request("preview-unfit"), model: { provider: "wrong", modelId: "model" } };
+    assert.equal((await ready.preview(invalidModel)).status, "known_unfit");
+    assert.equal(supervisor.auditSnapshot().leases.length, 0);
+  } finally {
+    await supervisor.stop().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("routing observer runs only after a real child handoff, never preview or pre-handoff failure", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-route-shadow-"));
+  const supervisor = signedSupervisor(root);
+  const resourceId = "R1";
+  const observations = [];
+  try {
+    await supervisor.start();
+    const selectContract = (input) => ({
+      expectedModel: MODEL,
+      contract: fixtureContract({ taskId: `task-${input.childId}`,
+        capability: { ...fixtureContract().capability, allowedResources: [resourceId] } }),
+      selection: { resourceId, policyGeneration: "fixture-v1" },
+      tier: { resources: [{ resourceId, model: MODEL }] },
+    });
+    const observeAdmittedRoute = (snapshot) => { observations.push(snapshot); return Promise.reject(new Error("observer failure")); };
+    const resolver = new BrokeredLaunchResolver({
+      socketPath: supervisor.socketPath, controllerToken: supervisor.controllerToken,
+      agentRoot: join(root, "child-agents"), extensionPaths: [EXTENSION_PATH], offline: true,
+      resolveModelForResource: () => MODEL,
+      routePreflight: async ({resourceId: candidate}) => ({ status: candidate === resourceId ? "ready" : "unavailable" }),
+      selectContract, observeAdmittedRoute,
+    });
+    await resolver.preview(request("shadow-preview"));
+    assert.equal(observations.length, 0);
+    const abandoned = await resolver.resolve(request("shadow-unopened"));
+    assert.equal(abandoned.action, "allow");
+    await abandoned.policy.onBeforeChildAbandoned("fixture");
+    assert.equal(observations.length, 0);
+    const child = await resolver.resolve({ ...request("shadow-opened"), capabilityRequest: {
+      taskDescription: "A bounded review brief", routingRouteMode: "auto", routingThinkingMode: "auto",
+      routingRequestedThinking: "off", routingTaskClass: "review", routingBriefComplete: true,
+    } });
+    assert.equal(child.action, "allow");
+    assert.equal(observations.length, 0);
+    assert.equal((await child.policy.onChildSessionOpened()).status, "handed");
+    assert.equal((await child.policy.onChildSessionOpened()).status, "handed");
+    assert.equal(observations.length, 1, "one-shot optional observer cannot multiply inference calls");
+    assert.equal(observations[0].task, "A bounded review brief");
+    assert.deepEqual(observations[0].resourceIds, [resourceId]);
+    await child.policy.onChildSessionClosed({ status: "failed" });
+    assert.equal(supervisor.auditSnapshot().leases.length, 0);
+    const incompleteBrief = await resolver.resolve({ ...request("shadow-role-hidden"), capabilityRequest: {
+      taskDescription: "Task omits separate role/skills", routingRouteMode: "auto", routingThinkingMode: "auto",
+      routingRequestedThinking: "off", routingTaskClass: "review", routingBriefComplete: false,
+    } });
+    assert.equal(incompleteBrief.action, "allow", "a partial shadow brief must not block ordinary work");
+    await incompleteBrief.policy.onChildSessionOpened();
+    assert.equal(observations.length, 1, "incomplete routing context must not be exported as full child task");
+    await incompleteBrief.policy.onChildSessionClosed({ status: "failed" });
+    const legacy = new BrokeredLaunchResolver({
+      socketPath: supervisor.socketPath, controllerToken: supervisor.controllerToken,
+      agentRoot: join(root, "child-agents"), extensionPaths: [EXTENSION_PATH], offline: true,
+      resolveModelForResource: () => MODEL, selectContract, observeAdmittedRoute,
+    });
+    const unverified = await legacy.resolve(request("shadow-unverified"));
+    assert.equal(unverified.action, "allow", "absence of exact preflight must not break ordinary delegation");
+    await unverified.policy.onChildSessionOpened();
+    assert.equal(observations.length, 1, "a no-preflight route is not a verified candidate snapshot for Jev");
+    await unverified.policy.onChildSessionClosed({ status: "failed" });
+    assert.equal(supervisor.auditSnapshot().leases.length, 0);
+  } finally { await supervisor.stop(); rmSync(root, { recursive: true, force: true }); }
+});
 
 test("controller resolver admits a matching child with only scoped policy data and releases pre-handoff failure", async () => {
   const root = mkdtempSync(join(tmpdir(), "br-"));
@@ -150,6 +339,46 @@ test("controller resolver preserves and safely reconciles a release after contro
   }
 });
 
+test("exact final read-only answer determines verifier outcome and routing label", async () => {
+  const root=mkdtempSync(join(tmpdir(),"br-answer-"));
+  const evidenceStore=new ControllerEvidenceStore({root:join(root,"evidence")});
+  const authority=new ControllerVerificationAuthority({evidenceStore});
+  const plans=new Map();
+  const outcomes=[];
+  let supervisor;
+  const verifier=new ControllerQueuedTaskVerifier({authority,
+    createVerifier:async({taskId,observedText})=>{
+      const plan=plans.get(taskId);
+      return new ControllerAcceptanceVerifier({evidenceStore,checks:plan.checks,
+        runCheck:(check,options)=>plan.runCheck(check,{...options,observedText})});
+    },
+    finalize:({taskId,leaseId,fencingToken,verification})=>requestBrokerIpc({
+      socketPath:supervisor.socketPath,authorization:supervisor.controllerToken,
+      method:"finalizeVerifiedTask",params:{taskId,leaseId,fencingToken,verification},
+    }),
+    onFinalized:(event)=>{outcomes.push([event.taskId,event.verification.status,event.outcome.status]);},
+  });
+  supervisor=signedSupervisor(root,fixtureRegistry(),(receipt,binding)=>authority.verify(receipt,binding));
+  try {
+    await supervisor.start();
+    for(const [index,text,expected] of [[1,"wrong final answer","rejected"],[2,"RIGHT","accepted"],[3,undefined,"rejected"]]) {
+      const taskId=`answer-task-${index}`;
+      const contract=fixtureContract({taskId});
+      plans.set(taskId,createControllerAcceptancePlan([{id:"answer-equals",content:"RIGHT"}],{cwd:root,taskMode:"observe"}));
+      const resolver=resolverFor(supervisor,root,()=>({expectedModel:MODEL,contract}),undefined,undefined,verifier);
+      const decision=await resolver.resolve(request(`child-answer-${index}`));
+      assert.equal(decision.action,"allow");
+      await decision.policy.onChildSessionOpened();
+      assert.deepEqual(await decision.policy.trackForVerification(),{status:"tracked"});
+      const result=await decision.policy.onChildSessionClosed({status:"completed",...(text===undefined?{}:{text})});
+      assert.equal(result.verification.verification.status,expected);
+      assert.equal(result.verification.outcome.status,expected==="accepted"?"completed":"failed");
+      assert.equal(supervisor.auditSnapshot().pendingTasks.at(-1).state,expected==="accepted"?"completed":"failed");
+    }
+    assert.deepEqual(outcomes.map(value=>value.slice(1)),[["rejected","failed"],["accepted","completed"],["rejected","failed"]]);
+  } finally {await supervisor.stop().catch(()=>undefined);rmSync(root,{recursive:true,force:true});}
+});
+
 test("controller resolver claims an exact ready task, requeues pre-handoff failure, and runs controller verification before completion", async () => {
   const root = mkdtempSync(join(tmpdir(), "br-q-"));
   const registry = fixtureRegistry();
@@ -184,7 +413,9 @@ test("controller resolver claims an exact ready task, requeues pre-handoff failu
       return { status: "recorded" };
     },
   });
-  supervisor = signedSupervisor(root, registry, (receipt, binding) => authority.verify(receipt, binding));
+  // This test dispatches explicitly; a background sweep racing those assertions makes the
+  // same correct state transition intermittently disappear from dispatchPending's return.
+  supervisor = signedSupervisor(root, registry, (receipt, binding) => authority.verify(receipt, binding), 60_000);
   try {
     await supervisor.start();
     const occupantContract = fixtureContract({ taskId: "resolver-queue-occupant" });
@@ -233,11 +464,12 @@ test("controller resolver claims an exact ready task, requeues pre-handoff failu
     const completed = await resolver.resolve(request("queued_completed"));
     assert.equal(completed.action, "allow");
     await completed.policy.onChildSessionOpened();
-    const completion = await completed.policy.onChildSessionClosed({ status: "completed" });
+    const completion = await completed.policy.onChildSessionClosed({ status: "completed", effectiveThinking: "low" });
     assert.deepEqual(completion.verification.outcome, { status: "completed" });
     assert.deepEqual(completion.verification.routing, { status: "recorded" });
     assert.equal(routingFinalization.routingObservation.resourceId, "R1");
     assert.deepEqual(routingFinalization.routingObservation.capabilities, queuedContract.capability.required);
+    assert.equal(routingFinalization.routingObservation.effectiveThinking, "low");
     assert.equal(authority.verify(completion.verification.verification, {
       taskId: queuedContract.taskId,
       leaseId: completed.policy.environment.PI_BROKER_LEASE_ID,
@@ -336,6 +568,51 @@ test("controller resolver denies a model mismatch and reports temporary capacity
     await first.policy.onBeforeChildAbandoned("cancelled_before_child");
   } finally {
     await supervisor.stop().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("controller-resolved inherit accepts the same model on a sibling subscription account", async () => {
+  const registry = catalogToBrokerRegistry([
+    {
+      provider: "openai-codex-account-7", baseUrl: "https://account-7.example", api: "openai-completions",
+      models: [{ id: "strong", name: "Strong", contextWindow: 400_000, maxTokens: 32_000, reasoning: true, input: ["text"] }],
+    },
+    {
+      provider: "openai-codex-account-2", baseUrl: "https://account-2.example", api: "openai-completions",
+      models: [{ id: "strong", name: "Strong", contextWindow: 400_000, maxTokens: 32_000, reasoning: true, input: ["text"] }],
+    },
+  ], { confidence: "measured" });
+  const root = mkdtempSync(join(tmpdir(), "br-inherit-sibling-"));
+  const supervisor = signedSupervisor(root, registry);
+  try {
+    await supervisor.start();
+    const resolver = resolverFor(supervisor, root, createSelectContract({
+      registry,
+      availability: () => supervisor.inventory(),
+    }));
+    const inherited = { provider: "openai-codex-account-7", modelId: "strong" };
+    const decision = await resolver.resolve({
+      childId: "inherit_sibling",
+      promptDigest: "a".repeat(64),
+      requestedCwd: tmpdir(),
+      isolation: "none",
+      schemaRequested: false,
+      model: { ...inherited, thinkingLevel: "off" },
+      capabilityRequest: {
+        taskId: "inherit-sibling",
+        taskDescription: "read this file and summarize it",
+        operationClass: "observe",
+        requireModelIdentity: inherited,
+        allowSiblingAccounts: true,
+        excludeResources: ["openai-codex-account-7/strong"],
+      },
+    });
+    assert.equal(decision.action, "allow", decision.reason ?? "");
+    assert.equal(decision.resource.id, "openai-codex-account-2/strong");
+    await decision.policy.onBeforeChildAbandoned("test_cleanup");
+  } finally {
+    await supervisor.stop();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -449,6 +726,48 @@ test("resolver preflights exact routes before reservation and excludes stale res
     assert.equal(supervisor.auditSnapshot().leases[0].resourceId, "R2");
     assert.equal(supervisor.inventory().find((resource) => resource.resourceId === "R1").state, "unknown");
     await resolver.releaseUnhanded("child_preflight");
+  } finally {
+    await supervisor.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("requested effort reaches preview and launch preflight without poisoning a healthy unsupported route", async () => {
+  const root = mkdtempSync(join(tmpdir(), "br-effort-preflight-"));
+  const supervisor = signedSupervisor(root);
+  const calls = [];
+  const { model: _unusedModel, ...withoutModel } = request("effort_preview");
+  const lowRequest = { ...withoutModel, capabilityRequest: { routingRequestedThinking: "low" } };
+  try {
+    await supervisor.start();
+    const resolver = resolverFor(supervisor, root, (input) => {
+      const excluded = new Set(input.capabilityRequest?.excludeResources ?? []);
+      const resourceId = excluded.has("R1") ? "R2" : "R1";
+      return { expectedModel: MODEL, contract: fixtureContract({ taskId: `task-${input.childId}`,
+        capability: { ...fixtureContract().capability, allowedResources: [resourceId] } }) };
+    }, undefined, [EXTENSION_PATH], undefined, async ({ resourceId, requestedThinking }) => {
+      calls.push({ resourceId, requestedThinking });
+      return resourceId === "R1" && requestedThinking === "low"
+        ? { status: "unavailable", reason: "reasoning_effort_unsupported", scope: "resource" }
+        : { status: "ready" };
+    });
+    const preview = await resolver.preview(lowRequest);
+    assert.equal(preview.status, "compatible_quota_unknown");
+    assert.deepEqual(preview.resourceIds, ["R2"]);
+    assert.deepEqual(preview.routeDiagnostics.excluded, [{resourceId:'R1',stage:'exact_preflight',reason:'reasoning_effort_unsupported',scope:'resource'}]);
+    assert.equal(preview.routeDiagnostics.omittedExclusions,0);
+    assert.equal(preview.routeDiagnostics.historicalExplanation,false);
+    assert.deepEqual(calls, [{ resourceId: "R1", requestedThinking: "low" }, { resourceId: "R2", requestedThinking: "low" }]);
+    assert.equal(supervisor.auditSnapshot().leases.length, 0);
+    const launch = await resolver.resolve({ ...lowRequest, childId: "effort_launch" });
+    assert.equal(launch.action, "allow");
+    assert.equal(launch.resource.id, "R2");
+    assert.equal(supervisor.inventory().find((resource) => resource.resourceId === "R1").state, "healthy",
+      "an unsupported effort is not a provider outage and must not quarantine healthy off-capable capacity");
+    await launch.policy.onBeforeChildAbandoned();
+    const off = await resolver.preview({ ...withoutModel, childId: "effort_off",
+      capabilityRequest: { routingRequestedThinking: "off" } });
+    assert.deepEqual(off.resourceIds, ["R1"], "ordinary off route remains available");
   } finally {
     await supervisor.stop();
     rmSync(root, { recursive: true, force: true });
@@ -662,7 +981,7 @@ test("observe launch lease keeps metered input against a hard catalog resource",
     const [lease] = supervisor.auditSnapshot().leases;
     const resource = supervisor.inventory().find((row) => row.resourceId === lease.resourceId);
     assert.deepEqual(resource.enforcement, { input: "hard", output: "hard" });
-    assert.deepEqual(lease.enforcement, { input: "metered_best_effort", output: "hard" });
+    assert.deepEqual(lease.enforcement, { input: "metered_best_effort", output: "unavailable" });
     assert.deepEqual(decision.policy.authorizationPolicy.budget.enforcement, lease.enforcement);
     await decision.policy.onBeforeChildAbandoned("test_cleanup");
   } finally {
