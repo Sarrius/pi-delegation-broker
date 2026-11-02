@@ -8,7 +8,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { streamProviderIpc } from "../src/ipc.mjs";
-import { proxyCanonicalContext, proxyTerminalError, TOOL_CALL_ID, TOOL_NAME } from "../src/proxy-context.mjs";
+import { proxyCanonicalContext, proxyCompletionError, TOOL_CALL_ID, TOOL_NAME } from "../src/proxy-context.mjs";
 
 const PROVIDER_ID = "broker-proxy";
 
@@ -110,9 +110,8 @@ function streamControllerProxy(model: any, context: any, options: any = {}) {
           output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
         }
       }
-      if (blocks.size > 0) throw new Error("controller proxy received an unclosed response block");
-      const terminalError = proxyTerminalError(terminal);
-      if (terminalError) throw new Error(terminalError);
+      const completionError = proxyCompletionError(terminal, blocks.size);
+      if (completionError) throw new Error(completionError);
       const hasToolCall = output.content.some((block: any) => block?.type === "toolCall");
       output.stopReason = hasToolCall ? "toolUse" : "stop";
       stream.push({ type: "done", reason: output.stopReason, message: output });

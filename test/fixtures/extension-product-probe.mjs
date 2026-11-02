@@ -3,6 +3,7 @@ import {mkdirSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {writeJob,updateJob} from '../../src/delegation-job-store.mjs';
 import {RoutingHistoryStore} from '../../src/routing-history-store.mjs';
+import {ownerKey,routeFact} from '../../src/delegation-history.mjs';
 const root=join(process.env.HOME,'.pi','agent'),state=join(root,'delegation-broker'),jobs=join(state,'jobs');
 mkdirSync(state,{recursive:true,mode:0o700});mkdirSync(join(state,'reports'),{recursive:true,mode:0o700});
 for(const [file,value] of Object.entries({'auth.json':{},'settings.json':{packages:[]},'models-store.json':{},'models.json':{providers:{}}}))writeFileSync(join(root,file),JSON.stringify(value));
@@ -16,12 +17,37 @@ assert.ok(tools.get('delegate').parameters.required.includes('work'),'new model 
 const conflict=await tools.get('delegate').execute('conflict',{task:'Duplicate work',work},null,null,ctx);
 assert.equal(conflict.isError,true);assert.equal(conflict.details.cause,'ownership_conflict');
 const block=await hooks.get('tool_call')({toolName:'write',input:{path:'src/example.mjs'}},ctx);assert.equal(block.block,true);
-const notice=await hooks.get('before_agent_start')({systemPrompt:'BASE'});assert.match(notice.systemPrompt,/Review auth subsystem/);assert.match(notice.systemPrompt,/BASE/);
+const notice=await hooks.get('before_agent_start')({systemPrompt:'BASE'});assert.match(notice.systemPrompt,/BASE/);
+const ownerMessage={role:'user',content:'Keep the actual owner request'};
+const snapshot=await hooks.get('context')({messages:[ownerMessage]},ctx);
+assert.match(snapshot.messages[0].content,/Review auth subsystem/);
+assert.equal(snapshot.messages.at(-1),ownerMessage,'controller context must not become the last owner turn');
 updateJob(jobs,'owned',job=>({...job,status:'cancellation_requested'}));
 assert.equal((await hooks.get('tool_call')({toolName:'edit',input:{path:'src/example.mjs'}},ctx)).block,true);
 await tools.get('delegate_cancel').execute('cancel',{id:'owned'},null,null,ctx);
 assert.equal(await hooks.get('tool_call')({toolName:'write',input:{path:'src/example.mjs'}},ctx),undefined,'only terminal cancellation releases ownership');
 const inventory=await tools.get('delegate_inventory').execute('inventory',{},null,null,ctx);assert.equal(inventory.details.availabilityGuarantee,false);assert.equal(inventory.details.rows.length,0);
-const store=new RoutingHistoryStore({path:join(state,'routing-history.sqlite')});store.append({id:'quality:test',kind:'quality',data:{resourceId:'anthropic/model',context:'routing-v3:diagnosis:requested-high',capabilities:['code_reasoning'],outcome:'accepted',latencyMs:100}});store.close();
-await commands.get('delegation-broker').handler('history',ctx);assert.match(notices.at(-1),/confidence95/);
-console.log('product probe passed: ownership, cancellation, context, unavailable inventory, persistent quality view');
+const evidence=await tools.get('delegate_model_evidence').execute('model-evidence',{},null,null,ctx);
+assert.equal(evidence.details.availabilityGuarantee,false);
+assert.equal(evidence.details.status,'catalog_unavailable');
+assert.equal(evidence.details.rows.length,0);
+const store=new RoutingHistoryStore({path:join(state,'routing-history.sqlite')});
+store.append({id:'quality:test',kind:'quality',data:{resourceId:'anthropic/model',context:'routing-v3:diagnosis:requested-high',capabilities:['code_reasoning'],outcome:'accepted',latencyMs:100}});
+for(const sessionId of ['owner','foreign']) {
+ const taskId=`history-${sessionId}`;
+ store.append({id:`route:${taskId}`,kind:'route',data:routeFact({taskId,ownerSessionId:sessionId,
+  context:'routing-v3:diagnosis:requested-high',startedAt:now-10,completedAt:now,
+  result:{status:'completed',resolved:{provider:'anthropic',modelId:'model',thinkingLevel:'high'},
+   route:[{resourceId:'anthropic/model',outcome:'completed'}],usage:{input:2,output:1}}})});
+}
+store.append({id:'feedback:history-owner',kind:'feedback',data:{taskId:'history-owner',owner:ownerKey('owner'),utility:'used',source:'parent_report'}});
+store.close();
+await commands.get('delegation-broker').handler('history',ctx);
+const history=JSON.parse(notices.at(-1));
+assert.equal(history.performance.length,1,'global independently checked quality remains available');
+assert.equal(history.scorecard.routeEvents,1,'scorecard is scoped to the requesting owner session');
+assert.equal(history.scorecard.cohorts[0].route.effectiveThinking,'high');
+assert.equal(history.scorecard.cohorts[0].parentUtility.used,1);
+assert.equal(history.recent.length,1);
+assert.doesNotMatch(JSON.stringify(history),/history-foreign/,'other sessions task IDs are not exposed');
+console.log('product probe passed: ownership, cancellation, context, owner scorecard and persistent quality view');

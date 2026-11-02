@@ -155,3 +155,14 @@ test("supervisor requires a signed registry by default and reports only safe reg
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("controller pool metadata can be signed but is stripped from broker authority", () => {
+  const registry = registryPayload();
+  registry.resources.R1.pool = "cursor.other";
+  const { envelope, trustedKeys } = signedEnvelopeWithKey(registry);
+  const verified = verifySignedRegistry(envelope, { trustedKeys, now: NOW });
+  assert.equal(verified.brokerRegistry.resources.R1.pool, undefined);
+  const malformed = registryPayload();
+  malformed.resources.R1.pool = { nested: true };
+  assert.throws(() => signedRegistryMessage({ schemaVersion: 2, keyId: "release-2026", registry: malformed }), /pool/);
+});

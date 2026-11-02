@@ -14,6 +14,11 @@ test("quality catalog rejects free/unknown aggregator models and admits research
   assert.equal(qualityForModel({ provider: "openrouter", modelId: "anthropic/claude-fable-5.1" }), "apex");
   assert.equal(qualityForModel({ provider: "openrouter", modelId: "anthropic/claude-fable-5.1:batch" }), "apex");
   assert.equal(qualityForModel({ provider: "cursor", modelId: "claude-fable-5-1-high", generation: 0 }), undefined, "uncalibrated aliases cannot inherit apex or generic frontier by freshness alone");
+  // Current manufacturer's guidance: GPT-6 Sol for complex agentic work, Luna for
+  // focused, repeatable work. Recency alone must not promote Luna to frontier.
+  assert.equal(qualityForModel({ provider: "openai-codex-account-8", modelId: "gpt-6-sol", generation: 0 }), "frontier");
+  assert.equal(qualityForModel({ provider: "openai-codex-account-8", modelId: "gpt-6-luna", generation: 0 }), "cheap");
+  assert.equal(meetsQualityFloor({ provider: "openai-codex-account-8", modelId: "gpt-6-luna", generation: 0 }, "frontier"), false);
   assert.equal(qualityForModel({ provider: "openai-codex-account-2", modelId: "gpt-5.6-sol" }), "frontier");
   assert.equal(qualityForModel({ provider: "openai-codex-account-2", modelId: "gpt-5.6-terra" }), "standard");
   assert.equal(qualityForModel({ provider: "openai-codex-account-2", modelId: "gpt-5.6-luna" }), "cheap");
@@ -23,6 +28,13 @@ test("quality catalog rejects free/unknown aggregator models and admits research
   assert.equal(qualityForModel({ provider: "zai", modelId: "glm-5.4", generation: 0 }), "frontier");
   assert.equal(qualityForModel({ provider: "zai", modelId: "glm-5.4" }), undefined);
   assert.equal(qualityForModel({ provider: "openrouter", modelId: "somevendor/brand-new-9", generation: 0 }), undefined);
+  // A vendor's own metered API is admitted at standard without a per-model table, so every
+  // model it advertises is usable; frontier still requires a researched rule.
+  assert.equal(qualityForModel({ provider: "deepseek", modelId: "deepseek-flash" }), "standard");
+  assert.equal(qualityForModel({ provider: "deepseek", modelId: "deepseek-v4-pro" }), "standard");
+  assert.equal(qualityForModel({ provider: "deepseek", modelId: "some-future-model-9" }), "standard");
+  assert.equal(meetsQualityFloor({ provider: "deepseek", modelId: "deepseek-flash" }, "standard"), true);
+  assert.equal(meetsQualityFloor({ provider: "deepseek", modelId: "deepseek-flash" }, "frontier"), false);
   assert.equal(meetsQualityFloor({ provider: "cursor", modelId: "composer-3", generation: 0 }, "standard"), true);
   assert.equal(meetsQualityFloor({ provider: "anthropic", modelId: "claude-fable-5-1" }, "apex"), true);
 });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { proxyCanonicalContext, proxyTerminalError } from "../src/proxy-context.mjs";
+import { proxyCanonicalContext, proxyTerminalError, proxyCompletionError } from "../src/proxy-context.mjs";
 
 test("proxy bridge preserves text and controller-approved Codex compound tool replay", () => {
   const context = proxyCanonicalContext({
@@ -122,6 +122,15 @@ test("proxy fails closed on unsupported modalities, replay state, and unapproved
   const decorated = ["x"];
   decorated.extra = "must reject";
   assert.throws(() => proxyCanonicalContext({ systemPrompt: "", messages: [], tools: [{ name: "read", description: "x", parameters: { enum: decorated } }] }), /dense and undecorated/);
+});
+
+test("a failed provider terminal takes precedence over unclosed response blocks", () => {
+  const truncated = { payload: { outcome: "stream_truncated", httpStatus: 200 } };
+  const malformed = { payload: { outcome: "malformed_provider_frame", httpStatus: 200 } };
+  assert.equal(proxyCompletionError(truncated, 1), "controller provider terminal: stream_truncated (200)");
+  assert.equal(proxyCompletionError(malformed, 1), "controller provider terminal: malformed_provider_frame (200)");
+  assert.equal(proxyCompletionError({ payload: { outcome: "succeeded_terminal" } }, 1), "controller proxy received an unclosed response block");
+  assert.equal(proxyCompletionError({ payload: { outcome: "succeeded_terminal" } }, 0), undefined);
 });
 
 test("proxy terminal mapping never converts an unknown/failed provider terminal into success", () => {

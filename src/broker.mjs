@@ -104,11 +104,12 @@ export class SqliteLeaseBroker {
   #verificationReceiptVerifier;
   #resourceRanker;
   #reconcileRegistryOnStart;
+  #preserveUnlistedResources;
 
   constructor({
     path, registry, maxPendingTasks = 1_000, agingStepMs = 30_000,
     behavioralEnforcement = "unavailable", verificationReceiptVerifier, resourceRanker,
-    reconcileRegistryOnStart = false,
+    reconcileRegistryOnStart = false, preserveUnlistedResources = false,
   }) {
     if (!path) throw new Error("SQLite broker needs a database path");
     if (!Number.isSafeInteger(maxPendingTasks) || maxPendingTasks < 1 || maxPendingTasks > 100_000) {
@@ -130,7 +131,9 @@ export class SqliteLeaseBroker {
     this.#behavioralEnforcement = behavioralEnforcement;
     this.#verificationReceiptVerifier = verificationReceiptVerifier;
     this.#resourceRanker = resourceRanker;
+    if (typeof preserveUnlistedResources !== "boolean") throw new Error("preserveUnlistedResources must be boolean");
     this.#reconcileRegistryOnStart = reconcileRegistryOnStart;
+    this.#preserveUnlistedResources = preserveUnlistedResources;
     this.#db = new DatabaseSync(path);
     try {
       // Configure the connection wait before contending for the database-wide
@@ -615,11 +618,13 @@ export class SqliteLeaseBroker {
   /**
    * Hash only controller-owned durable state relevant to this lease. Behavioral
    * observations include this value, never a child-supplied "state digest".
+   * A heartbeat changes lease expiry but is liveness, not task progress. Keep the
+   * expiry check below without hashing its moving timestamp into the observation.
    */
   behavioralStateDigestForLease(leaseId, fencingToken, now) {
     return this.#transaction(() => {
       const row = this.#db.prepare(`
-        SELECT l.lease_id, l.fencing_token, l.expires_at, l.task_id, l.resource_id,
+        SELECT l.lease_id, l.fencing_token, l.task_id, l.resource_id,
                r.state AS resource_state, r.cooldown_until AS resource_cooldown_until,
                g.breaker_state, g.cooldown_until AS group_cooldown_until, g.probe_lease_id
         FROM leases l
@@ -1411,7 +1416,10 @@ export class SqliteLeaseBroker {
       }
 
       for (const row of this.#db.prepare("SELECT id, retiring FROM resources ORDER BY id").all()) {
-        if (Object.hasOwn(candidate.resources, row.id)) continue;
+        // A controller's local model view is NOT global withdrawal authority in a shared
+        // DB. Other live Pi parents can have additional native providers/models registered.
+        // Its selector/allow-list still forbids routes absent from its own current catalog.
+        if (this.#preserveUnlistedResources || Object.hasOwn(candidate.resources, row.id)) continue;
         if (this.#resourceHasLiveLease(row.id, now)) {
           if (row.retiring !== 1) {
             this.#db.prepare("UPDATE resources SET retiring = 1 WHERE id = ?").run(row.id);

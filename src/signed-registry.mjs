@@ -111,18 +111,20 @@ function normalizedBrokerRegistry(registry) {
   for (const [id, resource] of Object.entries(registry.resources)) {
     requireResourceIdentifier(id, `resource ${id}`);
     // catalogToBrokerRegistry carries controller-side identity/metadata (`model`, `catalog`,
-    // `provenance`) so the selector can map and govern a lease. The broker persists none of
-    // them; permit their closed schemas and deliberately strip them while normalizing the signed
-    // registry. Unknown fields still fail closed.
+    // `provenance`, `pool`) so the selector can map, govern and pool-scope a lease. The broker
+    // persists none of them; permit their closed schemas and deliberately strip them while
+    // normalizing the signed registry. Unknown fields still fail closed.
     const keys = [
       "capacityGroup", "profile", "confidence", "enforcement",
       ...(resource.model !== undefined ? ["model"] : []),
       ...(resource.catalog !== undefined ? ["catalog"] : []),
       ...(resource.provenance !== undefined ? ["provenance"] : []),
+      ...(resource.pool !== undefined ? ["pool"] : []),
     ];
     ownKeysExactly(resource, keys, `resource ${id}`);
     requireIdentifier(resource.capacityGroup, `resource ${id} capacityGroup`);
     requireIdentifier(resource.profile, `resource ${id} profile`);
+    if (resource.pool !== undefined) requireIdentifier(resource.pool, `resource ${id} pool`);
     if (!capacityGroups[resource.capacityGroup]) throw new Error(`resource ${id} references unknown capacity group`);
     if (!profiles[resource.profile]) throw new Error(`resource ${id} references unknown profile`);
     if (!INVENTORY_CONFIDENCE.has(resource.confidence)) throw new Error(`resource ${id} has invalid confidence`);

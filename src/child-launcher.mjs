@@ -18,7 +18,7 @@ const CONTROL_REQUEST_TIMEOUT_MS = 15_000;
 const PROMPT_ACK_TIMEOUT_MS = 60_000;
 const DISPOSE_KILL_GRACE_MS = 2_000;
 const IMMEDIATE_COMPLETION_POLL_MS = 60;
-const IMMEDIATE_COMPLETION_MAX_POLLS = 40;
+const IMMEDIATE_COMPLETION_MAX_POLLS = 100;
 const ACTIVE_RPCS = new Set();
 const BEHAVIORAL_TOOLS = ["broker_declare_action", "broker_checkpoint"];
 const EFFECT_TOOL = "propose_patch";
@@ -40,6 +40,19 @@ async function terminateRpc(rpc) {
 
 export async function disposeBrokeredChildProcesses() {
   await Promise.allSettled([...ACTIVE_RPCS].map(terminateRpc));
+}
+
+/** Ordinary parent settlement may reap leaked RPC children only when no owner
+ * job is live and no controller-owned qualification/readiness/runner work is in
+ * flight. A qualification canary is a live runner child, not an orphan, even
+ * though it is absent from the parent delegate task map. Shutdown still calls
+ * disposeBrokeredChildProcesses after runners close.
+ */
+export function parentSettlementShouldReapBrokeredChildren({
+  ownerJobCount = 0,
+  controllerLiveWork = false,
+} = {}) {
+  return ownerJobCount === 0 && controllerLiveWork === false;
 }
 
 function resolveChildPiEntry() {
@@ -148,6 +161,7 @@ class RpcChildSession {
   #rpc;
   #listeners = new Set();
   #latestAssistant;
+  #guardTerminal;
   // Controller-owned efficiency observes consumable tokens/latency/attempts, never provider
   // price estimates: subscription routes have no truthful per-turn monetary value.
   #usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0 };
@@ -184,7 +198,11 @@ class RpcChildSession {
   }
 
   get sessionFile() { return this.#sessionFile; }
-  get latestAssistantMessage() { return this.#latestAssistant; }
+  get latestAssistantMessage() {
+    // This marker can only fail the child, never accept work or blame a provider.
+    return this.#guardTerminal ? { ...this.#latestAssistant, stopReason: "error",
+      errorMessage: `controller behavioral terminal: ${this.#guardTerminal}` } : this.#latestAssistant;
+  }
   get usage() { return { ...this.#usage }; }
 
   subscribe(listener) {
@@ -206,10 +224,11 @@ class RpcChildSession {
     };
     turn.observeImmediateCompletion = () => { if (turn.done) return; turn.done = true; turn.resolve(); };
     this.#turn = turn;
+    const assistantBefore = this.#latestAssistant;
     try {
       await this.#rpc.request({ type: "prompt", message: text }, { timeoutMs: PROMPT_ACK_TIMEOUT_MS });
       turn.acknowledge();
-      if (!turn.done) void this.#confirmImmediateCompletion(turn);
+      if (!turn.done) void this.#confirmImmediateCompletion(turn, assistantBefore);
       await turn.completion;
     } catch (error) {
       turn.fail(error instanceof Error ? error : new Error(String(error)));
@@ -236,7 +255,7 @@ class RpcChildSession {
     return this.#disposal;
   }
 
-  async #confirmImmediateCompletion(turn) {
+  async #confirmImmediateCompletion(turn, assistantBefore) {
     let idle = 0;
     for (let poll = 0; poll < IMMEDIATE_COMPLETION_MAX_POLLS; poll++) {
       await new Promise((resolve) => { const t = setTimeout(resolve, IMMEDIATE_COMPLETION_POLL_MS); t.unref?.(); });
@@ -256,13 +275,24 @@ class RpcChildSession {
       if (state.isCompacting) { idle = 0; poll -= 1; continue; }
       if (state.pendingMessageCount > 0) { idle = 0; continue; }
       idle += 1;
-      if (idle >= 2) { turn.observeImmediateCompletion(); return; }
+      // Two idle polls is ~120ms. That can notice a turn that finished before
+      // agent_start/agent_settled reached us, and is far too short to prove a freshly
+      // spawned Pi child has started broker-proxy inference. Empty idle must keep
+      // waiting; only a new assistant message is evidence the turn already completed.
+      if (idle >= 2 && this.#latestAssistant && this.#latestAssistant !== assistantBefore) {
+        turn.observeImmediateCompletion();
+        return;
+      }
     }
     turn.fail(new Error(`Child neither started an agent run nor settled within ${IMMEDIATE_COMPLETION_MAX_POLLS} polls`));
   }
 
   #handleEvent(event) {
     if (typeof event.type !== "string") return;
+    if (event.type === "tool_execution_end") {
+      const status = event.result?.details?.brokerGuardTerminal?.status;
+      if (typeof status === "string" && /^[a-z_]{1,64}$/.test(status)) this.#guardTerminal = status;
+    }
     if (event.type === "agent_start") { this.#turn?.observeAcceptance(); }
     if (event.type === "agent_settled") { this.#turn?.observeSettlement(); }
     if (event.type === "turn_end" || event.type === "message_start" || event.type === "message_end") {

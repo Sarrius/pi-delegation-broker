@@ -1,0 +1,37 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtempSync,rmSync,statSync,readFileSync} from 'node:fs';
+import {join} from 'node:path';
+import {tmpdir} from 'node:os';
+import {JevEngineMetrics} from '../src/jev-engine-metrics.mjs';
+import {RoutingHistoryStore} from '../src/routing-history-store.mjs';
+
+test('durable ON/OFF outcomes separate answered, applied, parent feedback and verified quality',t=>{
+ const dir=mkdtempSync(join(tmpdir(),'jev-engine-events-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));
+ const now=Date.now();const metrics=new JevEngineMetrics(join(dir,'events.jsonl'),{now:()=>now});
+ const history=new RoutingHistoryStore({path:join(dir,'routing.sqlite'),now:()=>now});t.after(()=>history.close());
+ metrics.record({functionName:'routing',state:'opportunity',taskId:'task-on',reason:'eligible_prelease'});
+ metrics.record({functionName:'routing',state:'opportunity',taskId:'task-on',reason:'engine_on'});
+ metrics.record({functionName:'routing',state:'invoked',answer:'model_1',inputTokens:30,outputTokens:5,latencyMs:100});
+ metrics.record({functionName:'routing',state:'applied',taskId:'task-on',modelIdentity:'cursor/composer-2.5',baselineModelIdentity:'openai-codex/gpt-6-sol',effort:'off'});
+ metrics.record({functionName:'routing',state:'baseline',taskId:'task-off',reason:'engine_off'});
+ metrics.record({functionName:'decision',state:'answered',answer:'verify',taskDigest:'a'.repeat(64)});
+ metrics.record({functionName:'decision',state:'skipped',reason:'sample child report',taskId:'sensitive task',taskDigest:'not a digest'});
+ const id='verified:'+'b'.repeat(64);
+ history.append({id,kind:'quality',timestamp:now,data:{taskId:'task-on',outcome:'accepted'}});
+ history.append({id:'feedback:task-on',kind:'feedback',timestamp:now,data:{taskId:'task-on',utility:'used'}});
+ let summary=metrics.summary({routingHistory:history});
+ assert.equal(summary.byFunction.routing.opportunity,1,'pre-lease and handoff reports for one task are not two opportunities');
+ assert.equal(summary.byFunction.routing.verifiedAccepted,1);
+ assert.equal(summary.byFunction.routing.parentFeedback,1);
+ assert.equal(summary.byFunction.routing.baseline,1);
+ assert.equal(summary.byFunction.decision.applied,0);
+ history.invalidateQuality({qualityId:id,reason:'controller_result_missing',evidenceRef:'controller:00000000-0000-0000-0000-000000000001',timestamp:now});
+ summary=metrics.summary({routingHistory:history});
+ assert.equal(summary.byFunction.routing.verifiedAccepted,0);
+ assert.equal(summary.byFunction.routing.withoutControllerOutcome,1);
+ assert.equal(metrics.summary().controllerHistoryCoverage,'not_loaded');
+ assert.equal(metrics.summary().byFunction.routing.verifiedAccepted,null,'no loaded controller history is unknown, not zero');
+ assert.equal(statSync(join(dir,'events.jsonl')).mode&0o777,0o600);
+ assert.doesNotMatch(readFileSync(join(dir,'events.jsonl'),'utf8'),/credential|sample child report|sensitive task|not a digest/);
+});

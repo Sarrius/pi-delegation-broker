@@ -59,6 +59,15 @@ test("a whole-repository task additionally asks for a large context", () => {
   assert.ok(requirement.capabilities.includes("large_context"));
 });
 
+test("textual design of agent behavior does not falsely require image-capable routes", () => {
+  const textual = deriveTaskRequirement("Design the agent observation workflow across the project", { operationClass: "observe" });
+  assert.deepEqual(textual.capabilities, ["large_context", "text_generation"]);
+  const visual = deriveTaskRequirement("Inspect the screenshot and photo", { operationClass: "observe" });
+  assert.ok(visual.capabilities.includes("vision_input"));
+  const explicit = deriveTaskRequirement("Design the workflow", { requiredCapabilities: ["vision_input"] });
+  assert.ok(explicit.capabilities.includes("vision_input"));
+});
+
 test("read-only work meters provider input instead of rejecting exact-token work from a byte upper bound", () => {
   const registry = registryOf([account("solo")]);
   const selected = selectModelForTask({
@@ -67,14 +76,17 @@ test("read-only work meters provider input instead of rejecting exact-token work
     constraints: baseConstraints({ operationClass: "observe" }),
   });
   assert.equal(selected.action, "allow");
-  assert.deepEqual(selected.contract.budget.enforcement, { input: "metered_best_effort", output: "hard" });
-  assert.equal(selected.contract.budget.maxInputTokens, 1_000_000);
+  assert.deepEqual(selected.contract.budget.enforcement, { input: "metered_best_effort", output: "unavailable" });
+  assert.equal(selected.contract.budget.maxInputTokens, undefined, "ordinary reads must not inherit a hidden cumulative 1M input stop");
+  assert.equal(selected.contract.budget.maxOutputTokens, undefined, "a missing caller cap is not an implicit 16k hard stop");
   withBroker(registry, (broker) => {
     const reservation = broker.reserve(selected.contract, 1_000);
     assert.equal(reservation.status, "leased", JSON.stringify(reservation));
     const resource = broker.inventory(1_000).find((row) => row.resourceId === reservation.lease.resourceId);
     assert.deepEqual(resource.enforcement, { input: "hard", output: "hard" });
-    assert.deepEqual(reservation.lease.enforcement, { input: "metered_best_effort", output: "hard" });
+    assert.deepEqual(reservation.lease.enforcement, { input: "metered_best_effort", output: "unavailable" });
+    assert.equal(reservation.lease.maxInputTokens, undefined);
+    assert.equal(reservation.lease.maxOutputTokens, undefined);
   });
 });
 
@@ -92,6 +104,18 @@ test("an effect-capable task never lands on the weakest class and is budgeted in
   assert.deepEqual(selected.contract.budget.enforcement, { input: "hard", output: "hard" });
   assert.equal(selected.contract.budget.maxInputTokens, 1_000_000, "default cumulative input accommodates byte-safe reservation across agent turns");
   assert.equal(selected.contract.budget.maxCostMicros, undefined);
+  assert.equal(selected.contract.budget.maxOutputTokens, 16_000, "effect-capable work retains its hard safety cap");
+});
+
+test("a caller-declared read-only output cap remains a hard budget, never silently widened", () => {
+  const selected = selectModelForTask({
+    taskDescription: "review three files and report evidence",
+    registry: registryOf([account("solo")]),
+    constraints: baseConstraints({ operationClass: "observe", budget: { maxOutputTokens: 6_000 } }),
+  });
+  assert.equal(selected.action, "allow");
+  assert.equal(selected.contract.budget.maxOutputTokens, 6_000);
+  assert.deepEqual(selected.contract.budget.enforcement, { input: "metered_best_effort", output: "hard" });
 });
 
 test("a monetary cap is rejected rather than becoming a fictional controller guarantee", () => {
@@ -179,6 +203,56 @@ test("an exact identity request narrows selection and never bypasses a gate", ()
     }),
     /requireModelIdentity must be \{provider, modelId\}/,
   );
+});
+
+test("an inherited model fails over across sibling account slots without changing model family", () => {
+  const registry = registryOf([
+    account("openai-codex-account-7"),
+    account("openai-codex-account-2"),
+  ]);
+  const inherited = { provider: "openai-codex-account-7", modelId: "strong" };
+  const first = selectModelForTask({
+    taskDescription: "read this file and tell me what it says",
+    registry,
+    constraints: baseConstraints({ requireModelIdentity: inherited, allowSiblingAccounts: true }),
+  });
+  assert.equal(first.action, "allow");
+  assert.deepEqual(first.expectedModel, inherited, "the parent account is the first proven route");
+
+  const manual = selectModelForTask({
+    taskDescription: "read this file and tell me what it says",
+    registry,
+    constraints: baseConstraints({
+      requireModelIdentity: inherited,
+      excludeResources: ["openai-codex-account-7/strong"],
+    }),
+  });
+  assert.deepEqual(manual, { action: "deny", reason: "inherited model has no current eligible account route" },
+    "a plain exact identity must not acquire inherit-only sibling authority");
+
+  const selected = selectModelForTask({
+    taskDescription: "read this file and tell me what it says",
+    registry,
+    constraints: baseConstraints({
+      requireModelIdentity: inherited,
+      allowSiblingAccounts: true,
+      excludeResources: ["openai-codex-account-7/strong"],
+    }),
+  });
+  assert.equal(selected.action, "allow");
+  assert.deepEqual(selected.expectedModel, { provider: "openai-codex-account-2", modelId: "strong" });
+  assert.deepEqual(selected.contract.capability.allowedResources, ["openai-codex-account-2/strong"]);
+
+  const denied = selectModelForTask({
+    taskDescription: "read this file and tell me what it says",
+    registry,
+    constraints: baseConstraints({
+      requireModelIdentity: inherited,
+      allowSiblingAccounts: true,
+      excludeResources: ["openai-codex-account-7/strong", "openai-codex-account-2/strong"],
+    }),
+  });
+  assert.deepEqual(denied, { action: "deny", reason: "inherited model has no current eligible account route" });
 });
 
 function apexRegistry() {
@@ -367,6 +441,26 @@ test("among equally known accounts cold start is deterministic without a price t
   assert.equal(selected.selection.resourceId, "a/weak");
 });
 
+test("cold-start fit uses the same generation evidence as quality admission", () => {
+  const model = id => ({ id, name: id, contextWindow: 32_000, maxTokens: 4_000,
+    reasoning: false, input: ["text"] });
+  const registry = registryOf([
+    { ...account("openai-codex"), models: [model("gpt-6.1-sol")] },
+    { ...account("google-antigravity"), models: [model("gemini-3.8-flash-low")] },
+  ]);
+  const currency = Object.fromEntries(Object.keys(registry.resources).map(id =>
+    [id, { listed: true, legacy: false, generation: 0 }]));
+  const args = { taskDescription: "read a file", registry, currency,
+    constraints: baseConstraints({ modelTier: "frontier" }), enforceQuality: true, enforceProvenance: true };
+  const selected = selectModelForTask(args);
+  assert.equal(selected.action, "allow");
+  assert.equal(selected.selection.resourceId, "google-antigravity/gemini-3.8-flash-low",
+    "equally sufficient models use deterministic identity ordering, not a missing-generation penalty");
+  delete currency["google-antigravity/gemini-3.8-flash-low"].generation;
+  assert.equal(selectModelForTask(args).selection.resourceId, "openai-codex/gpt-6.1-sol",
+    "unknown generation still cannot bypass quality admission");
+});
+
 test("a resource the caller excluded is not selected", () => {
   const registry = registryOf([account("a", { mid: false, strong: false }), account("b", { mid: false, strong: false })]);
   const selected = selectModelForTask({
@@ -407,7 +501,7 @@ test("the selected contract actually leases against a real broker", () => {
     const reservation = broker.reserve(selected.contract, now);
     assert.equal(reservation.status, "leased", JSON.stringify(reservation));
     assert.equal(reservation.lease.profile, selected.contract.capability.minimumProfile);
-    assert.deepEqual(selected.contract.budget.enforcement, { input: "metered_best_effort", output: "hard" });
+    assert.deepEqual(selected.contract.budget.enforcement, { input: "metered_best_effort", output: "unavailable" });
     assert.deepEqual(reservation.lease.enforcement, selected.contract.budget.enforcement);
     assert.deepEqual(
       broker.inventory(now).find((row) => row.resourceId === reservation.lease.resourceId).enforcement,
@@ -621,4 +715,64 @@ test("a model id containing slashes still maps back to provider and model", () =
     modelId: "anthropic/claude-opus-5:batch",
   });
   assert.equal(parseResourceModel("no-separator"), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Billing-pool pressure (Cursor's independently metered pools)
+// ---------------------------------------------------------------------------
+
+function cursorAccounts() {
+  return [{
+    provider: "cursor",
+    baseUrl: "https://api2.cursor.sh",
+    api: "openai-completions",
+    models: [
+      { id: "composer-2.5", name: "Composer 2.5", contextWindow: 200_000, maxTokens: 32_000, reasoning: true, input: ["text"] },
+      { id: "grok-4.6", name: "Grok 4.6", contextWindow: 256_000, maxTokens: 64_000, reasoning: true, input: ["text"] },
+    ],
+  }];
+}
+
+test("a pool at its allowance stops taking new leases without benching its sibling pool", () => {
+  const now = Date.now();
+  const registry = registryOf(cursorAccounts());
+  const selected = selectModelForTask({
+    taskDescription: "read the changelog and summarize it",
+    registry,
+    constraints: baseConstraints(),
+    pools: {
+      "cursor.models": { usedPercent: 99.5, resetAt: now + 3 * 86_400_000 },
+      "cursor.other": { usedPercent: 35, resetAt: now + 3 * 86_400_000 },
+    },
+    now,
+  });
+  assert.equal(selected.action, "allow");
+  assert.equal(selected.selection.resourceId, "cursor/grok-4.6", "the healthy sibling pool serves the task");
+  assert.equal(selected.selection.poolExcluded, true, "the exclusion is visible in the selection trail");
+  assert.ok(selected.contract.capability.allowedResources.includes("cursor/grok-4.6"));
+  assert.ok(!selected.contract.capability.allowedResources.includes("cursor/composer-2.5"), "the pressured pool cannot be leased back in");
+
+  // With every pool under pressure the selector refuses instead of leasing into a 429.
+  const denied = selectModelForTask({
+    taskDescription: "read the changelog and summarize it",
+    registry,
+    constraints: baseConstraints(),
+    pools: {
+      "cursor.models": { usedPercent: 100, resetAt: now + 86_400_000 },
+      "cursor.other": { usedPercent: 98, resetAt: now + 86_400_000 },
+    },
+    now,
+  });
+  assert.equal(denied.action, "deny");
+});
+
+test("an absent pool fact changes nothing about routing", () => {
+  const registry = registryOf(cursorAccounts());
+  const selected = selectModelForTask({
+    taskDescription: "read the changelog and summarize it",
+    registry,
+    constraints: baseConstraints(),
+  });
+  assert.equal(selected.action, "allow");
+  assert.equal(selected.selection.poolExcluded, undefined);
 });

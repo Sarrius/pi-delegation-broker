@@ -253,3 +253,11 @@ export function proxyTerminalError(terminal) {
   ].filter(Boolean).join(", ");
   return detail ? `controller provider terminal: ${outcome} (${detail})` : `controller provider terminal: ${outcome}`;
 }
+
+/** Preserve the controller's terminal cause even when a failed stream left a block open. */
+export function proxyCompletionError(terminal, openBlocks) {
+  const terminalError = proxyTerminalError(terminal);
+  if (terminalError) return terminalError;
+  if (openBlocks > 0) return "controller proxy received an unclosed response block";
+  return undefined;
+}

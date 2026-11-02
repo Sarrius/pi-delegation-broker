@@ -97,7 +97,7 @@ function killTree(child) {
   }
 }
 
-test(`fresh pi binary observe path: incident used=804330 requested=236663 cap=1000000 stays metered and completes${LIVE_CURSOR ? " through one live Cursor request" : ""}`, { timeout: 180_000 }, async () => {
+test(`fresh pi binary observe path: historical 804330/236663 workload has no implicit cumulative input cap${LIVE_CURSOR ? " through one live Cursor request" : ""}`, { timeout: 180_000 }, async () => {
   if (LIVE_CURSOR) {
     assert.equal(process.env.LIVE_PROVIDER_TEST, "1", "live Pi-host canary requires LIVE_PROVIDER_TEST=1");
     assert.equal(process.env.LIVE_PROXY_CANARY_APPROVED, "1", "live Pi-host canary requires LIVE_PROXY_CANARY_APPROVED=1");
@@ -194,9 +194,9 @@ test(`fresh pi binary observe path: incident used=804330 requested=236663 cap=10
     } else {
       assert.equal(result.liveDispatches, 0);
     }
-    assert.deepEqual(result.leaseEnforcement, { input: "metered_best_effort", output: "hard" });
+    assert.deepEqual(result.leaseEnforcement, { input: "metered_best_effort", output: "unavailable" });
     assert.equal(result.resourceEnforcement.input, "hard");
-    assert.equal(result.maxInputTokens, 1_000_000);
+    assert.equal(result.maxInputTokens, null, "new ordinary read-only leases must not inherit the historical cumulative cap");
     child.stdin.end();
     await new Promise((resolve) => {
       const timer = setTimeout(() => { killTree(child); resolve(); }, 10_000);

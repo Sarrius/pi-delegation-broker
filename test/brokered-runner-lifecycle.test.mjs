@@ -8,6 +8,19 @@ import { BrokeredChildRunner } from "../src/brokered-runner.mjs";
 
 const MODEL = { provider: "broker-fake", modelId: "lease-fake" };
 
+test("the production watchdog allows long provider-side reasoning silence", () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-default-watchdog-"));
+  try {
+    const runner = new BrokeredChildRunner({
+      resolver: { async resolve() { return { action: "deny", reason: "unused" }; } },
+      sessionsRoot: join(root, "sessions"),
+    });
+    assert.equal(runner.noProgressTimeoutMs, 10 * 60_000);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("every attempt is tracked while its lease lives, but only a completed one is verified", async () => {
   const root = mkdtempSync(join(tmpdir(), "runner-lifecycle-"));
   const tracks = [];
@@ -31,7 +44,7 @@ test("every attempt is tracked while its lease lives, but only a completed one i
           async onBeforeChildAbandoned() {},
           async onProviderSucceeded() { healthy.push(`provider/model-${attempt}`); },
           async trackForVerification() { tracks.push(attempt); return { status: "tracked" }; },
-          async onChildSessionClosed(result) { closes.push({ attempt, status: result.status, attempts: result.attempts }); return { status: "released" }; },
+          async onChildSessionClosed(result) { closes.push({ attempt, status: result.status, attempts: result.attempts, text: result.text }); return { status: "released" }; },
         },
       };
     },
@@ -69,11 +82,61 @@ test("every attempt is tracked while its lease lives, but only a completed one i
     // route requeues the task and only the completed route is closed toward verification.
     assert.deepEqual(tracks, [1, 2], "each attempt registers its own live lease");
     assert.deepEqual(closes, [
-      { attempt: 1, status: "failed", attempts: 1 },
-      { attempt: 2, status: "completed", attempts: 2 },
+      { attempt: 1, status: "failed", attempts: 1, text: undefined },
+      { attempt: 2, status: "completed", attempts: 2, text: "done" },
     ]);
     assert.deepEqual(healthy, ["provider/model-2"], "a completed child must rehabilitate the route it proved live");
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("controller-selected active low reaches the child while an explicit high request cannot be overridden",async()=>{
+  const root=mkdtempSync(join(tmpdir(),"runner-active-effort-"));
+  const launches=[],abandoned=[];
+  const resolver={async resolve(){return {action:"allow",selectedThinking:"low",resource:{id:"openai-codex-account-8/gpt-5.6-sol"},
+    resolvedModel:{provider:"openai-codex-account-8",modelId:"gpt-5.6-sol"},
+    selection:{jevActive:{applied:true,requestedThinking:"off",recommendedThinking:"low"}},
+    policy:{policyId:"active-low",agentDir:root,environment:{},
+      async onChildSessionOpened(){},async onBeforeChildAbandoned(){abandoned.push("abandoned");},
+      async onChildSessionClosed(){return {status:"released"};}}};}};
+  const spawnChild=async({spec})=>{launches.push(spec.thinkingLevel);return {resolved:{...MODEL,thinkingLevel:spec.thinkingLevel},
+    session:{usage:{input:1,output:1},latestAssistantMessage:{stopReason:"stop",content:[{type:"text",text:"done"}]},
+      async prompt(){},async dispose(){}}};};
+  try{
+    const runner=new BrokeredChildRunner({resolver,sessionsRoot:join(root,"sessions"),spawnChild});
+    const active=await runner.run({childId:"active-low",promptDigest:"a".repeat(64),cwd:root,prompt:"read",thinkingLevel:"off",
+      capabilityRequest:{routingRouteMode:"auto",routingThinkingMode:"auto",routingRequestedThinking:"off"},maxAttempts:1});
+    assert.equal(active.status,"completed");assert.deepEqual(launches,["low"]);
+    assert.equal(active.requestedThinking,"off");assert.equal(active.resolved.thinkingLevel,"low");
+    const explicit=await runner.run({childId:"explicit-high",promptDigest:"b".repeat(64),cwd:root,prompt:"read",thinkingLevel:"high",
+      capabilityRequest:{routingRouteMode:"auto",routingThinkingMode:"high",routingRequestedThinking:"high"},maxAttempts:1});
+    assert.equal(explicit.status,"failed");
+    assert.deepEqual(launches,["low"],"a bad resolver hint must not lower an explicit effort request");
+    assert.equal(abandoned.length,1,"a rejected hint releases its unhanded lease");
+  }finally{rmSync(root,{recursive:true,force:true});}
+});
+
+test("abort while a resolver ignores its signal releases its lease before any child is spawned",async()=>{
+  const root=mkdtempSync(join(tmpdir(),"runner-cancel-handoff-"));
+  let releaseResolve,announceResolve,spawned=0,released=0;
+  const resolving=new Promise(resolve=>{releaseResolve=resolve});
+  const entered=new Promise(resolve=>{announceResolve=resolve});
+  const resolver={async resolve(){announceResolve();await resolving;
+    return {action:"allow",resource:{id:"provider/leased"},resolvedModel:MODEL,
+      policy:{policyId:"late-lease",agentDir:root,environment:{},
+        async onBeforeChildAbandoned(){released++;},async onChildSessionOpened(){},
+        async onChildSessionClosed(){return {status:"released"}}}};}};
+  const runner=new BrokeredChildRunner({resolver,sessionsRoot:join(root,"sessions"),
+    spawnChild:async()=>{spawned++;throw Error("cancelled child must never start")}});
+  try{
+    const pending=runner.run({childId:"cancel-handoff",promptDigest:"a".repeat(64),cwd:root,prompt:"read",maxAttempts:1});
+    await entered;
+    await runner.abort("cancel-handoff");
+    releaseResolve();
+    const result=await pending;
+    assert.equal(result.status,"aborted");
+    assert.equal(spawned,0);
+    assert.equal(released,1,"the controller must release its unhanded lease exactly once");
+  }finally{releaseResolve?.();await runner.dispose();rmSync(root,{recursive:true,force:true});}
 });
 
 test("runner enforces cumulative output across failover and adopts the controller attempt cap", async () => {
@@ -409,8 +472,11 @@ test("abort during a capacity wait stops the run instead of paying for a later s
 
 test("cancel between the capacity grant and the handle stops the newborn child and frees its lease", async () => {
   const root = mkdtempSync(join(tmpdir(), "runner-abort-postacquire-"));
-  let closed = 0;
+  let abandoned = 0;
   let aborts = 0;
+  let releaseSpawn, spawnEntered;
+  const spawnGate = new Promise((resolve) => { releaseSpawn = resolve; });
+  const enteredSpawn = new Promise((resolve) => { spawnEntered = resolve; });
   let releaseResolve;
   const resolveGate = new Promise((resolve) => { releaseResolve = resolve; });
   let resolveEntered;
@@ -426,40 +492,76 @@ test("cancel between the capacity grant and the handle stops the newborn child a
         policy: {
           policyId: "lease-1", agentDir: root, environment: {},
           async onChildSessionOpened() {},
-          async onBeforeChildAbandoned() {},
-          async onChildSessionClosed() { closed += 1; return { status: "released" }; },
+          async onBeforeChildAbandoned() { abandoned += 1; },
+          async onChildSessionClosed() { throw Error("no handoff can occur after cancellation"); },
         },
       };
     },
   };
-  const spawnChild = async () => ({
-    resolved: MODEL,
-    session: {
+  const spawnChild = async () => {
+    spawnEntered();await spawnGate;
+    return {resolved: MODEL,session: {
       usage: { input: 1, output: 0 }, latestAssistantMessage: undefined,
-      async prompt() { await new Promise((resolve) => setTimeout(resolve, 50)); },
+      async prompt() { throw Error("cancelled child must not receive a prompt"); },
       async abort() { aborts += 1; }, async dispose() {},
-    },
-  });
+    }};
+  };
   try {
     const runner = new BrokeredChildRunner({ resolver, sessionsRoot: join(root, "sessions"), spawnChild });
     const completion = runner.run({
       childId: "post-acquire", promptDigest: "a".repeat(64), cwd: root, prompt: "work", maxAttempts: 1,
     });
     await entered;
-    await runner.abort("post-acquire");
     releaseResolve();
+    await enteredSpawn;
+    await runner.abort("post-acquire");
+    releaseSpawn();
     const result = await completion;
     assert.equal(result.status, "aborted");
-    assert.match(result.error, /aborted after launch admission/);
-    assert.ok(aborts >= 1, "the newborn child must be aborted");
-    assert.equal(closed, 1, "the lease must be closed exactly once");
+    assert.match(result.error, /aborted before a child was launched/);
+    assert.equal(aborts, 1, "the newborn but unhanded child must be aborted");
+    assert.equal(abandoned, 1, "the unhanded lease must be released exactly once");
     assert.deepEqual(runner.activeAttempts(), []);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a revoked handoff callback closes the newborn child without sending a prompt", async () => {
+  const root = mkdtempSync(join(tmpdir(), "runner-revoked-handoff-"));
+  let prompted = 0, aborted = 0, disposed = 0, abandoned = 0;
+  try {
+    const runner = new BrokeredChildRunner({
+      resolver: { async resolve() { return {
+        action: "allow", resource: { id: "provider/model" }, resolvedModel: MODEL,
+        policy: {
+          policyId: "lease-1", agentDir: root, environment: {},
+          async onChildSessionOpened() { return { status: "revoked" }; },
+          async onBeforeChildAbandoned() { abandoned++; },
+          async onChildSessionClosed() { throw Error("revoked work must not hand off"); },
+        },
+      }; } },
+      sessionsRoot: join(root, "sessions"),
+      spawnChild: async () => ({ resolved: MODEL, session: {
+        usage: { input: 0, output: 0 }, latestAssistantMessage: undefined,
+        async prompt() { prompted++; },
+        async abort() { aborted++; },
+        async dispose() { disposed++; },
+      } }),
+    });
+    const result = await runner.run({ childId: "revoked", promptDigest: "a".repeat(64),
+      cwd: root, prompt: "work", maxAttempts: 1 });
+    assert.equal(result.status, "failed");
+    assert.equal(prompted, 0, "a revoked active policy must never reach the provider");
+    assert.equal(abandoned, 1, "release the unhanded lease exactly once");
+    assert.equal(aborted, 1);assert.equal(disposed, 1);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("dispose waits for a launch already past admission instead of orphaning it", async () => {
   const root = mkdtempSync(join(tmpdir(), "runner-dispose-inflight-"));
-  let disposed = 0;
+  let disposed = 0, abandoned = 0;
+  let releaseSpawn, spawnEntered;
+  const spawnGate = new Promise((resolve) => { releaseSpawn = resolve; });
+  const enteredSpawn = new Promise((resolve) => { spawnEntered = resolve; });
   let releaseResolve;
   const resolveGate = new Promise((resolve) => { releaseResolve = resolve; });
   let resolveEntered;
@@ -474,33 +576,43 @@ test("dispose waits for a launch already past admission instead of orphaning it"
         resolvedModel: MODEL,
         policy: {
           policyId: "lease-1", agentDir: root, environment: {},
-          async onChildSessionOpened() {}, async onBeforeChildAbandoned() {},
-          async onChildSessionClosed() { return { status: "released" }; },
+          async onChildSessionOpened() { throw Error("disposed before handoff"); },
+          async onBeforeChildAbandoned() { abandoned += 1; },
+          async onChildSessionClosed() { throw Error("disposed before handoff"); },
         },
       };
     },
   };
-  const spawnChild = async () => ({
-    resolved: MODEL,
-    session: {
+  const spawnChild = async () => {
+    spawnEntered();await spawnGate;
+    return {resolved: MODEL,session: {
       usage: { input: 1, output: 0 }, latestAssistantMessage: undefined,
-      async prompt() { await new Promise((resolve) => setTimeout(resolve, 50)); },
+      async prompt() { throw Error("disposed child must not receive a prompt"); },
       async abort() {}, async dispose() { disposed += 1; },
-    },
-  });
+    }};
+  };
   try {
     const runner = new BrokeredChildRunner({ resolver, sessionsRoot: join(root, "sessions"), spawnChild });
     const completion = runner.run({
       childId: "inflight", promptDigest: "a".repeat(64), cwd: root, prompt: "work", maxAttempts: 1,
     });
     await entered;
-    const disposal = runner.dispose();
+    assert.equal(runner.hasLiveWork(), true, "lease selection is live work before a handle exists");
     releaseResolve();
+    await enteredSpawn;
+    assert.equal(runner.hasLiveWork(), true, "an in-flight spawn must not be treated as an orphan");
+    let settled = false;
+    const disposal = runner.dispose().then(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(settled, false, "dispose must drain a child construction already in flight");
+    releaseSpawn();
     await disposal;
-    assert.ok(disposed >= 1, "dispose must not return while a child is still being born");
+    assert.equal(disposed, 1);
+    assert.equal(abandoned, 1);
     assert.deepEqual(runner.activeAttempts(), []);
     const result = await completion;
     assert.equal(result.status, "aborted");
+    assert.equal(runner.hasLiveWork(), false, "drained shutdown releases live-work ownership");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

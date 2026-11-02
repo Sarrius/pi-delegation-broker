@@ -1,4 +1,4 @@
-import { assertIndependentNodeScopes } from "./delegation-policy.mjs";
+import { assertIndependentNodeScopes, storedInputCap, storedOutputCap } from "./delegation-policy.mjs";
 import { basename, dirname, isAbsolute } from "node:path";
 import { normalizeControllerAcceptanceSpecs } from "./acceptance-plan.mjs";
 import { normalizeContract } from "./child-contract.mjs";
@@ -157,7 +157,12 @@ export function appendWorkflowNodes(root, jobId, nodes, { joins = [], proposalId
     const prior = current.team.proposals.find((proposal) => proposal.proposalId === proposalId);
     if (prior) {
       if (prior.digest !== digest) fail("proposal id was reused with a different digest");
-      return Object.freeze({ job: current, added: Object.freeze([]), reused: Object.freeze(prior.memberIds.map((existingId) => ({ requestedId: existingId, existingId, fingerprint: "proposal-replay" }))), joins: Object.freeze([]), proposalId, proposalDigest: digest, revision: current.team.revision, idempotentReplay: true });
+      const reused = incoming.map((node) => {
+        const existing = current.nodes.find((member) => member.admission.fingerprint === node.admission.fingerprint);
+        if (!existing) fail("proposal replay lost its admitted member");
+        return Object.freeze({ requestedId: node.id, existingId: existing.id, fingerprint: node.admission.fingerprint });
+      });
+      return Object.freeze({ job: current, added: Object.freeze([]), reused: Object.freeze(reused), joins: Object.freeze([]), proposalId, proposalDigest: digest, revision: current.team.revision, idempotentReplay: true });
     }
   }
   if (expectedRevision !== undefined && expectedRevision !== current.team.revision) fail(`workflow revision conflict: expected ${expectedRevision}, current ${current.team.revision}`);
@@ -271,6 +276,8 @@ export class TaskOrchestrator {
       ...(metadata.idempotencyKey ? { idempotencyKey: metadata.idempotencyKey } : {}),
       ...(metadata.deadlineAt ? { deadlineAt: metadata.deadlineAt } : {}),
       policyGeneration: metadata.policyGeneration ?? "unresolved",
+      outputBudgetPolicy: metadata.outputBudgetPolicy ?? "metered_default_v2",
+      inputBudgetPolicy: metadata.inputBudgetPolicy ?? "metered_default_v1",
     };
     return submitJob(this.#root, job);
   }
@@ -290,7 +297,7 @@ export class TaskOrchestrator {
     const startedAt = state.startedAt ?? this.#now();
     state = structuredClone(updateJob(this.#root, this.#jobId, (job) => job.status === "cancellation_requested"
       ? job
-      : ({ ...job, status: "running", startedAt }), this.#now()));
+      : ({ ...job, status: "running", startedAt, shutdownReplaySafe: undefined }), this.#now()));
     let byId = new Map(state.nodes.map((node) => [node.id, node]));
     const running = new Set();
 
@@ -344,6 +351,9 @@ export class TaskOrchestrator {
       return persisted;
     };
     const launch = async (node) => {
+      if (state.budgetAccountingUncertain) {
+        node.state = "failed"; node.error = "remaining root budget is unknown"; persist(); return;
+      }
       if (state.team && state.team.usage.startedAttempts >= state.team.budgets.maxAttempts) {
         node.state = "failed";
         node.error = "root team maxAttempts budget exceeded";
@@ -385,26 +395,29 @@ export class TaskOrchestrator {
           ...(attemptBudget ? { attemptBudget } : {}),
           ...(remainingOutputTokens !== undefined ? { controllerBudget: { maxOutputTokens: remainingOutputTokens } } : {}),
         }));
+        // A shutdown discards completion authority, not tokens already consumed.
+        const usageKnown = Number.isSafeInteger(result?.usage?.output) && result.usage.output >= 0;
+        const outputTokens = usageKnown ? result.usage.output : 0;
+        if (!usageKnown && state.team?.budgets.maxOutputTokens !== undefined) state.budgetAccountingUncertain = true;
+        if (state.team) state.team = { ...state.team, usage: { ...state.team.usage, outputTokens: state.team.usage.outputTokens + outputTokens } };
         if (signal?.aborted) {
-          node.state = "pending";
+          const cannotResume = !["cancel", "deadline"].includes(signal.reason)
+            && (storedInputCap(state) !== undefined || storedOutputCap(state) !== undefined || state.budgetAccountingUncertain);
+          node.state = cannotResume ? "failed" : "pending";
+          if (cannotResume) node.error = "interrupted capped node cannot safely replenish its budget";
+        } else if (state.budgetAccountingUncertain) {
+          node.state = "failed"; node.error = "root output usage is unavailable";
         } else {
           node.result = result;
-          const outputTokens = Number.isSafeInteger(result?.usage?.output) && result.usage.output >= 0 ? result.usage.output : 0;
-          if (state.team) {
-            const outputTotal = state.team.usage.outputTokens + outputTokens;
-            state.team = { ...state.team, usage: { ...state.team.usage, outputTokens: outputTotal } };
-            if (state.team.budgets.maxOutputTokens !== undefined && outputTotal > state.team.budgets.maxOutputTokens) {
-              node.state = "failed";
-              node.error = "root team maxOutputTokens budget exceeded";
-            } else {
-              node.state = result?.status === "completed" ? "completed" : "failed";
-            }
-          } else {
-            node.state = result?.status === "completed" ? "completed" : "failed";
-          }
+          if (state.team?.budgets.maxOutputTokens !== undefined && state.team.usage.outputTokens > state.team.budgets.maxOutputTokens) {
+            node.state = "failed";
+            node.error = "root team maxOutputTokens budget exceeded";
+          } else node.state = result?.status === "completed" ? "completed" : "failed";
         }
       } catch (error) {
-        if (signal?.aborted) node.state = "pending";
+        if (state.team?.budgets.maxOutputTokens !== undefined) state.budgetAccountingUncertain = true;
+        const capped = storedInputCap(state) !== undefined || storedOutputCap(state) !== undefined || state.budgetAccountingUncertain;
+        if (signal?.aborted && !capped) node.state = "pending";
         else {
           node.state = "failed";
           node.error = error instanceof Error ? error.message : "runner failed";
@@ -461,6 +474,7 @@ export class TaskOrchestrator {
         state.terminalReason = "workflow deadline expired";
       } else {
         state.status = "queued";
+        state.shutdownReplaySafe = !state.budgetAccountingUncertain;
         state.terminalReason = "paused for controller shutdown";
       }
       persist();

@@ -258,6 +258,7 @@ export class SingleHostBrokerSupervisor {
         ...(this.#resourceRanker === undefined ? {} : { resourceRanker: this.#resourceRanker }),
         behavioralEnforcement: this.#behavioralEnforcement,
         reconcileRegistryOnStart: this.#dynamicProviders,
+        preserveUnlistedResources: this.#dynamicProviders && this.#runtimeNamespace !== undefined,
       });
       hardenFile(this.databasePath);
       this.#server = new BrokerIpcServer({

@@ -205,6 +205,40 @@ function listingModelIds(listing) {
 }
 
 /**
+ * Resolve which model a provider actually served for a request (OpenAI-format only).
+ *
+ * A vendor that retires an id but still accepts it answers with the canonical id in the
+ * response `model` field — `deepseek-v4-flash` comes back as `deepseek-flash`. That is a live,
+ * authoritative alias fact and needs no per-model table. Controller-side only: the credential
+ * never leaves this process and the returned value carries only the served id.
+ */
+export async function probeServedModel({ baseUrl, apiKey, modelId, timeoutMs = 15_000, fetchImpl = fetch } = {}) {
+  if (typeof baseUrl !== "string" || !baseUrl) throw new Error("probeServedModel requires a baseUrl");
+  if (typeof modelId !== "string" || !modelId) throw new Error("probeServedModel requires a modelId");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(`${baseUrl.replace(/\/+$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+      },
+      body: JSON.stringify({ model: modelId, messages: [{ role: "user", content: "." }], max_tokens: 1, stream: false }),
+      signal: controller.signal,
+    });
+    if (!response.ok) return { status: "http_error", code: response.status };
+    const body = await response.json();
+    const servedModel = typeof body?.model === "string" && body.model ? body.model : undefined;
+    return servedModel ? { status: "ok", servedModel } : { status: "unknown" };
+  } catch (error) {
+    return { status: "unreachable", reason: error?.name === "AbortError" ? "timeout" : "connection" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Build the currency map for a set of resources.
  *
  * `liveListings` is provider → Set<modelId> or provider → Map<modelId, createdMs>. Supplying
@@ -212,7 +246,7 @@ function listingModelIds(listing) {
  * signal. Providers absent from the map contribute no listing fact rather than being punished
  * for a probe outage.
  */
-export function buildCurrencyMap({ resources, liveListings, evaluatedAt } = {}) {
+export function buildCurrencyMap({ resources, liveListings, servedModels, evaluatedAt } = {}) {
   if (!Array.isArray(resources)) throw new Error("buildCurrencyMap requires resources");
   const allIds = resources.map((resource) => resource.modelId);
   // The live listing matters even for models the user has not configured. If their stale Pi
@@ -250,6 +284,10 @@ export function buildCurrencyMap({ resources, liveListings, evaluatedAt } = {}) 
   for (const { provider, modelId } of resources) {
     const fact = generations.get(modelId) ?? { family: parseModelVersion(modelId).family, generation: 0 };
     const { listed, createdAt } = listingFact(liveListings?.get(provider), modelId);
+    // A served id different from the requested id means the requested id is a retired alias of
+    // the canonical model (verified live, e.g. `deepseek-v4-flash` → `deepseek-flash`).
+    const servedModel = servedModels?.get(provider)?.get(modelId);
+    const aliasOf = typeof servedModel === "string" && servedModel && servedModel !== modelId ? servedModel : undefined;
     const staleByDate = Number.isSafeInteger(createdAt)
       && createdAt > 0
       && (familyNewest.get(fact.family) ?? createdAt) - createdAt > FAMILY_STALENESS_MS;
@@ -263,6 +301,7 @@ export function buildCurrencyMap({ resources, liveListings, evaluatedAt } = {}) 
       ...(Number.isSafeInteger(evaluatedAt) ? { evaluatedAt } : {}),
       ...(Number.isSafeInteger(createdAt) ? { createdAt } : {}),
       ...(staleByDate ? { staleByDate: true } : {}),
+      ...(aliasOf ? { aliasOf } : {}),
       legacy: generation >= LEGACY_GENERATION,
     });
   }
@@ -280,16 +319,36 @@ export function readCurrencyCache(path) {
   return undefined;
 }
 
-export function writeCurrencyCache(path, listings) {
+export function writeCurrencyCache(path, listings, servedModels) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const serializable = {};
   for (const [provider, ids] of listings) {
     const modelIds = ids instanceof Map ? [...ids.keys()] : ids instanceof Set ? [...ids] : [];
     serializable[provider] = modelIds.filter((id) => typeof id === "string").sort();
   }
+  const serializableServed = {};
+  for (const [provider, served] of servedModels ?? []) {
+    const entries = served instanceof Map ? [...served.entries()] : [];
+    const resolved = entries.filter(([requested, canonical]) => typeof requested === "string" && typeof canonical === "string" && requested !== canonical);
+    if (resolved.length) serializableServed[provider] = Object.fromEntries(resolved.sort());
+  }
   const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, JSON.stringify({ probedAt: Date.now(), listings: serializable }), { mode: 0o600 });
+  writeFileSync(temporary, JSON.stringify({ probedAt: Date.now(), listings: serializable, servedModels: serializableServed }), { mode: 0o600 });
   renameSync(temporary, path);
+}
+
+/** Alias facts persisted alongside listings, so a restart keeps the observed canonicalization. */
+export function servedModelsFromCache(cache) {
+  const served = new Map();
+  for (const [provider, entries] of Object.entries(cache?.servedModels ?? {})) {
+    if (!entries || typeof entries !== "object") continue;
+    const resolved = new Map();
+    for (const [requested, canonical] of Object.entries(entries)) {
+      if (typeof requested === "string" && typeof canonical === "string" && requested !== canonical) resolved.set(requested, canonical);
+    }
+    if (resolved.size) served.set(provider, resolved);
+  }
+  return served;
 }
 
 export function listingsFromCache(cache) {

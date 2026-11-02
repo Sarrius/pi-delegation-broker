@@ -17,6 +17,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, isAbsolute } from "node:path";
+import { THINKING_LEVELS } from "./child-contract.mjs";
+import { effectiveQualityEvents } from "./routing-history-store.mjs";
 
 const RESOURCE_ID = /^[A-Za-z0-9~][A-Za-z0-9._/:~-]{0,191}$/;
 const CAPABILITY = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
@@ -138,7 +140,7 @@ export class ModelAffinityJournal {
   }
 
   /** Called only by a controller verifier bridge after receipt validation. */
-  recordVerified({ resourceId, capabilities, outcome, latencyMs, tokens, attempts, observationId, context = this.#context, timestamp = this.#now() } = {}) {
+  recordVerified({ resourceId, capabilities, outcome, latencyMs, tokens, attempts, effectiveThinking, observationId, context = this.#context, timestamp = this.#now() } = {}) {
     if (typeof resourceId !== "string" || !RESOURCE_ID.test(resourceId)) throw new Error("model affinity requires a valid resource id");
     if (outcome !== "accepted" && outcome !== "rejected") throw new Error("model affinity outcome must be accepted or rejected");
     if (!Number.isSafeInteger(latencyMs) || latencyMs < 0 || !Number.isSafeInteger(timestamp) || timestamp < 0) {
@@ -146,10 +148,13 @@ export class ModelAffinityJournal {
     }
     if (tokens !== undefined && (!Number.isSafeInteger(tokens) || tokens < 0)) throw new Error("model affinity tokens must be non-negative");
     if (attempts !== undefined && (!Number.isSafeInteger(attempts) || attempts < 1)) throw new Error("model affinity attempts must be a positive count");
+    if (effectiveThinking !== undefined && !THINKING_LEVELS.includes(effectiveThinking)) throw new Error("model affinity effective thinking is invalid");
     const taskClass = capabilityClass(capabilities);
     if (this.#store) {
       this.#store.append({ id: observationId ?? `quality:${randomUUID()}`, kind: "quality", timestamp,
-        data: {resourceId, capabilities, outcome, latencyMs, context, ...(tokens === undefined ? {} : {tokens}), ...(attempts === undefined ? {} : {attempts})} });
+        data: {resourceId, capabilities, outcome, latencyMs, context, ...(tokens === undefined ? {} : {tokens}),
+          ...(attempts === undefined ? {} : {attempts}),
+          ...(effectiveThinking === undefined ? {} : {effectiveThinking})} });
       this.#refresh(context);
       const entry = this.#state.observations[`${taskClass}\u0000${resourceId}`];
       return Object.freeze({...entry, reliability: reliability(entry), efficiency: means(entry)});
@@ -227,7 +232,7 @@ export class ModelAffinityJournal {
     if (!this.#store) return;
     const state = fresh();
     // A bounded recent evidence window permits recovery from model/harness drift.
-    for (const {data, timestamp} of this.#store.list({kind:"quality",limit:100000})) {
+    for (const {data, timestamp} of effectiveQualityEvents(this.#store)) {
       if (data.context !== context) continue;
       if (timestamp < this.#now() - 30 * 24 * 60 * 60 * 1000) continue;
       const taskClass = capabilityClass(data.capabilities);

@@ -1,11 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeWork, activeAssignments, assignmentNotice, parentWriteConflict, overlappingAssignment } from '../src/delegation-policy.mjs';
+import { normalizeWork, activeAssignments, assignmentNotice, parentWriteConflict, overlappingAssignment, storedOutputCap } from '../src/delegation-policy.mjs';
 import { normalizeContract, assertStoredContract } from '../src/child-contract.mjs';
 const work={taskClass:'diagnosis',deliverable:'Find race',benefit:'Independent evidence',parentWork:'Inspect another subsystem',ownedPaths:['/repo/src']};
+test('persisted old jobs keep their original hard cap while new default work has no cumulative cap',()=>{
+ assert.equal(storedOutputCap({kind:'task'}),16000);
+ assert.equal(storedOutputCap({kind:'task',outputBudgetPolicy:'metered_default_v2'}),undefined);
+ assert.equal(storedOutputCap({kind:'task',outputBudgetPolicy:'metered_default_v2',maxOutputTokens:6000}),6000);
+ assert.equal(storedOutputCap({kind:'workflow'}, {maxOutputTokens:9000}),9000);
+ assert.equal(storedOutputCap({kind:'workflow',outputBudgetPolicy:'metered_default_v2'}, {maxAttempts:2}),undefined);
+});
 test('ownership persists in child contracts and blocks parent writes until terminal, including cancellation pending',()=>{
  const contract=assertStoredContract(normalizeContract({work}));assert.equal(contract.work.taskClass,'diagnosis');
- for(const status of ['queued','running','cancellation_requested']) {const assignments=activeAssignments([{jobId:'job',kind:'task',ownerSessionId:'owner',status,contract}],'owner');assert.ok(parentWriteConflict('src/a.ts','/repo',assignments));assert.ok(overlappingAssignment(normalizeWork(work),assignments));assert.match(assignmentNotice(assignments),/Inspect another subsystem/);}
+ for(const status of ['submitted','queued','running','cancellation_requested']) {const assignments=activeAssignments([{jobId:'job',kind:'task',ownerSessionId:'owner',status,contract}],'owner');assert.ok(parentWriteConflict('src/a.ts','/repo',assignments));assert.ok(overlappingAssignment(normalizeWork(work),assignments));assert.match(assignmentNotice(assignments),/Inspect another subsystem/);}
+ assert.match(assignmentNotice(activeAssignments([{jobId:'job',kind:'task',ownerSessionId:'owner',status:'submitted',contract}],'owner')),/admission reserves/);
  assert.equal(parentWriteConflict('src/a.ts','/repo',activeAssignments([{jobId:'job',kind:'task',ownerSessionId:'owner',status:'cancelled',contract}],'owner')),undefined);
  assert.equal(parentWriteConflict('src-other/a.ts','/repo',activeAssignments([{jobId:'job',kind:'task',ownerSessionId:'owner',status:'running',contract}],'owner')),undefined);
  assert.equal(activeAssignments([{jobId:'job',ownerSessionId:'foreign',status:'running'}],'owner').length,0);

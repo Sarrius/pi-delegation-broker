@@ -22,6 +22,28 @@ const STATUSES = new Set(["completed", "failed"]);
 export const REPORT_READ_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_TEXT = 64 * 1024;
 
+/** Execution completion is not verification acceptance. Preserve the controller receipt. */
+export function reportVerificationEvidence(result) {
+  const verification = result?.verification?.verification;
+  return verification && ["accepted", "rejected"].includes(verification.status)
+    ? { verificationStatus: verification.status, verification }
+    : {};
+}
+
+/** Resolve only an exact durable task/node binding; report-provided owner labels are not authority. */
+export function reportOwnerJob(report, readJob) {
+  if (!report || typeof report.taskId !== "string" || !TASK_ID.test(report.taskId)) return undefined;
+  const direct = readJob(report.taskId);
+  if (direct) return direct; // Never use logicalId to override an existing task's owner.
+  const parts = typeof report.logicalId === "string" ? report.logicalId.split("/") : [];
+  if (parts.length !== 2 || !parts.every(id => TASK_ID.test(id))) return undefined;
+  const [rootId, nodeId] = parts;
+  const job = readJob(rootId);
+  if (job?.kind !== "workflow" || job.jobId !== rootId || report.taskId !== `${rootId}-${nodeId}`) return undefined;
+  const node = job.nodes?.find(entry => entry.id === nodeId);
+  return node && node.result?.reportTaskId === report.taskId ? job : undefined;
+}
+
 function reportPath(root, taskId) {
   if (!TASK_ID.test(taskId)) throw new Error("report store requires a bounded task id");
   const path = resolve(join(root, `${taskId}.json`));

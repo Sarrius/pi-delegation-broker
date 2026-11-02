@@ -34,6 +34,20 @@ test("three semantically identical completed actions with no state change termin
   });
 });
 
+test("parallel duplicate reads count as one decision, not three no-progress turns", () => {
+  const monitor = new BehavioralRunMonitor({ doneWhen: ["inspect"], repeatedNoProgressLimit: 3 });
+  const result = { text: "same content" };
+  const observe = (modelTurnId) => monitor.observeActionResult({
+    toolName: "read", args: { path: "README.md" }, result, isError: false, stateDigest: stateA, modelTurnId,
+  });
+  assert.equal(observe(1).status, "progress_observed");
+  // The next assistant response contains three identical read calls. All three
+  // results arrive before the model can see any of them or choose a new action.
+  for (let i = 0; i < 3; i++) assert.equal(observe(2).status, "progress_observed");
+  assert.equal(monitor.metrics().repeatedNoProgress, 1);
+  assert.equal(observe(3).status, "no_progress", "three separate model decisions still terminate");
+});
+
 test("a state transition resets repetition and a running tool is not misclassified", () => {
   const monitor = new BehavioralRunMonitor({ doneWhen: ["tests pass"], repeatedNoProgressLimit: 2 });
   run(monitor, "first");

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.0-alpha.4 — 2026-11-02
+
+- Add opt-in operational Jev decisions and eligible read-only route advice, with separate consent, bounded requests, safe fallbacks and source-attributed model evidence.
+- Add experimental `delegate_visual` using Jev 1.14 Images/Box with explicit image-export consent, paired presence checks, bounded local PNG/JPEG inputs and no UI-action authority. Existing text consent does not enable image export.
+- Qualify routes through isolated tool-loop canaries before owner work; distinguish cached readiness, actual child handoffs, parent utility and independently verified outcomes.
+- Preserve reasoning effort, read-only budget semantics, shared-controller state, parent compaction/wake ownership and bounded workflow recovery.
+- Fix generation-aware cold-start ranking and prevent one opaque pre-header failure from immediately quarantining untried sibling models. Expose health reasons and exact-preflight exclusions in preview diagnostics.
+- Add native metered-provider admission and pool-pressure handling while retaining explicit billing, quality and capability gates.
+- Keep the package experimental and publish under `next`; this release does not claim unattended production readiness or measured orchestration utility gains.
+
 ## 0.1.0-alpha.3 — 2026-10-26
 
 - Integrate account-discovered Antigravity subscription routes from pi-multi-account 1.27.0 browser login, without manual application configuration or controller-held user tokens.

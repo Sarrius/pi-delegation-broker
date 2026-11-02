@@ -435,6 +435,23 @@ test("cooldown default comes from registry and only one half-open probe is admit
   }, registry);
 });
 
+test("duplicate rate-limit reports cannot replace a real Retry-After with the longer default", () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  withBroker((broker) => {
+    assert.equal(broker.markRateLimited("R1", 2_000, 1_000).until, 3_000);
+    assert.equal(broker.markRateLimited("R1", undefined, 1_001).until, 3_000);
+    assert.equal(broker.markRateLimited("R1_ALIAS", 5_000, 2_000).until, 7_000);
+    assert.equal(broker.markRateLimited("R1", undefined, 2_001).until, 7_000);
+    assert.equal(broker.reserve(fixtureContract({ taskId: "too-soon" }), 6_999).status, "denied_capacity");
+    const probe = leased(broker, fixtureContract({ taskId: "retry-when-provider-said" }), 7_000);
+    assert.equal(probe.probe, true);
+    const nextFailure = broker.markRateLimited("R1", undefined, 7_001);
+    assert.equal(nextFailure.until, 7_001 + registry.capacityGroups["G-shared"].cooldown.defaultMs);
+  }, registry);
+});
+
 test("a successful availability preflight clears unknown resources but does not close a quota breaker", () => {
   const registry = fixtureRegistry();
   delete registry.resources.R2;
@@ -451,6 +468,59 @@ test("a successful availability preflight clears unknown resources but does not 
     broker.markAvailabilityObserved("R1", 1_003, "capacity_group");
     const stillCooling = broker.inventory(1_003).find((row) => row.resourceId === "R1");
     assert.equal(stillCooling.breakerState, "cooling_down", "a model-list probe cannot prove inference quota recovered");
+  }, registry);
+});
+
+/**
+ * Incident `workflow-mtopmw94-8`: the runner quarantined a route after a real pre-header
+ * transport failure, and ~14s later the periodic catalog sweep listed the provider successfully
+ * and reset `state='healthy', cooldown_until=0` for the whole group. The next task then leased the
+ * same dead route, so the broker forgot every dispatch lesson within one probe cycle.
+ */
+test("a listing probe cannot resurrect a route quarantined by a real dispatch failure", () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R2;
+  delete registry.resources.R3;
+  registry.capacityGroups["G-shared"].cooldown = { defaultMs: 10_000, probeIntervalMs: 300_000 };
+  withBroker((broker) => {
+    broker.markUnknown("R1", 1_000, "transport_before_headers", "capacity_group", undefined, "dispatch");
+    const sibling = broker.inventory(1_000).find((row) => row.resourceId === "R1_ALIAS");
+    assert.equal(sibling.state, "unknown", "the endpoint failure condemns the whole account");
+
+    broker.markAvailabilityObserved("R1", 15_000, "capacity_group");
+
+    for (const row of broker.inventory(15_000)) {
+      assert.equal(row.state, "unknown", `${row.resourceId}: a model listing does not prove inference dispatch recovered`);
+      assert.ok(row.cooldownUntil > 15_000, `${row.resourceId}: the dispatch retry deadline must survive a listing probe`);
+    }
+  }, registry);
+});
+
+for (const firstEvidence of ["catalog", "dispatch"]) test(`repeated catalog outages cannot postpone ${firstEvidence} recovery forever; alternatives still work`, () => {
+  const registry = fixtureRegistry();
+  delete registry.resources.R3;
+  registry.capacityGroups["G-shared"].cooldown = { defaultMs: 10_000, probeIntervalMs: 2_000 };
+  withBroker((broker) => {
+    broker.markUnknown("R1", 1_000, "initial outage", "capacity_group", undefined, firstEvidence);
+    const alternative = leased(broker, fixtureContract({ taskId: "use-other-group" }), 1_001);
+    assert.equal(alternative.resourceId, "R2");
+    broker.release(alternative.leaseId, alternative.fencingToken, "alternate complete", 1_002);
+    for (const now of [1_500, 2_000, 2_999, 3_000]) {
+      const observation = broker.markUnknown("R1", now, "catalog still down", "capacity_group");
+      assert.equal(observation.retryAt, 3_000, "background discovery cannot perpetually push the inference probe into the future");
+    }
+    const probe = leased(broker, fixtureContract({ taskId: "automatic-recovery", capability: { ...fixtureContract().capability, allowedResources: ["R1"] } }), 3_000);
+    assert.equal(probe.resourceId, "R1");
+    assert.equal(probe.probe, true);
+    const otherDuringProbe = leased(broker, fixtureContract({ taskId: "other-still-works" }), 3_000);
+    assert.equal(otherDuringProbe.resourceId, "R2");
+    broker.markProviderSucceeded(probe.leaseId, probe.fencingToken, 3_001);
+    broker.release(probe.leaseId, probe.fencingToken, "recovered", 3_001);
+    const healthy = leased(broker, fixtureContract({ taskId: "reuse-recovered" }), 3_001);
+    assert.equal(healthy.resourceId, "R1");
+    assert.equal(healthy.probe, false);
+    broker.markUnknown("R1", 3_002, "new dispatch failure", "resource", undefined, "dispatch");
+    assert.equal(broker.inventory(3_002).find(row => row.resourceId === "R1").cooldownUntil, 5_002);
   }, registry);
 });
 
@@ -899,6 +969,19 @@ test("a registry reload does not resurrect accounts already proven dead", () => 
   assert.equal(inventory.find((row) => row.resourceId === "R2").state, "unknown");
   // A healthy account is untouched, so a reload cannot silently quarantine a working route.
   assert.equal(inventory.find((row) => row.resourceId === "R3").state, "healthy");
+}));
+
+test("registry reload preserves dispatch evidence so catalog success cannot fake recovery", () => withBroker((broker) => {
+  broker.markUnknown("R1", 1_000, "dispatch failed", "capacity_group", undefined, "dispatch");
+  broker.reloadRegistry(fixtureRegistry(), 1_001);
+  broker.markAvailabilityObserved("R1", 1_002, "capacity_group");
+  for (const id of ["R1", "R1_ALIAS"]) {
+    const row = broker.inventory(1_002).find(entry => entry.resourceId === id);
+    assert.equal(row.state, "unknown");
+    assert.equal(row.cooldownUntil, 301_000);
+  }
+  const alternative = leased(broker, fixtureContract({ taskId: "after-reload-use-alternative" }), 1_002);
+  assert.equal(alternative.resourceId, "R2");
 }));
 
 test("a controller with no receipt authority says so instead of denying opaquely", () => withBroker((broker) => {

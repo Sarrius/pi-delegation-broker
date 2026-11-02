@@ -3,7 +3,7 @@ import {
   chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync,
 } from "node:fs";
 import { join, resolve, sep } from "node:path";
-import { activeAssignments, overlappingAssignment } from "./delegation-policy.mjs";
+import { activeAssignments, overlappingAssignment, storedInputCap, storedOutputCap } from "./delegation-policy.mjs";
 import { assertStoredContract } from "./child-contract.mjs";
 import { validateTeamState } from "./team.mjs";
 
@@ -44,6 +44,15 @@ function validate(job) {
   if (typeof job.cwd !== "string" || job.cwd.length < 1 || job.cwd.length > 4096 || /\0/.test(job.cwd)) fail("cwd is invalid");
   if (job.ownerSessionId !== undefined && (typeof job.ownerSessionId !== "string" || !SESSION_ID.test(job.ownerSessionId))) fail("ownerSessionId is invalid");
   if (job.workFingerprint !== undefined && !/^[a-f0-9]{64}$/.test(job.workFingerprint)) fail("workFingerprint is invalid");
+  if (job.outputBudgetPolicy !== undefined && job.outputBudgetPolicy !== "metered_default_v2") fail("outputBudgetPolicy is invalid");
+  if (job.inputBudgetPolicy !== undefined && job.inputBudgetPolicy !== "metered_default_v1") fail("inputBudgetPolicy is invalid");
+  if (job.startedAttempts !== undefined && (!Number.isSafeInteger(job.startedAttempts) || job.startedAttempts < 0)) fail("startedAttempts is invalid");
+  for (const field of ["budgetAccountingUncertain", "shutdownReplaySafe"]) {
+    if (job[field] !== undefined && typeof job[field] !== "boolean") fail(`${field} is invalid`);
+  }
+  for (const field of ["maxInputTokens", "maxOutputTokens"]) {
+    if (job[field] !== undefined && (!Number.isSafeInteger(job[field]) || job[field] < 1)) fail(`${field} is invalid`);
+  }
   if (job.kind === "task" && (typeof job.task !== "string" || job.task.length < 1 || job.task.length > 256 * 1024)) fail("task text is invalid");
   // The contract is durable intent: a malformed one must not survive a restart and silently
   // resolve into different spending than the caller asked for. Node contracts are the same
@@ -153,6 +162,25 @@ function updateJobLocked(root, jobId, update, now) {
   return writeJob(root, { ...next, updatedAt: now });
 }
 
+// An asynchronous submission reserves the assignment while the controller selects a route.
+// Only a real, admitted child session transfers the assignment. Subsequent failover attempts
+// retain that transfer; cancellation and terminal outcomes can never be revived by a late start.
+export function markTaskAdmitted(root, jobId, now = Date.now(), { maxAttempts } = {}) {
+  return updateJob(root, jobId, (job) => {
+    if (job.kind !== "task") fail("only a task can be admitted as a child");
+    if (maxAttempts !== undefined) {
+      if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 32) fail("maxAttempts is invalid");
+      if (!["submitted", "running"].includes(job.status)) fail(`task cannot be admitted from ${job.status}`);
+      const used = job.startedAttempts ?? 0;
+      if (used >= maxAttempts) fail("durable physical-attempt budget exceeded");
+      return { ...job, status: "running", admittedAt: job.admittedAt ?? now, startedAttempts: used + 1 };
+    }
+    if (job.status === "running") return job;
+    if (job.status !== "submitted") fail(`task cannot be admitted from ${job.status}`);
+    return { ...job, status: "running", admittedAt: now };
+  }, now);
+}
+
 export function requestJobCancellation(root, jobId, now = Date.now(), ownerSessionId) {
   return updateJob(root, jobId, (job) => {
     if (job.ownerSessionId !== undefined && ownerSessionId !== job.ownerSessionId) fail("job owner session does not match");
@@ -175,6 +203,15 @@ export function recoverJobs(root, now = Date.now(), { ownerSessionId } = {}) {
     const next = updateJob(root, current.jobId, (job) => {
       if (job.status === "cancellation_requested") {
         return { ...job, status: "cancelled", completedAt: now, terminalReason: "cancelled during controller restart" };
+      }
+      const capped = storedInputCap(job) !== undefined || storedOutputCap(job) !== undefined;
+      const legacyStarted = job.startedAt !== undefined && (job.inputBudgetPolicy === undefined || job.outputBudgetPolicy === undefined);
+      const interruptedTask = job.kind === "task" && (job.status === "running" || job.admittedAt !== undefined || legacyStarted || job.terminalReason === "paused for controller shutdown");
+      const interruptedNodes = job.kind === "workflow" && job.nodes.some((node) => node.state === "running");
+      const unaccountedPause = job.kind === "workflow" && job.terminalReason === "paused for controller shutdown" && job.shutdownReplaySafe !== true;
+      if (job.budgetAccountingUncertain || (interruptedTask && (capped || job.startedAttempts === undefined))
+        || ((interruptedNodes || unaccountedPause) && (capped || job.team?.budgets.maxOutputTokens !== undefined))) {
+        return { ...job, status: "failed", completedAt: now, terminalReason: "interrupted work has unaccounted token or attempt budget; replay denied" };
       }
       const nodes = Array.isArray(job.nodes)
         ? job.nodes.map((node) => node.state === "running" ? { ...node, state: "pending", result: undefined, error: undefined } : node)

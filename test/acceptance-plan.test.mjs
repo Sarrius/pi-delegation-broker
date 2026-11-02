@@ -25,7 +25,7 @@ test("acceptance vocabulary exposes fixed checks without executable argv", async
       { id: "file-equals", path: "value.txt", content: "two\n" },
     ]);
     assert.deepEqual([...controllerAcceptanceCheckIds], [
-      "git-diff-check", "npm-check", "npm-test", "npm-release-check", "file-equals",
+      "git-diff-check", "npm-check", "npm-test", "npm-release-check", "file-equals", "answer-equals",
     ]);
     assert.equal("argv" in specs[0], false);
     assert.equal("claim" in specs[0], false);
@@ -39,6 +39,27 @@ test("acceptance vocabulary exposes fixed checks without executable argv", async
     const result = await plan.runCheck(plan.checks[1]);
     assert.equal(result.exitCode, 0);
   });
+});
+
+test("read-only work cannot train affinity from an unrelated cwd check", async () => {
+ await withRoot(async root => {
+  writeFileSync(join(root,"value.txt"),"correct\n");
+  assert.throws(() => createControllerAcceptancePlan([{id:"file-equals",path:"value.txt",content:"correct\n"}],
+    {cwd:root,taskMode:"observe"}), /read-only.*result|answer-equals/i);
+  assert.throws(() => createControllerAcceptancePlan([{id:"npm-test"}],
+    {cwd:root,taskMode:"observe"}), /read-only.*result|answer-equals/i);
+ });
+});
+
+test("read-only exact answer acceptance checks the final result, not the source file or child claim", async () => {
+ await withRoot(async root => {
+  const plan=createControllerAcceptancePlan([{id:"answer-equals",content:"verified answer"}],{cwd:root,taskMode:"observe"});
+  assert.doesNotMatch(plan.checks[0].claim,/verified answer/);
+  assert.equal((await plan.runCheck(plan.checks[0],{observedText:"wrong answer"})).exitCode,1);
+  assert.equal((await plan.runCheck(plan.checks[0],{})).exitCode,1);
+  assert.equal((await plan.runCheck(plan.checks[0],{observedText:"verified answer"})).exitCode,0);
+  assert.throws(() => createControllerAcceptancePlan([{id:"answer-equals",content:"verified answer"}],{cwd:root,taskMode:"effect"}),/read-only|effect/i);
+ });
 });
 
 test("caller cannot inject argv, claims, unsafe paths, or symlink targets into a fixed plan", async () => {

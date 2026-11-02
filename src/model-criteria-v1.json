@@ -1,0 +1,264 @@
+{
+  "schemaVersion": 1,
+  "capturedAtUTC": "2026-09-25T11:45:43+00:00",
+  "sourceRegistry": {
+    "codex-recommendations": {
+      "sourceClass": "vendor_guidance",
+      "url": "https://learn.chatgpt.com/docs/models",
+      "snapshotSha256": "96bb353c0850243fd234d2420f5fd370c79c6e23dda011f268f94684e0f5f7a5"
+    },
+    "sol-api": {
+      "sourceClass": "vendor_technical",
+      "url": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+      "snapshotSha256": "6f9b9247933c347f6c881b2ce54ee9f54125314dc9c6c80a44513b69a0dcfa95"
+    },
+    "luna-api": {
+      "sourceClass": "vendor_technical",
+      "url": "https://developers.openai.com/api/docs/models/gpt-6-luna",
+      "snapshotSha256": "1fceb066fdeca0ea3306c7de3e65ed02b84a7ab77e13a6f9826b670053cf8423"
+    },
+    "astra-api": {
+      "sourceClass": "vendor_technical",
+      "url": "https://developers.openai.com/api/docs/models/gpt-6-astra",
+      "snapshotSha256": "906aa1ba54e088029d0f35261f56521b4b51ee1b048b95b64df30d758432e9b0"
+    },
+    "cursor-pool": {
+      "sourceClass": "vendor_technical",
+      "url": "https://cursor.com/docs/models-and-pricing",
+      "snapshotSha256": "8719d6fab7f0d57247ebbae4015a1789fa0763709f02157541fa9437feb98eb6"
+    },
+    "composer-blog": {
+      "sourceClass": "vendor_guidance",
+      "url": "https://cursor.com/blog/composer-2-5",
+      "snapshotSha256": "94c76dc20ec41c672026c13f9d8acaa092c3bd2a3f5cbef81b2f21cf6bc3ecf2"
+    },
+    "deepseek-catalog": {
+      "sourceClass": "vendor_technical",
+      "url": "https://api-docs.deepseek.com/quick_start/pricing/",
+      "snapshotSha256": "210f102275ccf1a6542f08a3bc9e4b4c7c83278cb74b35217bffa112df6363b2"
+    },
+    "aa-sol": {
+      "sourceClass": "third_party_evaluation",
+      "url": "https://artificialanalysis.ai/models/gpt-6-sol",
+      "snapshotSha256": "9e7e124041e25e2c24cc260a9c9d6cc1d0dd41648ad5e96af0a3ec5f291360ec"
+    },
+    "aa-luna": {
+      "sourceClass": "third_party_evaluation",
+      "url": "https://artificialanalysis.ai/models/gpt-6-luna",
+      "snapshotSha256": "d58822902fad674d9ad3ef8aa1ef6dca039fe6c2857308cd0bf9a2dbbfe5b5e3"
+    },
+    "aa-method": {
+      "sourceClass": "third_party_methodology",
+      "url": "https://artificialanalysis.ai/methodology/intelligence-benchmarking",
+      "snapshotSha256": "a5f333f163ad056a620a361ac2eb41ce2b604e52c4b30356ab10ddbbc86a70ed"
+    }
+  },
+  "scope": "Advisory evidence only; no automatic permission/quality receipt; verify live route and exact transport again before lease.",
+  "benchmarks": "AA Intelligence Index v4.3.2, English-focused aggregate, not a success probability or Pi child test. Attributed third-party measurement; per-task/transport transfer unknown.",
+  "models": [
+    {
+      "identity": "cursor/composer-2.5",
+      "manufacturer": "Cursor (Composer; Kimi K2.5 base checkpoint per Cursor)",
+      "routeAliases": [
+        "cursor/composer-2.5",
+        "cursor/composer-2.5-fast"
+      ],
+      "vendorUses": [
+        {
+          "task": "sustained codebase work, complex instructions",
+          "sourceId": "composer-blog",
+          "kind": "attributed_vendor_claim"
+        }
+      ],
+      "effort": {
+        "off": {
+          "wire": "Pi configured off; Cursor internal reasoning unknown",
+          "evidence": "local_model_registry"
+        },
+        "minimal": {
+          "wire": "unsupported_explicit",
+          "evidence": "local_transport"
+        },
+        "low": {
+          "wire": "unsupported_explicit",
+          "evidence": "local_transport"
+        },
+        "medium": {
+          "wire": "unsupported_explicit",
+          "evidence": "local_transport"
+        },
+        "high": {
+          "wire": "unsupported_explicit",
+          "evidence": "local_transport"
+        }
+      },
+      "independentBenchmark": null,
+      "unknowns": [
+        "No independently reproduced exact-variant, effort-matched child-task comparative evidence.",
+        "Fast variant same intelligence is a Cursor vendor assertion; not locally verified.",
+        "Subscription pool headroom is dynamic."
+      ],
+      "sources": [
+        "cursor-pool",
+        "composer-blog"
+      ]
+    },
+    {
+      "identity": "openai-codex/gpt-6-luna",
+      "manufacturer": "OpenAI",
+      "routeAliases": [
+        "openai-codex*/gpt-6-luna"
+      ],
+      "vendorUses": [
+        {
+          "task": "clear focused repeatable lookup, extraction, summarization, focused coding",
+          "sourceId": "codex-recommendations",
+          "kind": "attributed_vendor_claim"
+        }
+      ],
+      "effort": {
+        "off": {
+          "wire": "Pi omits explicit reasoning.effort; provider effective default not attested",
+          "evidence": "local_transport"
+        },
+        "minimal": {
+          "wire": "Pi maps to low, not distinct provider level",
+          "evidence": "local_model_registry"
+        },
+        "low": {
+          "wire": "Codex Responses catalog maps exact effort; preflight required",
+          "evidence": "local_registry_and_vendor_technical"
+        },
+        "medium": {
+          "wire": "Codex Responses catalog maps exact effort; preflight required",
+          "evidence": "local_registry_and_vendor_technical"
+        },
+        "high": {
+          "wire": "Codex Responses catalog maps exact effort; preflight required",
+          "evidence": "local_registry_and_vendor_technical"
+        },
+        "xhigh": {
+          "wire": "Codex Responses catalog maps exact effort; preflight required",
+          "evidence": "local_registry_and_vendor_technical"
+        },
+        "max": {
+          "wire": "Codex Responses catalog maps exact effort; preflight required",
+          "evidence": "local_registry_and_vendor_technical"
+        }
+      },
+      "independentBenchmark": {
+        "sourceId": "aa-luna",
+        "methodologySourceId": "aa-method",
+        "indexVersion": "4.3.2",
+        "effortIndices": {
+          "none": 18.26,
+          "low": 20.92,
+          "medium": 29.46,
+          "high": 32.15,
+          "xhigh": 33.88,
+          "max": 37.26
+        },
+        "strength": "third_party_aggregate_not_local_quality",
+        "transportCaveat": "AA API evaluation does not prove exact Pi subscription behavior or financial price."
+      },
+      "unknowns": [
+        "No controlled local task/effort outcome comparison with Sol or Cursor.",
+        "Pi off does not attest provider none."
+      ],
+      "sources": [
+        "codex-recommendations",
+        "luna-api",
+        "aa-luna",
+        "aa-method"
+      ]
+    },
+    {
+      "identity": "openai-codex/gpt-6-sol",
+      "manufacturer": "OpenAI",
+      "routeAliases": [
+        "openai-codex*/gpt-6-sol"
+      ],
+      "vendorUses": [
+        {
+          "task": "ambiguous/difficult complex coding and agentic workflows",
+          "sourceId": "codex-recommendations",
+          "kind": "attributed_vendor_claim"
+        }
+      ],
+      "effort": {
+        "off": {
+          "wire": "Pi omits explicit reasoning.effort; provider effective default not attested",
+          "evidence": "local_transport"
+        },
+        "minimal": {
+          "wire": "Pi maps to low, not distinct provider level",
+          "evidence": "local_model_registry"
+        },
+        "low": {
+          "wire": "Codex Responses catalog maps exact effort; preflight required",
+          "evidence": "local_registry_and_vendor_technical"
+        },
+        "medium": {
+          "wire": "Codex Responses catalog maps exact effort; preflight required",
+          "evidence": "local_registry_and_vendor_technical"
+        },
+        "high": {
+          "wire": "Codex Responses catalog maps exact effort; preflight required",
+          "evidence": "local_registry_and_vendor_technical"
+        },
+        "xhigh": {
+          "wire": "Codex Responses catalog maps exact effort; preflight required",
+          "evidence": "local_registry_and_vendor_technical"
+        },
+        "max": {
+          "wire": "Codex Responses catalog maps exact effort; preflight required",
+          "evidence": "local_registry_and_vendor_technical"
+        }
+      },
+      "independentBenchmark": {
+        "sourceId": "aa-sol",
+        "methodologySourceId": "aa-method",
+        "indexVersion": "4.3.2",
+        "effortIndices": {
+          "none": 28.09,
+          "low": 33.9,
+          "medium": 39.78,
+          "high": 42.82,
+          "xhigh": 44.1,
+          "max": 47.53
+        },
+        "strength": "third_party_aggregate_not_local_quality",
+        "transportCaveat": "AA API evaluation does not prove exact Pi subscription behavior or financial price."
+      },
+      "unknowns": [
+        "No controlled local task/effort outcome comparison with Luna or Cursor.",
+        "Pi off does not attest provider none."
+      ],
+      "sources": [
+        "codex-recommendations",
+        "sol-api",
+        "aa-sol",
+        "aa-method"
+      ]
+    }
+  ],
+  "notAutoEligible": [
+    {
+      "identity": "openai-codex/gpt-6-astra",
+      "reason": "controller apex explicit admission only",
+      "vendorGuidance": "hardest end-to-end code/apps/research",
+      "sourceId": "codex-recommendations"
+    },
+    {
+      "identity": "deepseek/deepseek-v4-pro",
+      "reason": "metered direct route requires explicit admission",
+      "vendorGuidance": "thinking and non-thinking via model-specific API; no broker auto quality evidence",
+      "sourceId": "deepseek-catalog"
+    }
+  ],
+  "unknownIdentity": {
+    "taskSuitability": "unknown",
+    "benchmark": "unknown",
+    "action": "do not invent priors; retain baseline eligibility and gather current source/checked outcomes before preference"
+  }
+}

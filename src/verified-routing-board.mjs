@@ -1,3 +1,4 @@
+import { THINKING_LEVELS } from "./child-contract.mjs";
 const ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 const EVIDENCE_KIND = "acceptance_criteria";
 
@@ -49,7 +50,10 @@ export class ControllerVerifiedRoutingBoard {
   }
 
   /** Record the terminal outcome only after broker finalization has succeeded. */
-  recordFinalized({ taskId, leaseId, fencingToken, verification, outcome, resourceId, capabilities, latencyMs, tokens, attempts, context, observationId, learningResourceId } = {}) {
+  recordFinalized({ taskId, leaseId, fencingToken, verification, outcome, resourceId, capabilities, latencyMs, tokens, attempts, effectiveThinking, context, observationId, learningResourceId } = {}) {
+    if (effectiveThinking !== undefined && !THINKING_LEVELS.includes(effectiveThinking)) {
+      throw new Error("verified routing effective thinking is invalid");
+    }
     if (typeof taskId !== "string" || !ID.test(taskId) || typeof leaseId !== "string" || !ID.test(leaseId)
       || !Number.isSafeInteger(fencingToken) || fencingToken < 1
       || typeof resourceId !== "string" || !ID.test(resourceId)
@@ -87,6 +91,7 @@ export class ControllerVerifiedRoutingBoard {
       latencyMs,
       ...(tokens === undefined ? {} : { tokens }),
       ...(attempts === undefined ? {} : { attempts }),
+      ...(effectiveThinking === undefined ? {} : { effectiveThinking }),
       timestamp,
     });
     return Object.freeze({ resourceId, capabilities: requiredCapabilities, outcome: record.outcome, evidenceKind: EVIDENCE_KIND, timestamp });

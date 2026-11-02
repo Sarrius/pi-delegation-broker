@@ -6,7 +6,7 @@
  * internals. The catalog source and admission policy remain controller-owned.
  */
 
-import { deriveModelProvenance } from "./model-provenance-policy.mjs";
+import { baseRouteProvider, cursorBillingPool, deriveModelProvenance } from "./model-provenance-policy.mjs";
 
 const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/;
 // A model id may carry a vendor path, a variant suffix and a rolling-alias marker —
@@ -118,7 +118,10 @@ export function capabilityTierId(supports) {
  *   its strongest one;
  * - one capacity group per provider — an account has a single rate-limit
  *   bucket that every one of its models shares, so a 429 on one model must
- *   cool down all of them;
+ *   cool down all of them. A provider that meters several independent pools
+ *   under one account is the exception: Cursor bills included models and
+ *   third-party models separately, so its group is per pool and one pool's
+ *   exhaustion cannot bench routes that draw on the other;
  * - one profile per capability tier — shared across providers, so a contract
  *   pinning a tier can be served by whichever provider is alive right now.
  *
@@ -154,13 +157,21 @@ export function catalogToBrokerRegistry(catalog, options = {}) {
     if (seenProviders.has(entry.provider)) throw new Error(`catalog repeats provider ${entry.provider}`);
     seenProviders.add(entry.provider);
 
-    const groupId = `G-${entry.provider}`;
-    capacityGroups[groupId] = Object.freeze({
-      maxConcurrent: maxConcurrentPerProvider,
-      admission: Object.freeze({ controlReserve: 1, verifyReserve: 0 }),
-      cooldown: Object.freeze({ defaultMs: cooldownDefaultMs, probeIntervalMs: cooldownProbeIntervalMs }),
-      confidence,
-    });
+    // Cursor meters two independently-billed model pools under one subscription. Keeping one
+    // group per pool is what stops one pool's 429 from cooling the routes of the other; every
+    // other provider keeps its single account-level group. The pool id is carried on the
+    // resource so the selector can consult live pool pressure for it.
+    const poolScoped = baseRouteProvider(entry.provider) === "cursor";
+    const groupFor = (pool) => {
+      const groupId = pool ? `G-${entry.provider}.${pool}` : `G-${entry.provider}`;
+      capacityGroups[groupId] ??= Object.freeze({
+        maxConcurrent: maxConcurrentPerProvider,
+        admission: Object.freeze({ controlReserve: 1, verifyReserve: 0 }),
+        cooldown: Object.freeze({ defaultMs: cooldownDefaultMs, probeIntervalMs: cooldownProbeIntervalMs }),
+        confidence,
+      });
+      return groupId;
+    };
 
     const seenModels = new Set();
     for (const model of entry.models) {
@@ -171,8 +182,10 @@ export function catalogToBrokerRegistry(catalog, options = {}) {
       const profileId = capabilityTierId(supports);
       profiles[profileId] ??= Object.freeze({ status: "approved", supports });
 
+      const pool = poolScoped ? cursorBillingPool(model.id) : undefined;
       resources[`${entry.provider}/${model.id}`] = Object.freeze({
-        capacityGroup: groupId,
+        capacityGroup: groupFor(pool),
+        ...(pool ? { pool: `${entry.provider}.${pool}` } : {}),
         profile: profileId,
         confidence,
         enforcement: Object.freeze({ input: "hard", output: "hard" }),

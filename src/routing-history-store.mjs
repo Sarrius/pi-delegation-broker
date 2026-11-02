@@ -2,7 +2,18 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
 
-const KINDS = new Set(['quality', 'route', 'feedback', 'decision']);
+const KINDS = new Set(['quality', 'quality_invalidation', 'route', 'feedback', 'decision']);
+const VERIFIED_ID = /^verified:[a-f0-9]{64}$/;
+const EVIDENCE_REF = /^controller:[a-f0-9-]{36}$/;
+
+/** Retain original receipts for audit, but never rank from a controller-proven bad observation. */
+export function effectiveQualityEvents(store) {
+  const invalidated = new Set(store.list({kind:'quality_invalidation',limit:100000})
+    .filter(row=>VERIFIED_ID.test(row.data?.qualityId??'') && row.data?.reason==='controller_result_missing'
+      && EVIDENCE_REF.test(row.data?.evidenceRef??''))
+    .map(row=>row.data.qualityId));
+  return store.list({kind:'quality',limit:100000}).filter(row=>!invalidated.has(row.id));
+}
 function canonical(value) {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])]));
@@ -32,6 +43,18 @@ export class RoutingHistoryStore {
       if (existing && (existing.kind !== kind || existing.data !== json)) throw new Error('history event id collision');
       if (!existing) this.#db.prepare('INSERT INTO routing_history(id,kind,data,timestamp) VALUES(?,?,?,?)').run(id,kind,json,timestamp);
       return { inserted: !existing };
+    });
+  }
+  /** Append one idempotent owner-audited correction; never rewrite or delete the original. */
+  invalidateQuality({qualityId,reason,evidenceRef,timestamp=this.#now()}={}) {
+    if(!VERIFIED_ID.test(qualityId??'') || reason!=='controller_result_missing' || !EVIDENCE_REF.test(evidenceRef??''))
+      throw new Error('invalid controller quality invalidation');
+    return this.transaction(()=>{
+      const target=this.#db.prepare('SELECT kind,timestamp FROM routing_history WHERE id=?').get(qualityId);
+      if(target?.kind!=='quality') throw new Error('missing quality observation to invalidate');
+      if(!Number.isSafeInteger(timestamp)||timestamp<target.timestamp) throw new Error('invalidation precedes quality observation');
+      return this.append({id:`quality_invalidation:${qualityId}`,kind:'quality_invalidation',
+        data:{qualityId,reason,evidenceRef},timestamp});
     });
   }
   transaction(fn) {

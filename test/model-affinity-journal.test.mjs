@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { ModelAffinityJournal } from "../src/model-affinity-journal.mjs";
 import { ControllerVerifiedRoutingBoard } from "../src/verified-routing-board.mjs";
+import { RoutingHistoryStore } from "../src/routing-history-store.mjs";
 
 const CAPS = ["code_reasoning", "text_generation"];
 function journal() {
@@ -43,6 +44,29 @@ test("a verified routing bridge writes an affinity only after receipt/outcome va
     assert.equal(entry.tokenTotal, 321, "controller-observed token use reaches the learned efficiency journal");
     assert.equal(entry.attemptTotal, 2, "the journal retains failover effort, not only final success");
   } finally { rmSync(setup.root, { recursive: true, force: true }); }
+});
+test("receipt-backed quality retains effective effort for reporting without changing requested routing-v3 context", () => {
+  const root=mkdtempSync(join(tmpdir(),"affinity-effective-"));
+  const store=new RoutingHistoryStore({path:join(root,"history.sqlite")});
+  try {
+    const affinity=new ModelAffinityJournal({store,now:()=>1000});
+    const board={record(){},score(){},rank(){return []}};
+    const authority={verify:(receipt,binding)=>receipt?.token==="valid"&&binding.taskId==="task-a"};
+    const bridge=new ControllerVerifiedRoutingBoard({routingBoard:board,verificationAuthority:authority,
+      affinityJournal:affinity,now:()=>1000});
+    const input={taskId:"task-a",leaseId:"lease-a",fencingToken:1,verification:{status:"accepted",token:"valid"},
+      outcome:{status:"completed"},resourceId:"zai/glm-5.3",capabilities:CAPS,latencyMs:10,
+      context:"routing-v3:review:requested-off",effectiveThinking:"low"};
+    assert.throws(()=>bridge.recordFinalized({...input,effectiveThinking:"unknown"}),/effective thinking/);
+    assert.equal(store.count("quality"),0);
+    bridge.recordFinalized(input);
+    const quality=store.list({kind:"quality"});
+    assert.equal(quality.length,1);
+    assert.equal(quality[0].data.effectiveThinking,"low");
+    assert.equal(quality[0].data.context,"routing-v3:review:requested-off");
+    assert.equal(affinity.rank({resourceIds:["zai/glm-5.3"],capabilities:CAPS,
+      context:"routing-v3:review:requested-off"})[0],"zai/glm-5.3");
+  } finally {store.close();rmSync(root,{recursive:true,force:true});}
 });
 test("between equally reliable routes the more efficient one is preferred", () => {
   const setup = journal();

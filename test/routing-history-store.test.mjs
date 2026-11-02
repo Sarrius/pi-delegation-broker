@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { RoutingHistoryStore } from '../src/routing-history-store.mjs';
 import { ModelAffinityJournal } from '../src/model-affinity-journal.mjs';
+import {qualitySummary} from '../src/delegation-history.mjs';
 const caps=['code_reasoning'];
 function setup(t) {const root=mkdtempSync(join(tmpdir(),'routing-shared-'));t.after(()=>rmSync(root,{recursive:true,force:true}));return join(root,'history.sqlite');}
 test('history survives restart, shares live updates, and rejects conflicting replay',t=>{
@@ -36,6 +37,21 @@ test('verified learning survives separate controller instances and isolates task
  first.recordVerified({observationId:'quality:0',context:'diagnosis:high',resourceId:'good/model',capabilities:caps,outcome:'accepted',latencyMs:10});
  assert.equal(a.count('quality'),4);
 });
+test('an authenticated-result defect is corrected by an append-only quality invalidation, not a fabricated opposite verdict',t=>{
+ const path=setup(t),store=new RoutingHistoryStore({path});t.after(()=>store.close());
+ const journal=new ModelAffinityJournal({store}),context='lookup:off',resourceId='cursor/composer-2.5';
+ for(let i=0;i<3;i++)journal.recordVerified({observationId:`verified:${String(i).repeat(64)}`,context,resourceId,capabilities:caps,outcome:'rejected',latencyMs:10});
+ assert.equal(journal.snapshot(context).observations[`code_reasoning\0${resourceId}`].rejected,3);
+ const target=`verified:${'0'.repeat(64)}`;
+ assert.equal(store.invalidateQuality({qualityId:target,reason:'controller_result_missing',evidenceRef:'controller:00000000-0000-0000-0000-000000000001'}).inserted,true);
+ assert.equal(store.invalidateQuality({qualityId:target,reason:'controller_result_missing',evidenceRef:'controller:00000000-0000-0000-0000-000000000001'}).inserted,false);
+ assert.equal(store.count('quality'),3,'the forensic verdict remains in the durable ledger');
+ assert.equal(store.count('quality_invalidation'),1);
+ assert.equal(journal.snapshot(context).observations[`code_reasoning\0${resourceId}`].rejected,2,'routing must not learn the erroneous failure');
+ assert.equal(qualitySummary(store).reduce((n,row)=>n+row.samples,0),2);
+ assert.throws(()=>store.invalidateQuality({qualityId:'verified:'+'f'.repeat(64),reason:'controller_result_missing',evidenceRef:'controller:00000000-0000-0000-0000-000000000001'}),/missing quality/);
+});
+
 test('unknown beats proven failures; traffic volume is not a quality bonus',t=>{
  const path=setup(t),store=new RoutingHistoryStore({path});t.after(()=>store.close());const journal=new ModelAffinityJournal({store});
  for(const [resourceId,wins,losses] of [['frequent',80,20],['scarce',8,0],['failed',0,3]]) for(let i=0;i<wins+losses;i++) journal.recordVerified({resourceId,capabilities:caps,outcome:i<wins?'accepted':'rejected',latencyMs:10,tokens:10});

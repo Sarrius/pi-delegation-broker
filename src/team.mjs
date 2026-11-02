@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { normalizeContract } from "./child-contract.mjs";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -34,6 +35,15 @@ function fail(message) { throw new Error(`team admission: ${message}`); }
 function bounded(value, label, max = 4096) {
   if (typeof value !== "string" || value.length < 1 || value.length > max || /[\0\r\n]/.test(value)) {
     fail(`${label} must be a bounded single-line string`);
+  }
+  return value.trim();
+}
+
+// An objective is task prose, not an identifier. Preserve paragraph/code layout
+// in its JSON fingerprint; missing objectives inherit complete task briefs.
+function boundedObjective(value, label) {
+  if (typeof value !== "string" || !value.trim() || value.length > 256 * 1024 || /\0/.test(value)) {
+    fail(`${label} must be bounded non-empty text without NUL`);
   }
   return value.trim();
 }
@@ -77,7 +87,7 @@ function normalizePurpose(value) {
 export function normalizeTaskAdmission(node, index = 0) {
   if (!node || typeof node !== "object" || Array.isArray(node)) fail(`node ${index} is invalid`);
   const raw = node.admission && typeof node.admission === "object" ? node.admission : {};
-  const objective = bounded(raw.objective ?? node.objective ?? node.task, `node ${index} objective`, 256 * 1024);
+  const objective = boundedObjective(raw.objective ?? node.objective ?? node.task, `node ${index} objective`);
   const scope = optionalBounded(raw.scope ?? node.scope, `node ${index} scope`, 16 * 1024) ?? "";
   const inputValue = raw.inputFingerprint ?? node.inputFingerprint ?? node.inputs ?? [];
   const artifactValue = raw.artifactFingerprint ?? node.artifactFingerprint ?? [];
@@ -182,17 +192,21 @@ function redundancyCount(nodes) {
   return [...groups.values()].reduce((total, count) => total + Math.max(0, count - 1), 0);
 }
 
+function nodeExecutionIntent(node) {
+  const contract = node.contract ?? ([node.work,node.thinking,node.route,node.role,node.skills].some(value => value !== undefined)
+    ? normalizeContract({work:node.work,thinking:node.thinking,route:node.route,role:node.role,skills:node.skills}) : undefined);
+  return {
+    task: node.task,
+    dependsOn: [...(node.dependsOn ?? [])].sort(),
+    inputs: [...(node.inputs ?? [])].sort(),
+    admission: node.admission ?? normalizeTaskAdmission(node),
+    contract: contract ?? null,
+    acceptance: node.acceptance ?? [], tier: node.tier ?? null,
+    capabilities: [...(node.capabilities ?? [])].sort(), recursion: node.recursion ?? null,
+  };
+}
 export function teamProposalDigest(nodes, joins = []) {
-  return digest({
-    nodes: nodes.map((node) => ({
-      id: node.id,
-      task: node.task,
-      dependsOn: [...(node.dependsOn ?? [])].sort(),
-      inputs: [...(node.inputs ?? [])].sort(),
-      admission: node.admission ?? normalizeTaskAdmission(node),
-    })),
-    joins,
-  });
+  return digest({ nodes: nodes.map((node) => ({ id: node.id, ...nodeExecutionIntent(node) })), joins });
 }
 
 export function admitTeamNodes(existingNodes, incomingNodes, { budgets, appendCount = 0, concurrency = 4 } = {}) {
@@ -201,7 +215,7 @@ export function admitTeamNodes(existingNodes, incomingNodes, { budgets, appendCo
   integer(appendCount, "appendCount", 0, normalizedBudgets.maxAppends);
   const existing = existingNodes.map((node, index) => ({ node, admission: node.admission ?? normalizeTaskAdmission(node, index) }));
   const ids = new Set(existingNodes.map((node) => node.id));
-  const byFingerprint = new Map(existing.map(({ node, admission }) => [admission.fingerprint, node.id]));
+  const byFingerprint = new Map(existing.map(({ node, admission }) => [admission.fingerprint, node]));
   const byObjective = new Map();
   for (const { admission } of existing) {
     const list = byObjective.get(admission.objectiveFingerprint) ?? [];
@@ -218,7 +232,8 @@ export function admitTeamNodes(existingNodes, incomingNodes, { budgets, appendCo
     const admission = normalizeTaskAdmission(raw, index);
     const exact = byFingerprint.get(admission.fingerprint);
     if (exact) {
-      reused.push({ requestedId: raw.id, existingId: exact, fingerprint: admission.fingerprint });
+      if (digest(nodeExecutionIntent(raw)) !== digest(nodeExecutionIntent(exact))) fail(`node ${raw.id} requests a different execution contract for an existing identity`);
+      reused.push({ requestedId: raw.id, existingId: exact.id, fingerprint: admission.fingerprint });
       continue;
     }
     const sameObjective = byObjective.get(admission.objectiveFingerprint) ?? [];
@@ -229,7 +244,7 @@ export function admitTeamNodes(existingNodes, incomingNodes, { budgets, appendCo
     ids.add(node.id);
     normalized.push(node);
     added.push(node);
-    byFingerprint.set(admission.fingerprint, node.id);
+    byFingerprint.set(admission.fingerprint, node);
     byObjective.set(admission.objectiveFingerprint, [...sameObjective, admission]);
   }
   if (existingNodes.length + added.length > normalizedBudgets.maxNodes) fail("root maxNodes budget exceeded");
@@ -315,6 +330,8 @@ export function validateTeamState(team, nodes = []) {
   for (let index = 0; index < nodes.length; index += 1) {
     const node = nodes[index];
     if (!node?.admission || typeof node.admission.fingerprint !== "string") fail(`node ${node?.id ?? index} admission is missing`);
+    if ((node.dependsOn ?? []).some((id) => !nodeIds.has(id) || id === node.id)) fail(`node ${node.id} has an unknown or self dependency`);
+    if ((node.inputs ?? []).some((id) => !(node.dependsOn ?? []).includes(id))) fail(`node ${node.id} input is not a dependency`);
     const normalized = normalizeTaskAdmission(node, index);
     if (normalized.fingerprint !== node.admission.fingerprint || normalized.objectiveFingerprint !== node.admission.objectiveFingerprint) {
       fail(`node ${node.id ?? index} admission fingerprint is invalid`);
@@ -327,7 +344,9 @@ export function validateTeamState(team, nodes = []) {
   if (nodes.length > budgets.maxNodes) fail("team maxNodes budget is exceeded");
   if (team.usage.admittedMembers !== nodes.length) fail("team admitted member usage is invalid");
   if (team.usage.startedAttempts > budgets.maxAttempts) fail("team attempt budget is exceeded");
-  if (budgets.maxOutputTokens !== undefined && team.usage.outputTokens > budgets.maxOutputTokens) fail("team output budget is exceeded");
+  // Observed usage may overshoot a cap before cancellation reaches the provider.
+  // Persist that evidence; the scheduler, not the state parser, denies further dispatch.
+  if (team.usage.outputTokens < 0 || team.usage.startedAttempts < 0) fail("team usage must be nonnegative");
   if (redundancyCount(nodes) > budgets.maxRedundant) fail("team redundancy budget is exceeded");
   return Object.freeze({ ...team, budgets, joins });
 }
