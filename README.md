@@ -10,6 +10,12 @@ trusted controller → signed registry → SQLite lease broker → scoped Unix-s
 
 The Pi extension owns its native provider adapter and uses Agent Pi's model registry, provider runtime and authentication APIs directly. It keeps credentials in the parent while children receive a scoped IPC route. No other extension is required to initialize this path. The low-level library additionally supports explicitly injected transports; a missing transport fails closed.
 
+## Requirements
+
+Node.js 26+ and Pi 1.4+ are required. Pi provides the declared runtime peers;
+the clean-CI development host is pinned to Pi 1.4.0. Restart Pi after upgrading
+extension source modules; an already-running process keeps its loaded version.
+
 ## Status
 
 This package is publishable as an **`alpha` research artifact**, not a production broker. Its API, file schema and lifecycle hooks may change before `1.0.0`.

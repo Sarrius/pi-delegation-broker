@@ -8,6 +8,7 @@
 - Preserve reasoning effort, read-only budget semantics, shared-controller state, parent compaction/wake ownership and bounded workflow recovery.
 - Fix generation-aware cold-start ranking and prevent one opaque pre-header failure from immediately quarantining untried sibling models. Expose health reasons and exact-preflight exclusions in preview diagnostics.
 - Add native metered-provider admission and pool-pressure handling while retaining explicit billing, quality and capability gates.
+- Require Pi 1.4+ and pin clean-CI development hosts to 1.4.0; compaction acceptance no longer depends on a private/global Pi executable or unavailable older lifecycle behavior.
 - Keep the package experimental and publish under `next`; this release does not claim unattended production readiness or measured orchestration utility gains.
 
 ## 0.1.0-alpha.3 — 2026-10-26

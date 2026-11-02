@@ -19,9 +19,9 @@ async function runScenario(t, scenario) {
     "settings.json": { packages: [], quietStartup: true, defaultProjectTrust: "always", defaultProvider: "compaction-parent", defaultModel: "parent", defaultThinkingLevel: "off", retry: { enabled: false }, compaction: { enabled: true, reserveTokens: 1024, keepRecentTokens: 64, timeoutMs: 30_000 } },
     "models-store.json": {}, "models.json": { providers: {} },
   })) writeFileSync(join(agent, name), JSON.stringify(value), { mode: 0o600 });
-  // npm prepends its older SDK dev-dependency CLI. Native acceptance targets the
-  // installed host, not that shadowed binary; keep the parent and child on one PATH.
-  const piBin = process.env.PI_BIN ?? "pi";
+  // Use the pinned public dev host by default, including in clean CI without a global Pi.
+  // An explicit PI_BIN can qualify another host; keep parent and child on the same PATH.
+  const piBin = process.env.PI_BIN ?? new URL('../node_modules/.bin/pi', import.meta.url).pathname;
   const installedPath = (process.env.PATH ?? "").split(delimiter).filter((path) => !/[\\/]node_modules[\\/]\.bin[\\/]?$/.test(path)).join(delimiter);
   const hostPath = isAbsolute(piBin) ? `${dirname(piBin)}${delimiter}${installedPath}` : installedPath;
   const child = spawn(piBin, [
