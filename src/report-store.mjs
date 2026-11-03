@@ -17,7 +17,7 @@ import {
 import { join, resolve, sep } from "node:path";
 
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/;
-const STATUSES = new Set(["completed", "failed"]);
+const STATUSES = new Set(["completed", "failed", "blocked", "handback"]);
 /** Read reports are pruned after this age; unread reports are never deleted automatically. */
 export const REPORT_READ_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_TEXT = 64 * 1024;
@@ -112,7 +112,7 @@ function readWakeClaim(root, taskId, completedAt) {
 function validate(report) {
   if (!report || typeof report !== "object" || Array.isArray(report)) throw new Error("report must be an object");
   if (typeof report.taskId !== "string" || !TASK_ID.test(report.taskId)) throw new Error("report requires a bounded task id");
-  if (!STATUSES.has(report.status)) throw new Error("report status must be completed or failed");
+  if (!STATUSES.has(report.status)) throw new Error("report status must be completed, failed, blocked, or handback");
   if (typeof report.task !== "string" || report.task.length === 0) throw new Error("report requires the delegated task text");
   if (!Number.isSafeInteger(report.startedAt) || !Number.isSafeInteger(report.completedAt) || report.completedAt < report.startedAt) {
     throw new Error("report requires coherent started/completed timestamps");
@@ -132,6 +132,7 @@ function validate(report) {
   for (const [field, max] of [
     ["resourceId", 500], ["provider", 200], ["modelId", 300],
     ["effectiveThinking", 40], ["requestedThinking", 40], ["role", 80],
+    ["sessionFile", 4096], ["question", 2000], ["handbackReason", 2000],
   ]) {
     if (report[field] !== undefined && (typeof report[field] !== "string" || report[field].length < 1 || report[field].length > max)) {
       throw new Error(`report ${field} must be a bounded string`);
@@ -292,6 +293,21 @@ export function markReportWoken(root, taskId, now = Date.now()) {
   if (!current) return undefined;
   writeReport(root, { ...current, wakeAt: current.wakeAt ?? wakeAt });
   return readReport(root, taskId);
+}
+
+/**
+ * Reset a report and its read/wake markers when an owner explicitly resumes a ticket.
+ * This allows the resumed turn's subsequent report to wake the parent and appear unread.
+ */
+export function resetReportForResume(root, taskId) {
+  for (const path of [
+    reportPath(root, taskId),
+    readMarkerPath(root, taskId),
+    wakeClaimPath(root, taskId),
+    wakeSentPath(root, taskId),
+  ]) {
+    try { rmSync(path, { force: true }); } catch { /* best effort */ }
+  }
 }
 
 /**

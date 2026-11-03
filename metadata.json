@@ -1,0 +1,5 @@
+{
+  "name": "Pi Delegation Broker Control Plane",
+  "description": "Interactive control plane, SQLite lease broker inspector, capability-aware model selector, and live fleet view for @sars267/pi-delegation-broker.",
+  "requestFramePermissions": []
+}

@@ -4,6 +4,9 @@ import { JEV_ROUTING_SHADOW_VERSION } from "./jev-routing-shadow.mjs";
 import { JEV_ACTIVE_ROUTING_VERSION, jevActiveScopeAllowed } from "./jev-active-routing.mjs";
 import {JEV_DECISION_VERSION} from './jev-decision.mjs';
 import {JEV_VISUAL_VERSION, MAX_VISUAL_BODY_BYTES, validateJevVisualRequest, validateJevVisualAnswers} from './jev-visual.mjs';
+import { JEV_SKILL_SUGGEST_VERSION } from "./jev-skill-suggest.mjs";
+import { JEV_CONTEXT_RANK_VERSION } from "./jev-context-rank.mjs";
+import { JEV_REPORT_VERIFY_VERSION } from "./jev-report-verify.mjs";
 
 // This client can propose operational choices only under separate consent;
 // it never owns admission, credentials, leases, tool permissions or result verification.
@@ -115,18 +118,33 @@ function validateResponse(data, request, expectedModel) {
   const ids = Object.keys(request.questions);
   if (Object.keys(data.answers).length !== ids.length) throw new Error("invalid_response");
   const assessments = ids.map((id) => {
+    const q = request.questions[id];
     const answer = data.answers[id];
-    const options = Object.keys(request.questions[id].criteria);
-    if (!object(answer) || answer.type !== "choice" || !options.includes(answer.choice)
-      || !probability(answer.confidence) || !object(answer.probabilities)
-      || Object.keys(answer.probabilities).length !== options.length
-      || options.some((key) => !probability(answer.probabilities[key]))) throw new Error("invalid_response");
-    const values = options.map((key) => answer.probabilities[key]);
-    // Jev rounds probabilities. Permit rounding, not a malformed distribution.
-    if (Math.abs(values.reduce((a, b) => a + b, 0) - 1) > 0.021
-      || Math.max(...values) - answer.probabilities[answer.choice] > 0.011) throw new Error("invalid_response");
-    return { id, assessment: answer.choice, confidence: answer.confidence,
-      probabilities: Object.fromEntries(options.map((key) => [key, answer.probabilities[key]])) };
+    if (!object(answer)) throw new Error("invalid_response");
+    if (q.type === "choice") {
+      const options = Object.keys(q.criteria ?? {});
+      if (answer.type !== "choice" || !options.includes(answer.choice)
+        || !probability(answer.confidence) || !object(answer.probabilities)
+        || Object.keys(answer.probabilities).length !== options.length
+        || options.some((key) => !probability(answer.probabilities[key]))) throw new Error("invalid_response");
+      const values = options.map((key) => answer.probabilities[key]);
+      // Jev rounds probabilities. Permit rounding, not a malformed distribution.
+      if (Math.abs(values.reduce((a, b) => a + b, 0) - 1) > 0.021
+        || Math.max(...values) - answer.probabilities[answer.choice] > 0.011) throw new Error("invalid_response");
+      return { id, type: "choice", assessment: answer.choice, confidence: answer.confidence,
+        probabilities: Object.fromEntries(options.map((key) => [key, answer.probabilities[key]])) };
+    }
+    if (q.type === "noul") {
+      const noulVal = typeof answer.noul === "number" ? answer.noul : typeof answer.value === "number" ? answer.value : undefined;
+      if (answer.type !== "noul" || !probability(noulVal)) throw new Error("invalid_response");
+      return { id, type: "noul", noul: noulVal, assessment: noulVal >= 0.5 ? "true" : "false", confidence: Math.abs(noulVal - 0.5) * 2 };
+    }
+    if (q.type === "score") {
+      const scoreVal = typeof answer.score === "number" ? answer.score : typeof answer.value === "number" ? answer.value : undefined;
+      if (answer.type !== "score" || !Number.isFinite(scoreVal)) throw new Error("invalid_response");
+      return { id, type: "score", score: scoreVal, assessment: String(scoreVal), confidence: probability(answer.confidence) ? answer.confidence : 1.0 };
+    }
+    throw new Error("invalid_response");
   });
   return { model: data.model, assessments, usage: { inputTokens: data.usage.input_tokens, outputTokens: data.usage.output_tokens } };
 }
@@ -200,6 +218,7 @@ export class JevAdvisor {
   status() {
     try {
       const { config, reason } = this.refresh();
+      const phases = { handoff: 0, result: 0, routing: 0, routing_active: 0, decision: 0, visual: 0, ...this.requestsByPhase };
       return { mode: config.mode, routeShadow: config.routeShadow,
         routingConsent: config.consentToSendRoutingState, activeRouting: config.activeRouting,
         engineDecisions:config.engineDecisions,activeScopeAll:config.activeScopeAll,
@@ -209,7 +228,7 @@ export class JevAdvisor {
         available: !reason && this.requests < config.maxRequestsPerSession,
         reason: reason ?? (this.requests >= config.maxRequestsPerSession ? "request_allowance" : "ready"),
         lastOutcome: this.lastReason,
-        requests: this.requests, requestsByPhase: { ...this.requestsByPhase },
+        requests: this.requests, requestsByPhase: phases,
         maxRequestsPerSession: config.maxRequestsPerSession, usage: { ...this.usage },
         usageCoverage: "valid_responses_only; failed_or_aborted_requests_may_also_be_billed",
         retryAt: this.retryAt || null, consecutiveFailures: this.consecutiveFailures,
@@ -242,15 +261,21 @@ export class JevAdvisor {
       const routing = request?.version === JEV_ROUTING_SHADOW_VERSION && request.phase === "routing";
       const activeRouting = request?.version === JEV_ACTIVE_ROUTING_VERSION && request.phase === "routing_active";
       const decision = request?.version === JEV_DECISION_VERSION && request.phase === 'decision';
-      if (!visual && !routing && !activeRouting && !decision
+      const skillSuggest = request?.version === JEV_SKILL_SUGGEST_VERSION && request.phase === 'skill_suggest';
+      const contextRank = request?.version === JEV_CONTEXT_RANK_VERSION && request.phase === 'context_rank';
+      const reportVerify = request?.version === JEV_REPORT_VERIFY_VERSION && request.phase === 'report_verify';
+
+      if (!visual && !routing && !activeRouting && !decision && !skillSuggest && !contextRank && !reportVerify
         && (!request || request.version !== JEV_REVIEW_VERSION || !["handoff", "result"].includes(request.phase))) return skipped("invalid_input");
       if (visual ? (config.mode !== 'advisory' || !config.visual)
         : decision ? (config.mode !== 'advisory' || !config.engineDecisions)
         : activeRouting ? (config.mode !== "advisory" || !config.activeRouting)
+        : (skillSuggest || contextRank || reportVerify) ? config.mode !== "advisory"
         : routing ? !config.routeShadow : !config[request.phase]) return skipped("feature_disabled");
       if (routing && !config.consentToSendRoutingState) return skipped("routing_consent_required");
       if (activeRouting && !config.consentToSendActiveRoutingState) return skipped("active_routing_consent_required");
       if (decision && (!config.activeScopeAll || !config.consentToSendTaskText)) return skipped('decision_consent_required');
+      if ((skillSuggest || contextRank || reportVerify) && !config.consentToSendTaskText) return skipped('consent_required');
       // The local cwd never enters the network body. Check before cache lookup as well: a
       // previously consented answer cannot be replayed into a different project/session.
       if (activeRouting && !jevActiveScopeAllowed(config, request.localScopeCwd)) return skipped("scope_unapproved");
@@ -261,10 +286,16 @@ export class JevAdvisor {
       if (visual && !validateJevVisualRequest(request)) return skipped('invalid_input');
       if (!visual && (!object(request.state) || !object(request.questions)
         || Object.keys(request.questions).length < 1 || Object.keys(request.questions).length > 32
-        || Object.values(request.questions).some((question) => !object(question)
-          || question.type !== "choice" || !text(question.instructions, 4000)
-          || !object(question.criteria) || Object.keys(question.criteria).length < 2
-          || Object.keys(question.criteria).length > 255))) return skipped("invalid_input");
+        || Object.values(request.questions).some((question) => {
+          if (!object(question) || !text(question.instructions, 4000)) return true;
+          if (question.type === "choice") {
+            return !object(question.criteria) || Object.keys(question.criteria).length < 2 || Object.keys(question.criteria).length > 255;
+          }
+          if (question.type === "noul" || question.type === "score") {
+            return false;
+          }
+          return true;
+        }))) return skipped("invalid_input");
       if (signal?.aborted) return skipped("cancelled");
       const requestModel = visual ? config.visualModel : config.model;
       const body = JSON.stringify({ model: requestModel, state: request.state, questions: request.questions,

@@ -1,13 +1,28 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
-const tracked = execFileSync("git", ["ls-files", "-z"], { cwd: root })
-  .toString("utf8")
-  .split("\0")
-  .filter(Boolean);
+function walkFiles(dir) {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    if (entry.name === "node_modules" || entry.name === ".git" || entry.name === ".playwright-cli" || entry.name === ".aistudio") {
+      return [];
+    }
+    const full = join(dir, entry.name);
+    return entry.isDirectory() ? walkFiles(full) : [relative(root, full)];
+  });
+}
+
+let tracked;
+try {
+  tracked = execFileSync("git", ["ls-files", "-z"], { cwd: root, stdio: ["ignore", "pipe", "ignore"] })
+    .toString("utf8")
+    .split("\0")
+    .filter(Boolean);
+} catch {
+  tracked = walkFiles(root);
+}
 
 const skip = /\.(png|jpe?g|gif|webp|woff2?|sqlite|lock)$/i;
 const allowedUsers = new Set(["example", "runner", "shared"]);

@@ -23,7 +23,7 @@ export function projectParentDelegationContext({
   // already-woken/legacy reports must not be re-blasted on a resumed session.
   const unread = reports.filter((report) => TASK_ID.test(report?.taskId ?? "")
     && byId.has(report.taskId) && report.readAt === null
-    && ["completed", "failed"].includes(report.status)
+    && ["completed", "failed", "blocked", "handback"].includes(report.status)
     && (report.wakeAt === null || isLiveReport(report.taskId)));
   const ownerBinding = binding?.sessionId === ownerSessionId ? binding : undefined;
   const resumeRoots = new Set(ownerBinding?.rootIds?.slice(0, MAX_ASSIGNMENTS) ?? []);

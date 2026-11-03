@@ -95,10 +95,13 @@ export {
   recoverJobs,
   removeJob,
   requestJobCancellation,
+  resumeTaskJob,
   submitJob,
   updateJob,
   writeJob,
 } from "./delegation-job-store.mjs";
+export { resetReportForResume } from "./report-store.mjs";
+export { composeTaskPrompt, normalizeWork } from "./delegation-policy.mjs";
 export {
   DEFAULT_MODEL_PREFERENCES,
   MODEL_PREFERENCE_TIERS,
@@ -155,3 +158,22 @@ export { verifyProposedPatch, EffectVerificationError } from "./effect-verificat
 export { controllerAcceptanceCheckIds, createControllerAcceptancePlan, normalizeControllerAcceptanceSpecs } from "./acceptance-plan.mjs";
 export { applyProposedPatch, proposedPatchPaths } from "./proposed-patch.mjs";
 export { proxyCanonicalContext, proxyTerminalError } from "./proxy-context.mjs";
+export {
+  JEV_SKILL_SUGGEST_VERSION,
+  describeJevSkillSuggestion,
+  makeJevSkillSuggestion,
+  suggestChildSkills,
+} from "./jev-skill-suggest.mjs";
+export {
+  JEV_CONTEXT_RANK_VERSION,
+  describeJevContextRank,
+  makeJevContextRank,
+  rankContextFilesWithJev,
+} from "./jev-context-rank.mjs";
+export {
+  JEV_REPORT_VERIFY_VERSION,
+  describeJevReportVerify,
+  makeJevReportVerify,
+  verifyChildReportWithJev,
+} from "./jev-report-verify.mjs";
+

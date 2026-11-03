@@ -7,7 +7,7 @@
  */
 
 const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/;
-const STATUSES = new Set(["completed", "failed"]);
+const STATUSES = new Set(["completed", "failed", "blocked", "handback"]);
 const MAX_REPORTS_PER_WAKE = 32;
 // Local host readiness only: no provider calls, disk reads or claims while busy.
 const HOST_IDLE_RETRY_MS = 250;
@@ -201,6 +201,13 @@ export class ParentWakeCoordinator {
   /** Current-incarnation inbox only; does not expose report text or claim authority. */
   tracksReport(taskId) {
     return !this.#closed && (this.#pending.has(taskId) || this.#dispatched.has(taskId));
+  }
+
+  resetTask(taskId) {
+    this.#pending.delete(taskId);
+    this.#dispatched.delete(taskId);
+    this.#dispatchedReports.delete(taskId);
+    this.#acknowledged.delete(taskId);
   }
 
   /** Fast path after a host run/queue transition; idle retries also cover compaction. */

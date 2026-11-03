@@ -6,6 +6,7 @@ import { Semaphore } from "./semaphore.mjs";
 import { effectiveThinkingLevel } from "./model-thinking-policy.mjs";
 import { THINKING_LEVELS } from "./child-contract.mjs";
 import { createWorktree, collectWorktree, cleanupWorktree, WorktreeCollectionError } from "./worktree.mjs";
+import { applyProposedPatch } from "./proposed-patch.mjs";
 
 const SETTLE_GRACE_MS = 15_000;
 
@@ -291,10 +292,12 @@ export class BrokeredChildRunner {
       "tool_execution_end", "auto_retry_start", "auto_retry_end", "bash_execution_update",
     ].includes(event.type);
     const observedAt = this.#now();
+    const childReport = event.type === "tool_execution_end" ? event.result?.details?.brokerChildReport : undefined;
     this.#updateAttempt(attemptId, {
       lastEventAt: observedAt,
       lastEventType: event.type,
       ...(progress ? { lastProgressAt: observedAt } : {}),
+      ...(typeof childReport?.summary === "string" ? { lastProgressSummary: childReport.summary.slice(0, 240) } : {}),
     });
     if ((event.type === "tool_execution_end" || event.type === "tool_result") && (event.isError === true || event.error)) {
       const attempt = this.#attempts.get(attemptId);
@@ -365,6 +368,9 @@ export class BrokeredChildRunner {
     let requiredCapabilities = spec.capabilityRequest?.requiredCapabilities;
     let capacityWaitDeadline;
     let lastResult;
+    let carryoverProgress = "";
+    let carryoverPatch = "";
+    let carryoverChanged = [];
     let visibleAttemptId;
     const finish = (value) => {
       this.#clearAttempt(visibleAttemptId);
@@ -439,11 +445,22 @@ export class BrokeredChildRunner {
       // Checkpoints are keyed to the controller lease task id. The child may declare lineage
       // metadata, but it cannot choose which other root's accepted artifacts enter its prompt.
       const checkpointPrompt = this.#acceptedCheckpointPrompt(childId);
-      if (checkpointPrompt) capabilityRequest.routingActiveBriefComplete = false;
-      const attemptPrompt = checkpointPrompt
-        ? `${spec.prompt ?? ""}\n\n${checkpointPrompt}`
+      const continuityLines = [];
+      if (carryoverProgress) {
+        continuityLines.push(`Last structured progress report: ${carryoverProgress}`);
+      }
+      if (carryoverChanged.length > 0) {
+        continuityLines.push(`Carried-over worktree changes already applied in your workspace: ${carryoverChanged.join(", ")}`);
+      }
+      const continuityPrompt = continuityLines.length > 0
+        ? `Prior attempt progress before provider failover (unverified child progress — verify and continue from this state without redoing completed steps):\n- ${continuityLines.join("\n- ")}`
+        : "";
+      const replacementContext = [checkpointPrompt, continuityPrompt].filter(Boolean).join("\n\n");
+      if (replacementContext) capabilityRequest.routingActiveBriefComplete = false;
+      const attemptPrompt = replacementContext
+        ? `${spec.prompt ?? ""}\n\n${replacementContext}`
         : spec.prompt;
-      const attemptPromptDigest = checkpointPrompt && typeof attemptPrompt === "string"
+      const attemptPromptDigest = replacementContext && typeof attemptPrompt === "string"
         ? createHash("sha256").update(attemptPrompt).digest("hex")
         : spec.promptDigest;
       let handle;
@@ -451,6 +468,7 @@ export class BrokeredChildRunner {
         handle = await this.spawn({
           ...spec, childId: attemptId, prompt: attemptPrompt, promptDigest: attemptPromptDigest,
           capabilityRequest, attempts: attempt, attemptBudget, deferClosePolicy: true,
+          ...(carryoverPatch ? { seedPatch: carryoverPatch } : {}),
           onAttemptStarted: async (event) => {
             await onAttemptStarted?.(event); // Keep the original durable gate before counting a handoff.
             childHandoffs++;
@@ -575,6 +593,10 @@ export class BrokeredChildRunner {
         route.push({ attempt, childId: attemptId, resourceId, outcome: "controller_close_failed", error: error.message });
         return finish(Object.freeze({ ...lastResult, id: childId, status: "failed", error: `controller close failed: ${error.message}`, route: Object.freeze(route) }));
       }
+      if (lastResult.status === "blocked" || lastResult.status === "handback") {
+        route.push({ attempt, childId: attemptId, resourceId, outcome: lastResult.status });
+        return finish(Object.freeze({ ...lastResult, id: childId, route: Object.freeze(route) }));
+      }
       if (lastResult.status === "completed") {
         const verification = closure?.verification;
         if (verification?.outcome?.status && verification.outcome.status !== "completed") {
@@ -631,6 +653,13 @@ export class BrokeredChildRunner {
       if (resourceId !== undefined && kind === "incomplete") excludeResources.push(resourceId);
       if (kind === "fatal" || kind === "budget_exhausted" || kind === "controller_failure" || attempt === routeAttemptLimit) break;
 
+      if (typeof lastResult?.childReport?.summary === "string" && lastResult.childReport.summary.trim().length > 0) {
+        carryoverProgress = lastResult.childReport.summary.trim().slice(0, 1_000);
+      }
+      if (typeof lastResult?.patch === "string" && lastResult.patch.trim().length > 0) {
+        carryoverPatch = lastResult.patch;
+        carryoverChanged = Array.isArray(lastResult.changed) ? [...lastResult.changed] : [];
+      }
       this.#clearAttempt(attemptId);
       visibleAttemptId = undefined;
       if (kind === "context_exhausted") {
@@ -706,7 +735,7 @@ export class BrokeredChildRunner {
     finally { this.#inflightSpawns.delete(promise); }
   }
 
-  async #spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, recursion, attempts = 1, attemptBudget, deferClosePolicy = false, roleFraming, skills, onAttemptStarted }) {
+  async #spawn({ childId, promptDigest, model, cwd, isolation = "none", tools, excludeTools, label, thinkingLevel, prompt, capabilityRequest, recursion, attempts = 1, attemptBudget, deferClosePolicy = false, roleFraming, skills, forkSessionFile, seedPatch, onAttemptStarted }) {
     if (this.#disposed) throw new Error("BrokeredChildRunner is disposed");
     if (this.#handles.has(childId)) throw new Error(`Duplicate child id: ${childId}`);
     if (!Number.isSafeInteger(attempts) || attempts < 1) throw new Error("brokered child attempt count must be a positive safe integer");
@@ -810,6 +839,13 @@ export class BrokeredChildRunner {
       if (isolation === "worktree") {
         const sourceCwd = cwd;
         const tree = await createWorktree(sourceCwd, join(this.#sessionsRoot, childId, "worktree"));
+        if (typeof seedPatch === "string" && seedPatch.trim().length > 0) {
+          try {
+            applyProposedPatch({ cwd: tree.cwd, patch: seedPatch });
+          } catch {
+            // Best-effort carryover: if the prior partial patch cannot apply cleanly, keep the fresh worktree.
+          }
+        }
         worktree = { sourceCwd, tree };
         childSpec = { ...childSpec, cwd: tree.cwd };
       }
@@ -824,6 +860,7 @@ export class BrokeredChildRunner {
           spec: childSpec,
           parentCwd: cwd,
           sessionsDir,
+          ...(forkSessionFile ? { forkSessionFile } : {}),
           launchPolicy: {
             ...policy,
             offline: policy.offline ?? false,
@@ -970,33 +1007,39 @@ export class BrokeredChildRunner {
       await this.#promptWithDeadline(session, spec.prompt ?? "");
       const message = session.latestAssistantMessage;
       const usage = session.usage;
-      const text = assistantText(message);
+      const rawText = assistantText(message);
+      const childReport = session.lastChildReport;
+      const sessionFile = typeof session.sessionFile === "string" && session.sessionFile
+        ? session.sessionFile
+        : (typeof handle.resolved?.sessionFile === "string" && handle.resolved.sessionFile ? handle.resolved.sessionFile : undefined);
       const worktreeResult = worktree ? await this.#collectWorktree(worktree) : undefined;
-      const answered = text.trim().length > 0 || Boolean(worktreeResult?.patch);
-      const unresolvedToolRequest = message?.stopReason === "toolUse" || message?.stopReason === "tool_use";
-      const truncated = ["length", "max_tokens", "maxTokens"].includes(message?.stopReason);
-      const aborted = message?.stopReason === "aborted";
-      if (message?.stopReason === "error" || !answered || unresolvedToolRequest || truncated || aborted) {
-        this.#recordDefect({
-          kind: "lifecycle", origin: "controller", rootId: this.#attempts.get(handle.id)?.rootId,
-          taskId: this.#attempts.get(handle.id)?.logicalId ?? handle.id, attemptId: handle.id,
-          phase: "child_settlement", message: String(message?.errorMessage ?? (unresolvedToolRequest
-            ? "child stopped with unresolved tool request" : truncated ? "child output was truncated" : aborted ? "child was aborted" : "child completed without a result")).replace(/\s+/g, " ").slice(0, 2_000),
-          retryable: true, details: { stopReason: message?.stopReason ?? "empty_result" },
-        });
+      if (message?.stopReason !== "error" && !handle.wasExternallyCancelled && childReport?.state === "blocked") {
+        const question = typeof childReport.question === "string" ? childReport.question : "";
+        const text = rawText.trim() ? rawText : (childReport.summary ? `${childReport.summary}\n\nQuestion: ${question}` : question);
         result = {
           id: handle.id,
-          status: "failed",
+          status: "blocked",
           text,
-          error: message?.stopReason === "error"
-            ? (message.errorMessage ?? "Child model request failed")
-            : unresolvedToolRequest
-              ? "child stopped with an unresolved tool request"
-              : truncated
-                ? "child output ended before completion"
-                : aborted
-                  ? "child was aborted before completion"
-                  : "child completed without a result",
+          question,
+          childReport,
+          ...(sessionFile ? { sessionFile } : {}),
+          usage,
+          resolved: handle.resolved,
+          resource: handle.resource,
+          ...(handle.selection ? { selection: handle.selection } : {}),
+          ...(worktreeResult ?? {}),
+        };
+      } else if (message?.stopReason !== "error" && !handle.wasExternallyCancelled && childReport?.state === "handback") {
+        const reason = typeof childReport.reason === "string" ? childReport.reason : "child handed back task";
+        const text = rawText.trim() ? rawText : (childReport.summary ? `${childReport.summary}\n\nReason: ${reason}` : reason);
+        result = {
+          id: handle.id,
+          status: "handback",
+          text,
+          reason,
+          error: `child handback: ${reason}`,
+          childReport,
+          ...(sessionFile ? { sessionFile } : {}),
           usage,
           resolved: handle.resolved,
           resource: handle.resource,
@@ -1004,18 +1047,63 @@ export class BrokeredChildRunner {
           ...(worktreeResult ?? {}),
         };
       } else {
-        result = {
-          id: handle.id,
-          status: "completed",
-          text,
-          usage,
-          resolved: handle.resolved,
-          resource: handle.resource,
-          ...(handle.selection ? { selection: handle.selection } : {}),
-          ...(worktreeResult ?? {}),
-        };
+        const text = !rawText.trim() && childReport?.state === "ready" && typeof childReport.summary === "string"
+          ? childReport.summary
+          : rawText;
+        const answered = text.trim().length > 0 || Boolean(worktreeResult?.patch);
+        const unresolvedToolRequest = message?.stopReason === "toolUse" || message?.stopReason === "tool_use";
+        const truncated = ["length", "max_tokens", "maxTokens"].includes(message?.stopReason);
+        const aborted = message?.stopReason === "aborted";
+        if (message?.stopReason === "error" || !answered || unresolvedToolRequest || truncated || aborted) {
+          this.#recordDefect({
+            kind: "lifecycle", origin: "controller", rootId: this.#attempts.get(handle.id)?.rootId,
+            taskId: this.#attempts.get(handle.id)?.logicalId ?? handle.id, attemptId: handle.id,
+            phase: "child_settlement", message: String(message?.errorMessage ?? (unresolvedToolRequest
+              ? "child stopped with unresolved tool request" : truncated ? "child output was truncated" : aborted ? "child was aborted" : "child completed without a result")).replace(/\s+/g, " ").slice(0, 2_000),
+            retryable: true, details: { stopReason: message?.stopReason ?? "empty_result" },
+          });
+          result = {
+            id: handle.id,
+            status: "failed",
+            text,
+            error: message?.stopReason === "error"
+              ? (message.errorMessage ?? "Child model request failed")
+              : unresolvedToolRequest
+                ? "child stopped with an unresolved tool request"
+                : truncated
+                  ? "child output ended before completion"
+                  : aborted
+                    ? "child was aborted before completion"
+                    : "child completed without a result",
+            ...(childReport ? { childReport } : {}),
+            ...(sessionFile ? { sessionFile } : {}),
+            usage,
+            resolved: handle.resolved,
+            resource: handle.resource,
+            ...(handle.selection ? { selection: handle.selection } : {}),
+            ...(worktreeResult ?? {}),
+          };
+        } else {
+          result = {
+            id: handle.id,
+            status: "completed",
+            text,
+            ...(childReport ? { childReport } : {}),
+            ...(sessionFile ? { sessionFile } : {}),
+            usage,
+            resolved: handle.resolved,
+            resource: handle.resource,
+            ...(handle.selection ? { selection: handle.selection } : {}),
+            ...(worktreeResult ?? {}),
+          };
+        }
       }
     } catch (error) {
+      const childReport = session.lastChildReport;
+      const sessionFile = typeof session.sessionFile === "string" && session.sessionFile
+        ? session.sessionFile
+        : (typeof handle.resolved?.sessionFile === "string" && handle.resolved.sessionFile ? handle.resolved.sessionFile : undefined);
+      const worktreeResult = worktree ? await this.#collectWorktree(worktree).catch(() => undefined) : undefined;
       this.#recordDefect({
         kind: "lifecycle", origin: "controller", rootId: this.#attempts.get(handle.id)?.rootId,
         taskId: this.#attempts.get(handle.id)?.logicalId ?? handle.id, attemptId: handle.id,
@@ -1027,14 +1115,17 @@ export class BrokeredChildRunner {
         status: handle.wasExternallyCancelled ? "aborted" : "failed",
         text: "",
         error: error.message,
+        ...(childReport ? { childReport } : {}),
+        ...(sessionFile ? { sessionFile } : {}),
         usage: session.usage,
         resolved: handle.resolved,
         resource: handle.resource,
         ...(handle.selection ? { selection: handle.selection } : {}),
+        ...(worktreeResult ?? {}),
       };
     } finally {
       // Success must precede dispose, whose shutdown hook releases the lease.
-      if (result?.status === "completed") {
+      if (["completed", "blocked", "handback"].includes(result?.status)) {
         try { await policy.onProviderSucceeded?.(); }
         catch { /* health recovery is best effort; the verified child result still stands */ }
       }

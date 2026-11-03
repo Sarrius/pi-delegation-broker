@@ -78,6 +78,7 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "verifyHumanApproval",
     "verifyProposedPatch",
     "compileEffectiveChildCapability",
+    "composeTaskPrompt",
     "controllerVerificationReceipt",
     "createApprovedAnthropicProviderRoute",
     "createApprovedOpenAIProviderRoute",
@@ -122,6 +123,7 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "normalizeTeamBudgets",
     "normalizeTeamJoin",
     "normalizeTeamMetadata",
+    "normalizeWork",
     "modelRegistryToProviderCatalog",
     "loadControllerRouteConfiguration",
     "loadModelPreferences",
@@ -150,6 +152,8 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "requestChildIpc",
     "recoverJobs",
     "removeJob",
+    "resetReportForResume",
+    "resumeTaskJob",
     "qualityForModel",
     "requestBrokerIpc",
     "retryAfterMs",
@@ -176,7 +180,19 @@ test("public API excludes test fixtures while exposing controller-gated transpor
     "writeModelPreferences",
     "writeScopedChildAuth",
     "listingsFromCache",
-    "servedModelsFromCache"
+    "servedModelsFromCache",
+    "JEV_SKILL_SUGGEST_VERSION",
+    "describeJevSkillSuggestion",
+    "makeJevSkillSuggestion",
+    "suggestChildSkills",
+    "JEV_CONTEXT_RANK_VERSION",
+    "describeJevContextRank",
+    "makeJevContextRank",
+    "rankContextFilesWithJev",
+    "JEV_REPORT_VERIFY_VERSION",
+    "describeJevReportVerify",
+    "makeJevReportVerify",
+    "verifyChildReportWithJev"
   ].sort());
   assert.equal("ScriptedFakeProvider" in api, false);
   assert.equal(typeof testing.ScriptedFakeProvider, "function");

@@ -11,9 +11,9 @@ const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/;
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,511}$/;
 const JOB_KINDS = new Set(["task", "workflow"]);
 const JOB_STATUSES = new Set([
-  "submitted", "queued", "running", "cancellation_requested", "completed", "failed", "cancelled", "expired",
+  "submitted", "queued", "running", "cancellation_requested", "completed", "failed", "cancelled", "expired", "blocked", "handback",
 ]);
-const TERMINAL = new Set(["completed", "failed", "cancelled", "expired"]);
+const TERMINAL = new Set(["completed", "failed", "cancelled", "expired", "blocked", "handback"]);
 const MAX_JOB_BYTES = 32 * 1024 * 1024;
 
 function fail(message) { throw new Error(`delegation job store: ${message}`); }
@@ -47,6 +47,11 @@ function validate(job) {
   if (job.outputBudgetPolicy !== undefined && job.outputBudgetPolicy !== "metered_default_v2") fail("outputBudgetPolicy is invalid");
   if (job.inputBudgetPolicy !== undefined && job.inputBudgetPolicy !== "metered_default_v1") fail("inputBudgetPolicy is invalid");
   if (job.startedAttempts !== undefined && (!Number.isSafeInteger(job.startedAttempts) || job.startedAttempts < 0)) fail("startedAttempts is invalid");
+  if (job.resumeCount !== undefined && (!Number.isSafeInteger(job.resumeCount) || job.resumeCount < 0)) fail("resumeCount is invalid");
+  for (const [field, max] of [["sessionFile", 4096], ["forkSessionFile", 4096], ["question", 2000], ["handbackReason", 2000]]) {
+    if (job[field] !== undefined && (typeof job[field] !== "string" || job[field].length < 1 || job[field].length > max || /\0/.test(job[field]))) fail(`${field} is invalid`);
+  }
+  if (job.resumePrompt !== undefined && (typeof job.resumePrompt !== "string" || job.resumePrompt.length < 1 || job.resumePrompt.length > 256 * 1024 || /\0/.test(job.resumePrompt))) fail("resumePrompt is invalid");
   for (const field of ["budgetAccountingUncertain", "shutdownReplaySafe"]) {
     if (job[field] !== undefined && typeof job[field] !== "boolean") fail(`${field} is invalid`);
   }
@@ -179,6 +184,43 @@ export function markTaskAdmitted(root, jobId, now = Date.now(), { maxAttempts } 
     if (job.status !== "submitted") fail(`task cannot be admitted from ${job.status}`);
     return { ...job, status: "running", admittedAt: now };
   }, now);
+}
+
+export function resumeTaskJob(root, jobId, { message, now = Date.now(), ownerSessionId } = {}) {
+  if (typeof message !== "string" || !message.trim() || message.length > 256 * 1024 || /\0/.test(message)) {
+    fail("resume message must be bounded non-empty text");
+  }
+  return withJobLock(root, () => {
+    const current = readJob(root, jobId);
+    if (!current) fail(`job ${jobId} does not exist`);
+    if (current.kind !== "task") fail("only a task job can be resumed");
+    if (current.ownerSessionId !== undefined && ownerSessionId !== current.ownerSessionId) fail("job owner session does not match");
+    if (!["blocked", "completed", "handback"].includes(current.status)) {
+      fail(`task cannot be resumed from status ${current.status}`);
+    }
+    if (typeof current.sessionFile !== "string" || !current.sessionFile) {
+      fail("task has no persisted child sessionFile to fork from");
+    }
+    const assignments = activeAssignments(listJobs(root), current.ownerSessionId).filter((a) => a.id !== jobId);
+    const conflict = overlappingAssignment(current.contract?.work, assignments);
+    if (conflict) fail(`work is already owned by ${conflict.id}`);
+    return updateJobLocked(root, jobId, (job) => {
+      const next = {
+        ...job,
+        status: "submitted",
+        forkSessionFile: job.sessionFile,
+        resumePrompt: message.trim(),
+        resumeCount: (job.resumeCount ?? 0) + 1,
+        startedAttempts: 0,
+      };
+      delete next.completedAt;
+      delete next.terminalReason;
+      delete next.question;
+      delete next.handbackReason;
+      delete next.recoveredFromReport;
+      return next;
+    }, now);
+  });
 }
 
 export function requestJobCancellation(root, jobId, now = Date.now(), ownerSessionId) {

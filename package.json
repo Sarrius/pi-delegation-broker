@@ -29,9 +29,13 @@
     "CHANGELOG.md"
   ],
   "engines": {
-    "node": ">=26.0.0"
+    "node": ">=22.0.0"
   },
   "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs",
+    "build": "node --check server.mjs && node --check src/*.mjs",
+    "lint": "node --check server.mjs && node --check src/*.mjs",
     "check": "node --check src/*.mjs && node --check test/*.mjs && node scripts/check-public-tree.mjs && node scripts/check-tracked-privacy.mjs",
     "test": "node --test test/*.test.mjs test/*.test.ts",
     "pack:check": "node scripts/check-package.mjs",

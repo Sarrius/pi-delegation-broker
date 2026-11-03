@@ -90,3 +90,5 @@ export function normalizeSkills(skills) {
   if (Array.isArray(skills) && skills.length > 0 && skills.every(attested)) return assertStoredSkills(skills);
   return reviewSkills(skills);
 }
+
+export { suggestChildSkills, makeJevSkillSuggestion, describeJevSkillSuggestion } from "./jev-skill-suggest.mjs";

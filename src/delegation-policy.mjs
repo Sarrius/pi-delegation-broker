@@ -3,7 +3,7 @@ import { isAbsolute, resolve, sep } from 'node:path';
 import { DEFAULT_BUDGET } from './model-selector.mjs';
 
 export const TASK_CLASSES = Object.freeze(['lookup','summary','research','diagnosis','implementation','review','general']);
-const TERMINAL = new Set(['completed','failed','cancelled','expired']);
+const TERMINAL = new Set(['completed','failed','cancelled','expired','blocked','handback']);
 function line(value, name, max=1000) {
   if (typeof value !== 'string' || !value.trim() || value.length>max || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error(`work ${name} must be bounded single-line text`);
   return value.trim();
@@ -17,10 +17,24 @@ export function normalizeWork(work) {
   if (!['produce','review'].includes(purpose)) throw new Error('work purpose must be produce or review');
   const ownedPaths = work.ownedPaths ?? [];
   if (!Array.isArray(ownedPaths) || ownedPaths.length>16 || ownedPaths.some(p => typeof p !== 'string' || !isAbsolute(p) || p.length>4096 || /[\u0000-\u001f]/u.test(p))) throw new Error('work ownedPaths must be bounded absolute paths');
+  const contextFiles = work.contextFiles;
+  if (contextFiles !== undefined && (!Array.isArray(contextFiles) || contextFiles.length>16 || contextFiles.some(p => typeof p !== 'string' || !p.trim() || p.length>4096 || /[\u0000-\u001f]/u.test(p)))) throw new Error('work contextFiles must be bounded paths');
+  const benefit = work.benefit === undefined ? 'Independent execution in isolated child context' : line(work.benefit,'benefit');
+  const parentWork = work.parentWork === undefined ? 'Coordinate sibling tasks and integrate verified child findings' : line(work.parentWork,'parentWork');
   return Object.freeze({taskClass:work.taskClass, purpose, maxAttempts,
-    deliverable:line(work.deliverable,'deliverable'), benefit:line(work.benefit,'benefit'),
-    parentWork:line(work.parentWork,'parentWork'), ownedPaths:[...new Set(ownedPaths.map(p => resolve(p)))]});
+    deliverable:line(work.deliverable,'deliverable'), benefit, parentWork,
+    ownedPaths:[...new Set(ownedPaths.map(p => resolve(p)))],
+    ...(contextFiles?.length ? {contextFiles:Object.freeze([...new Set(contextFiles.map(p => p.trim()))])} : {})});
 }
+export function composeTaskPrompt(task, contextFiles) {
+  const base = typeof task === 'string' ? task : '';
+  if (!Array.isArray(contextFiles) || contextFiles.length === 0) return base;
+  const list = contextFiles.filter(p => typeof p === 'string' && p.trim() && !/[\u0000-\u001f]/u.test(p)).slice(0, 16);
+  if (!list.length) return base;
+  return `${base}\n\nContext file pointers (read directly with your read tool; do not wait for parent summaries):\n${list.map(p => `- ${p.trim()}`).join('\n')}`;
+}
+
+export { rankContextFilesWithJev, makeJevContextRank, describeJevContextRank } from './jev-context-rank.mjs';
 export function learningContext(work, thinking='off') { return `routing-v3:${work?.taskClass ?? 'general'}:requested-${thinking}`; }
 // A persisted job is intent, not a fresh request. Legacy jobs without a mode marker were
 // submitted when an absent cap meant HARD 16k; never silently widen them on restart.

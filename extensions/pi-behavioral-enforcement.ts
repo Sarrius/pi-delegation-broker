@@ -19,11 +19,13 @@ import {
 
 const DECLARATION_TOOL = "broker_declare_action";
 const CHECKPOINT_TOOL = "broker_checkpoint";
+const REPORT_TOOL = "broker_report";
 const RECURSIVE_TOOLS = new Set(["broker_request_child", "broker_cancel_child"]);
 const MAX_RESULT_BYTES = 128 * 1024;
 
 type ControllerCapability = {
   capabilityFingerprint: string;
+  operationClass?: string;
   allowedTools: string[];
   leaseTtlMs: number;
 };
@@ -101,6 +103,55 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.registerTool({
+    name: REPORT_TOOL,
+    label: "Report Structured Child Status",
+    description: "Report structured ticket status to the parent controller: 'progress' (non-terminal milestone), 'ready' (final answer summary), 'blocked' (one concrete question for the parent when an ambiguity blocks execution; stops this turn and releases the lease until resumed), or 'handback' (one-sentence reason when the task exceeds your scope or capability).",
+    promptSnippet: "Report progress, ready summary, blocked question, or out-of-scope handback to the parent controller",
+    promptGuidelines: [
+      "Call broker_report({ state: 'blocked', question, summary }) instead of guessing when a material requirement is ambiguous.",
+      "Call broker_report({ state: 'handback', reason }) immediately if the task requires capabilities or paths outside your scope.",
+    ],
+    parameters: Type.Object({
+      state: Type.Union([
+        Type.Literal("progress"),
+        Type.Literal("ready"),
+        Type.Literal("blocked"),
+        Type.Literal("handback"),
+      ]),
+      summary: Type.Optional(Type.String({ minLength: 1, maxLength: 16_000, description: "Milestone summary for 'progress', final summary for 'ready', or partial findings before 'blocked'." })),
+      question: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000, description: "Required when state='blocked': one concrete question for the parent agent." })),
+      reason: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000, description: "Required when state='handback': one sentence explaining why the request exceeds scope or capability." })),
+    }, { additionalProperties: false }),
+    async execute(_toolCallId, params: { state: "progress" | "ready" | "blocked" | "handback"; summary?: string; question?: string; reason?: string }) {
+      const state = params.state;
+      const summary = typeof params.summary === "string" ? params.summary.trim() : undefined;
+      const question = typeof params.question === "string" ? params.question.trim() : undefined;
+      const reason = typeof params.reason === "string" ? params.reason.trim() : undefined;
+      if (state === "blocked" && !question) throw new Error("broker_report with state='blocked' requires a non-empty question");
+      if (state === "handback" && !reason) throw new Error("broker_report with state='handback' requires a non-empty reason");
+      if ((state === "progress" || state === "ready") && !summary) throw new Error(`broker_report with state='${state}' requires a non-empty summary`);
+      const brokerChildReport = {
+        state,
+        ...(summary ? { summary } : {}),
+        ...(question ? { question } : {}),
+        ...(reason ? { reason } : {}),
+        reportedAt: Date.now(),
+      };
+      const text = state === "blocked"
+        ? `Ticket marked blocked; lease will be released while awaiting parent answer to: ${question}`
+        : state === "handback"
+          ? `Ticket handed back to parent: ${reason}`
+          : state === "ready"
+            ? `Ticket reported ready: ${summary}`
+            : `Progress recorded: ${summary}`;
+      return {
+        content: [{ type: "text", text }],
+        details: { brokerChildReport },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: CHECKPOINT_TOOL,
     label: "Publish Partial Checkpoint",
     description: "Publish one bounded structured partial-work checkpoint to the controller. It is never task completion; only controller-accepted checkpoints may be reused after a replacement attempt.",
@@ -165,9 +216,9 @@ export default function (pi: ExtensionAPI) {
     // Align the model-visible surface with controller policy. The blocking hook
     // remains authoritative if a later trusted extension changes active tools.
     const allowed = new Set(loaded.capability.allowedTools);
-    pi.setActiveTools([...new Set(pi.getActiveTools().filter((name) => allowed.has(name) || name === DECLARATION_TOOL || name === CHECKPOINT_TOOL))]);
-    if (!pi.getActiveTools().includes(DECLARATION_TOOL) || !pi.getActiveTools().includes(CHECKPOINT_TOOL)) {
-      pi.setActiveTools([...new Set([...pi.getActiveTools(), DECLARATION_TOOL, CHECKPOINT_TOOL])]);
+    pi.setActiveTools([...new Set(pi.getActiveTools().filter((name) => allowed.has(name) || name === DECLARATION_TOOL || name === CHECKPOINT_TOOL || name === REPORT_TOOL))]);
+    if (!pi.getActiveTools().includes(DECLARATION_TOOL) || !pi.getActiveTools().includes(CHECKPOINT_TOOL) || !pi.getActiveTools().includes(REPORT_TOOL)) {
+      pi.setActiveTools([...new Set([...pi.getActiveTools(), DECLARATION_TOOL, CHECKPOINT_TOOL, REPORT_TOOL])]);
     }
     const heartbeatMs = Math.max(500, Math.min(30_000, Math.floor(loaded.capability.leaseTtlMs / 2)));
     const beat = () => {
@@ -186,11 +237,14 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_start", () => { if (runtime) runtime.turnSerial++; });
 
   pi.on("tool_call", async (event) => {
-    if (event.toolName === DECLARATION_TOOL || event.toolName === CHECKPOINT_TOOL || RECURSIVE_TOOLS.has(event.toolName)) return undefined;
+    if (event.toolName === DECLARATION_TOOL || event.toolName === CHECKPOINT_TOOL || event.toolName === REPORT_TOOL || RECURSIVE_TOOLS.has(event.toolName)) return undefined;
     if (!runtime || runtime.failed) return failClosed(runtime?.failed ?? "broker behavioral monitor was not initialized");
     const pending = runtime.pending;
     const canonicalToolName = canonicalDeclaredToolName(event.toolName, runtime.capability.allowedTools);
-    if (!pending && isImplicitlyDeclaredObserveTool(event.toolName, runtime.capability.allowedTools)) {
+    const autoDeclaredProposePatch = canonicalToolName === "propose_patch"
+      && runtime.capability.operationClass === "propose_patch"
+      && runtime.capability.allowedTools.includes("propose_patch");
+    if (!pending && (isImplicitlyDeclaredObserveTool(event.toolName, runtime.capability.allowedTools) || autoDeclaredProposePatch)) {
       let actual;
       try { actual = captureLosslessJson(event.input, { maxBytes: 256 * 1024, maxDepth: 32, maxNodes: 10_000 }).value; }
       catch { return failClosed("observe tool arguments cannot be represented by the broker behavioral protocol"); }
@@ -255,6 +309,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName === REPORT_TOOL) {
+      const childReport = (event.details as any)?.brokerChildReport;
+      if (childReport && (childReport.state === "blocked" || childReport.state === "handback")) {
+        ctx.abort();
+      }
+      return undefined;
+    }
     if (event.toolName === DECLARATION_TOOL || event.toolName === CHECKPOINT_TOOL || !runtime) return undefined;
     const action = runtime.executing.get(event.toolCallId);
     if (!action) return undefined;

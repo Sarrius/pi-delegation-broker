@@ -162,6 +162,7 @@ class RpcChildSession {
   #listeners = new Set();
   #latestAssistant;
   #guardTerminal;
+  #lastChildReport;
   // Controller-owned efficiency observes consumable tokens/latency/attempts, never provider
   // price estimates: subscription routes have no truthful per-turn monetary value.
   #usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, turns: 0 };
@@ -198,6 +199,7 @@ class RpcChildSession {
   }
 
   get sessionFile() { return this.#sessionFile; }
+  get lastChildReport() { return this.#lastChildReport; }
   get latestAssistantMessage() {
     // This marker can only fail the child, never accept work or blame a provider.
     return this.#guardTerminal ? { ...this.#latestAssistant, stopReason: "error",
@@ -292,6 +294,10 @@ class RpcChildSession {
     if (event.type === "tool_execution_end") {
       const status = event.result?.details?.brokerGuardTerminal?.status;
       if (typeof status === "string" && /^[a-z_]{1,64}$/.test(status)) this.#guardTerminal = status;
+      const childReport = event.result?.details?.brokerChildReport;
+      if (isRecord(childReport) && ["progress", "ready", "blocked", "handback"].includes(childReport.state)) {
+        this.#lastChildReport = Object.freeze({ ...childReport });
+      }
     }
     if (event.type === "agent_start") { this.#turn?.observeAcceptance(); }
     if (event.type === "agent_settled") { this.#turn?.observeSettlement(); }
@@ -449,6 +455,7 @@ export async function spawnBrokeredChild({ spec, parentCwd, sessionsDir, childPi
         tools: Object.freeze(report.activeTools),
         cwd,
         label: spec.label ?? "brokered-child",
+        ...(typeof session.sessionFile === "string" && session.sessionFile ? { sessionFile: session.sessionFile } : {}),
       }),
     });
   } catch (error) {

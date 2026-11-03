@@ -108,7 +108,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 // @ts-expect-error — resolved relative to this file's real location
 import {
   claimReportWake, listReports, markReportRead, markReportWoken, pruneReports,
-  readReport, reportOwnerJob, reportVerificationEvidence, unreadReports, writeReport,
+  readReport, reportOwnerJob, reportVerificationEvidence, resetReportForResume, unreadReports, writeReport,
 } from "../src/report-store.mjs";
 import {
   initialReportWakeAt, ParentWakeCoordinator, PARENT_WAKE_SYSTEM_RULE,
@@ -117,7 +117,7 @@ import { planUnreadNotice, seedNotifiedUnread } from "../src/unread-notice.mjs";
 import { projectParentDelegationContext, PARENT_CONTEXT_SYSTEM_RULE } from "../src/parent-context.mjs";
 import { buildFleetProjection, fleetSummary, formatDelegationStatus, formatFleetDetails, formatFleetWidget } from "../src/fleet-view.mjs";
 import { normalizeContract, renderRoleFraming, resolveContract } from "../src/child-contract.mjs";
-import { markTaskAdmitted } from "../src/delegation-job-store.mjs";
+import { markTaskAdmitted, resumeTaskJob } from "../src/delegation-job-store.mjs";
 import { RecursiveAdmissionStore, normalizeRecursivePolicy } from "../src/recursive-admission.mjs";
 import { isCatalogOnlyNativeProvider } from "../src/native-provider-routing.mjs";
 import { captureChildRuntime } from "../src/child-runtime-snapshot.mjs";
@@ -127,7 +127,7 @@ import { BackgroundReadiness } from "../src/background-readiness.mjs";
 import { createQualificationCanary } from "../src/qualification-canary.mjs";
 
 import { RoutingHistoryStore } from "../src/routing-history-store.mjs";
-import { TASK_CLASSES, withWorkBudget, storedInputCap, storedOutputCap, activeAssignments, learningContext, overlappingAssignment, parentWriteConflict, taskFingerprint } from "../src/delegation-policy.mjs";
+import { TASK_CLASSES, composeTaskPrompt, withWorkBudget, storedInputCap, storedOutputCap, activeAssignments, learningContext, overlappingAssignment, parentWriteConflict, taskFingerprint } from "../src/delegation-policy.mjs";
 import { importLegacyAffinity, ownerKey, routeFact, historySummary, executionScorecard, qualitySummary, legacyQualitySummary } from "../src/delegation-history.mjs";
 import { delegationInventory, inventorySummary, modelLearningIdentity, rankAdmittedResources, prioritizeInventoryRows } from "../src/delegation-inventory.mjs";
 import { modelCriteria, criteriaIdentity, MODEL_CRITERIA_VERSION } from "../src/model-criteria.mjs";
@@ -238,10 +238,11 @@ const WORK_PLAN = Type.Object({
   taskClass: StringEnum([...TASK_CLASSES]),
   maxAttempts: Type.Optional(Type.Integer({minimum:1,maximum:8,description:"Whole-child physical attempt cap; default 3. Retries consume this same allowance."})),
   deliverable: Type.String({minLength:1,maxLength:1000,description:"The exact result the child owns."}),
-  benefit: Type.String({minLength:1,maxLength:1000,description:"Why delegation is worth briefing, waiting and integration cost."}),
-  parentWork: Type.String({minLength:1,maxLength:1000,description:"Independent work the parent will do, or wait for this result."}),
+  benefit: Type.Optional(Type.String({minLength:1,maxLength:1000,description:"Why delegation is worth briefing, waiting and integration cost. Defaults to independent execution in isolated child context."})),
+  parentWork: Type.Optional(Type.String({minLength:1,maxLength:1000,description:"Independent work the parent will do, or wait for this result. Defaults to coordinating sibling tasks and integrating verified child findings."})),
   purpose: Type.Optional(StringEnum(["produce","review"] as const)),
   ownedPaths: Type.Optional(Type.Array(Type.String({maxLength:4096}),{maxItems:16,description:"Absolute files/directories exclusively assigned for production. Parent write/edit is blocked until terminal; shell writes must respect the same ownership."})),
+  contextFiles: Type.Optional(Type.Array(Type.String({minLength:1,maxLength:4096}),{maxItems:16,description:"Thin-router file path pointers for the child to read directly with its read tool instead of parent summarization."})),
 });
 const WORKFLOW_NODE = Type.Object({
   id: Type.String({ description: "Stable workflow node id." }),
@@ -1308,26 +1309,33 @@ export default function piDelegationBroker(pi: any) {
     const route = (result.route ?? []).map((hop: any) => `${hop.outcome}${hop.resourceId ? ` ${hop.resourceId}` : ""}`).join(" → ");
     const routeExplanation = explainRoute(result);
     broker.lastRoute = { summary: routeExplanation, at: Date.now() };
+    const auditStatus = ["completed", "blocked", "handback"].includes(result.status) ? "completed" : result.status;
     try {
       if (result.resource?.id && Array.isArray(result.route) && result.route.length > 0
         && result.route.every((hop: any) => typeof hop.resourceId === "string")) {
         broker.routingAudit.recordRoute({
-          status: result.status, resourceId: result.resource.id, selection: result.selection,
+          status: auditStatus, resourceId: result.resource.id, selection: result.selection,
           route: result.route, usage: result.usage,
         });
       }
     } catch { /* audit storage cannot change task completion semantics */ }
     const completedAt = Date.now();
-    try { broker.history.append({id:`route:${childId}`,kind:"route",timestamp:completedAt,data:routeFact({taskId:childId,ownerSessionId:readJob(JOBS_DIR,logicalId.split("/")[0])?.ownerSessionId??currentSessionId(lastCtx),context:selectedLearningContext(broker.learningContexts.get(childId)??learningContext(undefined),result),result,startedAt,completedAt})}); }
+    const ownerJob = readJob(JOBS_DIR, logicalId.split("/")[0]);
+    const routeEventId = ownerJob?.resumeCount ? `route:${childId}:r${ownerJob.resumeCount}` : `route:${childId}`;
+    try { broker.history.append({id:routeEventId,kind:"route",timestamp:completedAt,data:routeFact({taskId:childId,ownerSessionId:ownerJob?.ownerSessionId??currentSessionId(lastCtx),context:selectedLearningContext(broker.learningContexts.get(childId)??learningContext(undefined),result),result,startedAt,completedAt})}); }
     catch { /* durable report remains the authoritative fallback when telemetry is unavailable */ }
     broker.learningContexts.delete(childId);
+    const reportStatus = ["completed", "blocked", "handback"].includes(result.status) ? result.status : "failed";
     const persistedReport = writeReport(REPORTS_DIR, {
       taskId: childId,
       logicalId,
-      status: result.status === "completed" ? "completed" : "failed",
+      status: reportStatus,
       task: task.slice(0, 2000),
       ...(typeof result.text === "string" ? { text: result.text.slice(0, 64 * 1024) } : {}),
-      ...(result.status === "completed" ? {} : { error: result.error ?? "unknown error" }),
+      ...(reportStatus === "completed" || reportStatus === "blocked" ? {} : { error: result.error ?? "unknown error" }),
+      ...(typeof result.sessionFile === "string" && result.sessionFile ? { sessionFile: result.sessionFile.slice(0, 4096) } : {}),
+      ...(typeof result.question === "string" && result.question ? { question: result.question.slice(0, 2000) } : {}),
+      ...(typeof result.reason === "string" && result.reason ? { handbackReason: result.reason.slice(0, 2000) } : {}),
       route,
       routeExplanation,
       ...reportVerificationEvidence(result),
@@ -1352,8 +1360,11 @@ export default function piDelegationBroker(pi: any) {
     });
     rememberFleetReport(persistedReport);
     return {
-      status: result.status === "completed" ? "completed" : "failed",
+      status: reportStatus,
       ...(result.error ? { error: String(result.error).slice(0, 2000) } : {}),
+      ...(typeof result.sessionFile === "string" && result.sessionFile ? { sessionFile: result.sessionFile.slice(0, 4096) } : {}),
+      ...(typeof result.question === "string" && result.question ? { question: result.question.slice(0, 2000) } : {}),
+      ...(typeof result.reason === "string" && result.reason ? { handbackReason: result.reason.slice(0, 2000) } : {}),
       route: Array.isArray(result.route) ? result.route.map((hop: any) => ({
         ...(hop.resourceId ? { resourceId: hop.resourceId } : {}), outcome: hop.outcome ?? "unknown",
       })) : [],
@@ -1373,7 +1384,7 @@ export default function piDelegationBroker(pi: any) {
     };
   };
 
-  const settleTaskWithoutChildResult = (taskId: string, initial: any, status: "cancelled" | "expired", reason: string) => {
+  const settleTaskWithoutChildResult = (taskId: string, initial: any, status: "cancelled" | "expired" | "failed", reason: string) => {
     const completedAt = Date.now();
     const terminal = updateJob(JOBS_DIR, taskId, (job: any) => ({
       ...job, status, completedAt, terminalReason: reason,
@@ -1458,7 +1469,11 @@ export default function piDelegationBroker(pi: any) {
             completedAt: top.completedAt,
             terminalReason: cancelled ? "cancelled by controller; terminal child artifact preserved"
               : top.status === "completed" ? "reconciled from controller terminal report after restart"
-                : String(top.error ?? "controller terminal report failed").slice(0, 2000),
+                : top.status === "blocked" ? String(top.question ?? "reconciled blocked report after restart").slice(0, 2000)
+                  : String(top.error ?? "controller terminal report failed").slice(0, 2000),
+            ...(typeof top.sessionFile === "string" ? { sessionFile: top.sessionFile } : {}),
+            ...(typeof top.question === "string" ? { question: top.question } : {}),
+            ...(typeof top.handbackReason === "string" ? { handbackReason: top.handbackReason } : {}),
             recoveredFromReport: true,
           };
         }, Math.max(job.updatedAt, top.completedAt));
@@ -1474,19 +1489,8 @@ export default function piDelegationBroker(pi: any) {
           // Without the legacy key a crashed node is requeued after upgrade and paid for twice.
           const legacyId = `${job.jobId}-${node.id}`;
           const legacy = byTaskId.get(legacyId);
-          // Only a genuine pre-upgrade node report may be matched by launch id: it carries no
-          // logicalId and owns no job of its own, so it cannot be a foreign top-level result.
-          // A legacy node report also has to look like one. A node report's stored task begins
-          // with the node's own task (dependency artifacts are appended after it, and the field
-          // is truncated at 2000 chars), so a prefix match accepts genuine pre-upgrade reports
-          // while a foreign top-level submission stays unattached.
           const nodePrefix = typeof node.task === "string" ? node.task.slice(0, 2000) : undefined;
           const legacyTask = typeof legacy?.task === "string" ? legacy.task : undefined;
-          // Either the report is the bare node task (no dependency inputs) or it is the composed
-          // prompt, which continues with the controller's fixed artifact header. Both the report
-          // field and this prefix are truncated at 2000 chars, so the remainder is accepted only
-          // while it still agrees with that header. A foreign task that merely extends the node's
-          // wording agrees with neither form.
           const remainder = nodePrefix !== undefined && legacyTask?.startsWith(nodePrefix)
             ? legacyTask.slice(nodePrefix.length) : undefined;
           const legacyTaskMatches = remainder !== undefined
@@ -1548,6 +1552,9 @@ export default function piDelegationBroker(pi: any) {
         // mean "this session", and an unhonourable contract must fail loudly rather than run cheap.
         const contract = resolveContract(initial.contract, ctx ?? lastCtx);
         const roleFraming = renderRoleFraming(contract.role);
+        const activePrompt = typeof initial.resumePrompt === "string" && initial.resumePrompt
+          ? initial.resumePrompt
+          : composeTaskPrompt(initial.task, contract.work?.contextFiles);
         const canaryEnabled = readJson(join(STATE_DIR, "recursion.json")).depth2ReadOnlyCanary === true;
         const recursionPolicy = initial.recursion?.mode === "depth2_readonly_canary" && canaryEnabled
           && (initial.recursion.depth ?? 1) < (initial.recursion.maxDepth ?? 2)
@@ -1558,7 +1565,8 @@ export default function piDelegationBroker(pi: any) {
         result = await broker.runner.run({
           childId: taskId,
           ...(initial.recursion?.maxAttempts ? { maxAttempts: initial.recursion.maxAttempts } : {}),
-          promptDigest: createHash("sha256").update(initial.task).digest("hex"),
+          ...(typeof initial.forkSessionFile === "string" && initial.forkSessionFile ? { forkSessionFile: initial.forkSessionFile } : {}),
+          promptDigest: createHash("sha256").update(activePrompt).digest("hex"),
           trackForVerification: Boolean(initial.acceptance?.length),
           onAttemptStarted: () => {
             const admitted = markTaskAdmitted(JOBS_DIR, taskId, Date.now(), {
@@ -1572,7 +1580,7 @@ export default function piDelegationBroker(pi: any) {
           ...(contract.model ? { model: contract.model } : {}),
           ...(roleFraming ? { roleFraming } : {}),
           ...(contract.skills ? { skills: contract.skills } : {}),
-          prompt: initial.task,
+          prompt: activePrompt,
           fleet: {
             logicalId: taskId, rootId: taskId, kind: "task",
             role: contract.role?.name ?? "worker",
@@ -1580,7 +1588,7 @@ export default function piDelegationBroker(pi: any) {
           ...(recursionPolicy ? { recursion: { mode: "depth2_readonly_canary", context: recursionPolicy } } : {}),
           capabilityRequest: {
             taskId,
-            taskDescription: initial.task,
+            taskDescription: activePrompt,
             operationClass: "observe",
             routingRouteMode: contract.routeMode,
             routingThinkingMode: contract.thinkingMode,
@@ -1650,17 +1658,26 @@ export default function piDelegationBroker(pi: any) {
           });
         } catch { /* terminal job state remains available through delegate_status */ }
       }
-      const status = result.status === "completed" && !reportError ? "completed" : "failed";
+      const status = !reportError && ["completed", "blocked", "handback"].includes(result.status) ? result.status : "failed";
       const terminal = updateJob(JOBS_DIR, taskId, (job: any) => {
         const cancelled = job.status === "cancellation_requested";
-        return {
+        const nextStatus = cancelled ? "cancelled" : status;
+        const next: any = {
           ...job,
-          status: cancelled ? "cancelled" : status,
+          status: nextStatus,
           completedAt: Date.now(),
           terminalReason: cancelled ? "cancelled by controller; terminal child artifact preserved"
-            : reportError ?? result.error ?? "child execution completed",
+            : reportError ?? (nextStatus === "blocked"
+              ? (result.question ? `blocked: ${result.question}` : "child blocked awaiting parent clarification")
+              : (result.error ?? "child execution completed")),
           policyGeneration: result.selection?.policyGeneration ?? job.policyGeneration,
+          ...(typeof result.sessionFile === "string" && result.sessionFile ? { sessionFile: result.sessionFile.slice(0, 4096) } : {}),
+          ...(nextStatus === "blocked" && typeof result.question === "string" && result.question ? { question: result.question.slice(0, 2000) } : {}),
+          ...(nextStatus === "handback" && typeof result.reason === "string" && result.reason ? { handbackReason: result.reason.slice(0, 2000) } : {}),
         };
+        if (nextStatus !== "blocked") delete next.question;
+        if (nextStatus !== "handback") delete next.handbackReason;
+        return next;
       });
       if (initial.recursion?.rootId && terminal) {
         runtime?.recursiveStore?.settle(taskId, terminal.status === "completed" ? "completed" : terminal.status === "cancelled" ? "cancelled" : "failed");
@@ -2501,6 +2518,8 @@ export default function piDelegationBroker(pi: any) {
       "For 2+ independent subtasks use delegate_workflow instead of sequential delegate calls.",
       "For a read-only task with a trustworthy pre-frozen exact answer, use answer-equals acceptance (content is exact final text, max 4096 bytes); ambient file/tests do not verify the child's reply. Otherwise leave it unverified. To get a code change, pass proposeChangesIn with repository path and file/test checks: the child edits an isolated worktree and the controller returns a verified patch that you or the user still have to apply.",
       "Write the delegate task as a complete brief: the child sees nothing of this conversation, so include file paths, context, and exactly what output you expect.",
+      "Thin-router dispatch: pass file paths in work.contextFiles so the child reads source files directly with its read tool; do not waste parent context reading and summarizing files just to paste them into the brief.",
+      "When a child reports status=blocked with a question, inspect it via delegate_collect and answer it with delegate_resume({ id, message }) to fork and continue the child's persisted session under a fresh lease instead of starting from scratch.",
       "Read-only delegation is asynchronous by default. Work ONLY on your declared independent part. Do not redo the child deliverable. Collect and integrate it; if taking over, cancel and await terminal status first. Report utility with delegate_feedback: used, reworked, redundant or unused. Cancellation requested is not yet a handoff.",
     ],
     parameters: DELEGATE_PARAMS,
@@ -2614,10 +2633,11 @@ export default function piDelegationBroker(pi: any) {
         };
       }
 
-      const promptDigest = createHash("sha256").update(params.task).digest("hex");
       let syncContract;
       try { syncContract = resolveContract(normalizeContract(params), ctx); }
       catch (error) { return { content: [{ type: "text", text: (error as Error).message }], isError: true }; }
+      const syncPrompt = composeTaskPrompt(params.task, syncContract.work?.contextFiles);
+      const promptDigest = createHash("sha256").update(syncPrompt).digest("hex");
       const syncRoleFraming = renderRoleFraming(syncContract.role);
       if (normalizedAcceptance.length > 0) {
         broker.acceptancePlans.set(childId, createControllerAcceptancePlan(normalizedAcceptance, {
@@ -2636,7 +2656,7 @@ export default function piDelegationBroker(pi: any) {
         ...(syncContract.model ? { model: syncContract.model } : {}),
         ...(syncRoleFraming ? { roleFraming: syncRoleFraming } : {}),
         ...(syncContract.skills ? { skills: syncContract.skills } : {}),
-        prompt: params.task,
+        prompt: syncPrompt,
         fleet: {
           logicalId: childId, rootId: childId,
           kind: params.proposeChangesIn ? "propose_effect" : "task",
@@ -2644,7 +2664,7 @@ export default function piDelegationBroker(pi: any) {
         },
         capabilityRequest: {
           taskId: childId,
-          taskDescription: params.task,
+          taskDescription: syncPrompt,
           // Pin the operation class explicitly: only proposeChangesIn makes this child
           // effect-capable. Leaving it unset would fall back to keyword guessing over the
           // task text, which misfires on negations ("do not modify anything" → propose_patch).
@@ -2687,13 +2707,14 @@ export default function piDelegationBroker(pi: any) {
         .join(" → ");
       const routeExplanation = explainRoute(result);
       broker.lastRoute = { summary: routeExplanation, at: Date.now() };
+      const syncAuditStatus = ["completed", "blocked", "handback"].includes(result.status) ? "completed" : result.status;
       // Persist facts observed by the controller/runner, never a child narrative. A denied
       // attempt has no leased resource and is intentionally not fabricated into an audit route.
       try {
         if (result.resource?.id && Array.isArray(result.route) && result.route.length > 0
           && result.route.every((hop: any) => typeof hop.resourceId === "string")) {
           broker.routingAudit.recordRoute({
-            status: result.status,
+            status: syncAuditStatus,
             resourceId: result.resource.id,
             selection: result.selection,
             route: result.route,
@@ -2751,11 +2772,31 @@ export default function piDelegationBroker(pi: any) {
         };
       }
 
+      if (result.status === "blocked") {
+        return {
+          content: [{
+            type: "text",
+            text: `Delegated child blocked awaiting parent input (${childId}):\nQuestion: ${result.question ?? result.text}\n${result.sessionFile ? `Session file: ${result.sessionFile}\n` : ""}Route: ${route}\nSelection: ${routeExplanation}`,
+          }],
+          details: { taskId: childId, status: "blocked", question: result.question, sessionFile: result.sessionFile, route, routeExplanation, usage: result.usage },
+        };
+      }
+      if (result.status === "handback") {
+        return {
+          content: [{
+            type: "text",
+            text: `Delegated child handed back task (${childId}): ${result.reason ?? result.error ?? "handback"}\nRoute: ${route}\nSelection: ${routeExplanation}`,
+          }],
+          isError: true,
+          details: { taskId: childId, status: "handback", handbackReason: result.reason, sessionFile: result.sessionFile, route, routeExplanation, usage: result.usage },
+        };
+      }
       if (result.status === "completed") {
         const usage = result.usage ? ` (${result.usage.input} in / ${result.usage.output} out)` : "";
         return {
           content: [{ type: "text", text: result.text }],
           details: { taskId:childId, route, routeExplanation, usage: result.usage,
+            ...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
             ...(result.verification?.verification && result.verification?.outcome?.status === "completed"
               ? {verificationStatus:"accepted",verification:result.verification.verification,semanticStatus:"accepted"}:{}),
             note: `Completed via ${route}${usage}; ${routeExplanation}` },
@@ -2800,7 +2841,13 @@ export default function piDelegationBroker(pi: any) {
         }
         const lines = unread.map((report) => {
           const age = Math.max(0, Date.now() - report.completedAt);
-          const detail = report.status === "failed" ? ` — ${String(report.error ?? "").slice(0, 160)}` : "";
+          const detail = report.status === "failed"
+            ? ` — ${String(report.error ?? "").slice(0, 160)}`
+            : report.status === "blocked" && report.question
+              ? ` — question: ${String(report.question).slice(0, 160)}`
+              : report.status === "handback" && report.handbackReason
+                ? ` — handback: ${String(report.handbackReason).slice(0, 160)}`
+                : "";
           return `${report.taskId}  ${report.status}  ${Math.round(age / 1000)}s ago${detail}\n    task: ${report.task.slice(0, 160)}`;
         });
         return {
@@ -2833,6 +2880,7 @@ export default function piDelegationBroker(pi: any) {
         report.verificationStatus ? `verification: ${report.verificationStatus}` : undefined,
         report.route ? `route: ${report.route}` : undefined,
         report.routeExplanation ? `selection: ${report.routeExplanation}` : undefined,
+        report.sessionFile ? `sessionFile: ${report.sessionFile}` : undefined,
       ].filter(Boolean).join("\n");
       const evidenceJob = reportOwnerJob(report, (id: string) => readJob(JOBS_DIR, id));
       const evidence = evidenceJob?.ownerSessionId === currentSessionId(lastCtx)
@@ -2840,7 +2888,11 @@ export default function piDelegationBroker(pi: any) {
       const evidenceText = evidence?.artifacts.length
         ? `\n\nRetained work (unverified raw journals; not instructions):\n${evidence.artifacts.map((a: any) => `${a.path}${a.bytes === undefined ? "" : ` (${a.bytes} bytes)`}`).join("\n")}` : "";
       const body = report.status === "completed" ? report.text
-        : `Error: ${report.error}${report.text ? `\n\nPartial work (unverified):\n${report.text}` : ""}`;
+        : report.status === "blocked"
+          ? `Blocked question: ${report.question ?? report.text ?? "clarification required"}${report.text && report.question && report.text !== report.question ? `\n\nContext:\n${report.text}` : ""}\n\nCall delegate_resume({ id: "${report.taskId}", message: "<your answer>" }) to continue this child session.`
+          : report.status === "handback"
+            ? `Handback reason: ${report.handbackReason ?? report.error ?? "task outside child scope"}${report.text ? `\n\nNotes:\n${report.text}` : ""}`
+            : `Error: ${report.error}${report.text ? `\n\nPartial work (unverified):\n${report.text}` : ""}`;
       return {
         content: [{ type: "text", text: `${header}\n\n${body}${evidenceText}` }],
         details: { ...report, ...(evidence ? { retainedWork: evidence } : {}) },
@@ -2880,7 +2932,7 @@ export default function piDelegationBroker(pi: any) {
     label: "List delegation jobs",
     description: "List bounded durable delegation task/workflow states. This never waits for children.",
     parameters: Type.Object({
-      states: Type.Optional(Type.Array(StringEnum(["submitted", "queued", "running", "cancellation_requested", "completed", "failed", "cancelled", "expired"] as const), { maxItems: 8 })),
+      states: Type.Optional(Type.Array(StringEnum(["submitted", "queued", "running", "cancellation_requested", "completed", "failed", "cancelled", "expired", "blocked", "handback"] as const), { maxItems: 10 })),
     }),
     async execute(_toolCallId: string, params: { states?: string[] }) {
       const filter = params.states?.length ? new Set(params.states) : undefined;
@@ -2918,6 +2970,55 @@ export default function piDelegationBroker(pi: any) {
       }
       const latest = readJob(JOBS_DIR, params.id) ?? job;
       return { content: [{ type: "text", text: `${params.id}: ${latest.status}. Cancellation is controller-owned and idempotent.` }], details: latest };
+    },
+  });
+
+  registerBrokerTool({
+    name: "delegate_resume",
+    label: "Resume delegated ticket",
+    description: "Resume a blocked, handback, or completed delegated task by forking its persisted child sessionFile with your clarification or follow-up instruction under a newly acquired broker lease.",
+    promptSnippet: "Resume a blocked or completed delegated child session (--fork sessionFile) with a follow-up answer or instruction",
+    parameters: Type.Object({
+      id: Type.String({ description: "Task id of the delegated ticket to resume." }),
+      message: Type.String({ minLength: 1, maxLength: 262144, description: "Clarification answer or follow-up instruction for the resumed child turn." }),
+      wait: Type.Optional(Type.Boolean({ description: "Wait for the resumed turn to settle. Default false runs in background and wakes the parent." })),
+    }),
+    async execute(_toolCallId: string, params: { id: string; message: string; wait?: boolean }, _signal: AbortSignal, _onUpdate: any, ctx: any) {
+      if (!enabled) return { content: [{ type: "text", text: "Delegation broker is stopped." }], isError: true };
+      lastCtx = ctx;
+      let resumed: any;
+      try {
+        resetReportForResume(REPORTS_DIR, params.id);
+        notifiedUnread.delete(params.id);
+        parentWake?.resetTask?.(params.id);
+        resumed = resumeTaskJob(JOBS_DIR, params.id, {
+          message: params.message,
+          now: Date.now(),
+          ownerSessionId: currentSessionId(ctx),
+        });
+      } catch (error) {
+        return { content: [{ type: "text", text: `Delegation resume rejected: ${(error as Error).message}` }], isError: true };
+      }
+      rememberFleetJob(resumed);
+      try { refreshSessionBinding(ctx, "active"); } catch { /* best effort */ }
+      const promise = startTask(params.id, ctx);
+      if (params.wait) {
+        const settled = await promise;
+        const report = readReport(REPORTS_DIR, params.id);
+        return {
+          content: [{ type: "text", text: report?.text ?? `${params.id}: ${settled?.status ?? "unknown"}` }],
+          isError: !["completed", "blocked"].includes(settled?.status),
+          details: { job: settled, report },
+        };
+      }
+      promise.catch(() => undefined);
+      return {
+        content: [{
+          type: "text",
+          text: `Delegation ticket resumed: ${params.id} (resume #${resumed.resumeCount}, forkSessionFile=${resumed.forkSessionFile}). Running in background under a fresh broker lease; collect with delegate_collect when woken.`,
+        }],
+        details: { taskId: params.id, status: resumed.status, resumeCount: resumed.resumeCount, forkSessionFile: resumed.forkSessionFile, background: true },
+      };
     },
   });
 

@@ -185,6 +185,7 @@ export function compileEffectiveChildCapability(cap) {
     ...(cap.delegation ? [`delegation: read_only_canary depth=${cap.delegation.depth}/${cap.delegation.maxDepth} children=${cap.delegation.maxChildren}`] : []),
     "Invoke tools by the names above, never the mcp_pi_ prefix.",
     "Invoke read-only observe tools directly; the broker declares and authorizes those read-only actions automatically.",
+    "Use broker_report to report structured status: state='progress' (milestone summary), state='ready' (final summary), state='blocked' (one concrete question when an ambiguity blocks you; stops this turn and releases the lease until resumed), or state='handback' (one-sentence reason when the request exceeds your scope or capability).",
     ...(effectTools.length > 0 ? [
       `effect_tools_requiring_explicit_declaration: ${effectTools.join(", ")}`,
       "Call broker_declare_action immediately before every effect-capable tool, with that exact tool name and exact arguments.",

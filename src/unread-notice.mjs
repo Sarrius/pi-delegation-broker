@@ -38,8 +38,14 @@ export function formatUnreadNotice(unread) {
   const lines = list.slice(0, 10).map((report) => {
     const taskId = String(report?.taskId ?? "");
     const status = String(report?.status ?? "");
-    const error = report?.status === "failed" ? ` (${String(report?.error ?? "").slice(0, 120)})` : "";
-    return `${taskId}: ${status}${error}`;
+    const detail = report?.status === "failed"
+      ? ` (${String(report?.error ?? "").slice(0, 120)})`
+      : report?.status === "blocked" && report?.question
+        ? ` (question: ${String(report.question).slice(0, 120)})`
+        : report?.status === "handback" && report?.handbackReason
+          ? ` (handback: ${String(report.handbackReason).slice(0, 120)})`
+          : "";
+    return `${taskId}: ${status}${detail}`;
   });
   return (
     `[delegation-broker] ${list.length} background delegation report(s) settled while you were working. ` +

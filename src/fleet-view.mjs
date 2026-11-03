@@ -1,5 +1,5 @@
 const ACTIVE_JOB_STATES = new Set(["submitted", "queued", "running", "cancellation_requested"]);
-const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "expired"]);
+const TERMINAL_STATES = new Set(["completed", "failed", "cancelled", "expired", "blocked", "handback"]);
 const ATTEMPT_WAITING = new Set(["selecting", "waiting_capacity", "dispatching"]);
 const ATTEMPT_RUNNING = new Set(["running", "verifying"]);
 
@@ -163,7 +163,7 @@ function countRows(rows) {
     else if (ATTEMPT_RUNNING.has(row.state) || row.state === "running") counts.running += 1;
     else if (ATTEMPT_WAITING.has(row.state) || ["submitted", "queued", "pending", "reconciling", "dispatching"].includes(row.state)) counts.waiting += 1;
     else if (row.state === "blocked" || row.state === "cancellation_requested") counts.blocked += 1;
-    else if (["failed", "cancelled", "expired"].includes(row.state)) counts.failed += 1;
+    else if (["failed", "cancelled", "expired", "handback"].includes(row.state)) counts.failed += 1;
     else if (row.state === "completed") counts.completed += 1;
   }
   return Object.freeze(counts);
